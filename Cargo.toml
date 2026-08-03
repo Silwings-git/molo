@@ -1,0 +1,11 @@
+[package]
+name = "molo"
+version = "0.1.0"
+edition = "2024"
+description = "molo(Model Loop)——Rust agent 框架聚合入口,re-export molo-kernel 契约层与 molo-rt 运行时"
+license = "MIT"
+repository = "https://github.com/Silwings-git/molo"
+keywords = ["agent", "llm", "framework", "molo"]
+categories = ["development-tools"]
+
+[dependencies]
