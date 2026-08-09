@@ -1,0 +1,291 @@
+<div align="center">
+
+# molo
+
+**Mo**del **Lo**op · A lightweight Rust agent framework
+
+Build LLM agents from building blocks — the reasoning loop, tool calling,
+context management, and all the wiring are already done for you.
+
+[![crates.io](https://img.shields.io/crates/v/molo.svg)](https://crates.io/crates/molo)
+[![docs.rs](https://docs.rs/molo/badge.svg)](https://docs.rs/molo)
+[![CI](https://github.com/Silwings-git/molo/actions/workflows/ci.yml/badge.svg)](https://github.com/Silwings-git/molo/actions/workflows/ci.yml)
+[![License](https://img.shields.io/crates/l/molo.svg)](LICENSE-APACHE)
+[![MSRV](https://img.shields.io/badge/rustc-1.97%2B-orange.svg)](https://github.com/Silwings-git/molo)
+
+English · [简体中文](docs/README.zh-CN.md)
+
+</div>
+
+---
+
+## ✨ Features
+
+- **Built-in reasoning loop** — `ReActAgent` implements the classic
+  "think → call tools → feed results back → answer" loop, with a tool-round
+  limit, cooperative cancellation, usage aggregation, event channel, and
+  tracing spans included.
+- **Everything is pluggable** — `Provider` (LLM), `Memory` (context) and
+  `Tool` (capabilities) are traits; swap implementations per scenario without
+  touching the loop.
+- **Real-world integrations** — MCP client for external tools, Agent Skills
+  with progressive disclosure, structured output validated against JSON Schema.
+- **Observable & controllable** — stream every token, subscribe to agent
+  events, talk to the outside world (human confirmation, agent-to-agent
+  conversation), and cancel runs cooperatively.
+- **Zero lock-in** — no bundled runtime, no hidden threads. Your tokio
+  runtime, your tracing subscriber, your HTTP stack.
+
+## 🚀 Quick Start
+
+A minimal agent needs three things: a `Provider` to talk to the LLM, a
+`Memory` to manage context, and (optionally) tools for external capabilities.
+The reasoning loop is built into `ReActAgent`, and the `react_agent!` macro
+assembles everything in one call.
+
+```toml
+[dependencies]
+molo = "0.2"
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+```
+
+### Self-test without an API
+
+Use `FakeProvider` to inject scripted replies — no real LLM required:
+
+```rust
+use molo::{react_agent, Agent, FakeProvider, FakeReply};
+
+let mut agent = react_agent!(
+    FakeProvider::new([FakeReply::Text("Hello".into())]),
+    "You are a helpful assistant",
+);
+let answer = agent.run("Are you there?").await?;
+assert_eq!(answer, "Hello");
+```
+
+### Talk to a real LLM
+
+Swap in `OpenAiProvider` (any OpenAI-compatible endpoint), wrap it in
+`RetryProvider` for retry/timeout protection, and add tools:
+
+```rust
+use molo::{react_agent, Agent, OpenAiProvider};
+
+let provider = OpenAiProvider::new(
+    std::env::var("MOLO_BASE_URL").unwrap_or_else(|_| "https://api.openai.com/v1".to_string()),
+    std::env::var("MOLO_API_KEY").unwrap_or_default(),
+    std::env::var("MOLO_MODEL").unwrap_or_else(|_| "gpt-4o-mini".to_string()),
+);
+
+let mut agent = react_agent!(
+    provider,
+    [Calculator],                              // your tools
+    "You are a helpful assistant. Use the calculator tool for calculations.",
+);
+let answer = agent.run("What is (1 + 2) * 3?").await?;
+println!("{answer}");
+```
+
+That is a complete, streaming-capable, tool-calling agent. `run` returns the
+final answer; `run_stream` yields token-by-token `MessageChunk` events
+(text deltas, tool calls, tool results, `Done`).
+
+## 🧩 Core Concepts
+
+molo is organized into domain modules — one concept per module. The crate
+root re-exports each module's core items, so `use molo::...` covers most cases:
+
+| Concept | What it does | Key types |
+| --- | --- | --- |
+| Agent | the reasoning loop | `Agent`, `ReActAgent`, `react_agent!`, `TypedAgent`, `CancellableAgent` |
+| Provider | LLM communication | `Provider`, `OpenAiProvider`, `RetryProvider`, `FakeProvider` |
+| Memory | context management | `Memory`, `InMemoryMemory`, `WindowMemory`, `SummarizeStrategy` |
+| Tool | external capabilities | `Tool`, `ToolRegistry`, `SharedState`, `#[molo::tool]` |
+| Skill | capability packs (Agent Skills protocol) | `Skill`, `SkillRegistry`, `LoadSkillTool` |
+| MCP | external tool servers | `McpClient`, `McpTool` |
+| Message | conversation model | `Message`, `ContentBlock`, `ToolCall` |
+| MessageChannel | external conversation (human/agents) | `CliMessageChannel`, `MpscChannel`, `BroadcastChannel`, `WatchChannel` |
+| EventChannel | observation of a run | `BroadcastEventChannel`, `MpscEventChannel` |
+
+### Choosing between implementations
+
+- **Context** — `InMemoryMemory` for short or unbounded sessions; `WindowMemory`
+  trims the oldest turns to a token budget; add `SummarizeStrategy` to compress
+  over-budget messages into a single summary.
+- **Talking to the LLM** — `FakeProvider` for development (scripted replies, no
+  API), `OpenAiProvider` + `RetryProvider` for production.
+- **External conversation** — `CliMessageChannel` for human-terminal interaction,
+  `MpscChannel` for one-to-one in-process agent conversation,
+  `BroadcastChannel` / `WatchChannel` for one-to-many broadcast and
+  latest-value notifications.
+- **Observing the process** — `BroadcastEventChannel` (multiple subscribers,
+  slow ones drop the oldest events) or `MpscEventChannel` (single subscriber,
+  nothing dropped within capacity).
+
+## 🛠 Highlights
+
+### Tools: one-shot definition with `#[molo::tool]`
+
+Writing a tool by hand takes ~25 lines of boilerplate; the macro generates the
+struct, schema, argument parsing, and error conversion from an async function:
+
+```rust
+use molo::tool::{SharedState, ToolError};
+
+#[molo::tool(description = "Evaluates a math expression, e.g. \"(1 + 2) * 3\"")]
+async fn calculator(args: CalcArgs) -> Result<String, ToolError> {
+    let value = evalexpr::eval(&args.expression)
+        .map_err(|e| ToolError::Execution(e.to_string()))?;
+    Ok(value.to_string())
+}
+```
+
+A failed tool call does **not** abort the loop — the error text is fed back to
+the model, which decides what to do next. `SharedState` lets tools share typed
+state; it is injected at call time.
+
+### Typed (structured) output
+
+`run_typed` validates the model's reply against a JSON Schema derived from
+your return type; on validation failure the error is fed back to the model for
+retry (3 attempts by default):
+
+```rust
+let weather: Weather = agent.run_typed("How is the weather in Beijing today?").await?;
+println!("{}°C, {}", weather.temperature, weather.condition);
+```
+
+### MCP client
+
+Bring tools exposed by external MCP servers into the agent. `McpClient`
+supports the stdio child-process and Streamable HTTP transports (via `rmcp`):
+
+```rust
+let mut client = McpClient::from_command("filesystem", ["/path/to/server"]);
+let mut registry = ToolRegistry::new();
+for tool in client.tools().await? {
+    registry.register(tool);
+}
+```
+
+### Skills (Agent Skills open protocol)
+
+A skill is a directory containing `SKILL.md` (YAML frontmatter + Markdown).
+The core mechanism is **progressive disclosure**: the model first sees only a
+one-line menu of name + description; when a task matches, it reads the body via
+the `load_skill` tool. Skills declare their tool dependencies with
+`allowed-tools`.
+
+### Sub-agents
+
+`SubAgentTool` / `SubAgentPool` let the main agent delegate to sub-agents:
+persistent experts (`from_agent`), transient factories (`from_factory`), or
+on-the-spot ReAct sub-agents defined in the call arguments (`from_react` /
+`spawn_react`). A named pool keeps sub-agents alive across turns for follow-up
+conversations.
+
+### Cooperative cancellation
+
+Agents that support cancellation implement `CancellableAgent`. Each run
+carries its own `CancellationToken`; cancellation applies per run, so stopping
+mid-reply leaves no residue and the next turn starts fresh.
+
+### Streaming, events & observability
+
+- `Agent::run_stream` — `MessageChunk` events: `Delta` / `ToolCall` /
+  `ToolResult` / `Done` / `Cancelled`.
+- `Provider::stream_chat` — raw `StreamEvent` stream (deltas, reasoning,
+  tool calls).
+- `EventChannel` — subscribe to the `AgentEvent` stream of a run for
+  decoupled observation.
+- Loops emit `tracing` spans at fixed points (`agent.run`, `llm_request`,
+  `tool`). No subscriber is installed — bring your own (e.g.
+  `tracing-subscriber`), and wire OpenTelemetry yourself if needed.
+
+## 📚 Examples
+
+All examples live in `examples/`; most read `MOLO_API_KEY` /
+`MOLO_BASE_URL` / `MOLO_MODEL` from `.env` (copy `.example.env` to `.env`).
+Self-contained examples (no real API needed) are marked ✦.
+
+### Core loop
+
+| Example | Run | What it shows |
+| --- | --- | --- |
+| ✦ `react_agent` | `cargo run --example react_agent` | The built-in `ReActAgent` + `react_agent!` macro (stream / chat modes) |
+| `agent` | `cargo run --example agent` | Hand-writing the `Agent` trait loop yourself |
+| `tool_agent` | `cargo run --example tool_agent` | Tool-call loop with `Provider::chat` / `stream_chat` |
+| `sub_agent` | `cargo run --example sub_agent` | Sub-agent delegation, `SubAgentTool` / `SubAgentPool` |
+
+### Tools
+
+| Example | Run | What it shows |
+| --- | --- | --- |
+| ✦ `tool_registry` | `cargo run --example tool_registry` | Registry full API: register / names / schemas / call / subset |
+| ✦ `tool_macro` | `cargo run --example tool_macro` | One-shot tool definitions with `#[molo::tool]` |
+| ✦ `shared_state` | `cargo run --example shared_state` | Three ways to use `SharedState` |
+| ✦ `mcp` | `cargo run --example mcp` | MCP client adapter, self-contained fake server |
+
+### Provider
+
+| Example | Run | What it shows |
+| --- | --- | --- |
+| `chat` | `cargo run --example chat` | Plain chat with a real model |
+| `chat_stream` | `cargo run --example chat_stream` | Streaming chat, tokens as they arrive |
+| ✦ `fake_provider` | `cargo run --example fake_provider` | Scripted replies for testing your own loop |
+| `retry` | `cargo run --example retry` | `RetryProvider` wrapper |
+| `usage` | `cargo run --example usage` | Per-run execution summary (tokens, rounds) |
+| `trace` | `cargo run --example trace` | Rendering the tracing spans to the console |
+
+### Memory
+
+| Example | Run | What it shows |
+| --- | --- | --- |
+| ✦ `window_memory` | `cargo run --example window_memory` | `WindowMemory` trimming and custom trim strategies |
+| `window_memory_agent` | `cargo run --example window_memory_agent` | Real-model agent with a token-budget window |
+| ✦ `summarize` | `cargo run --example summarize` | `SummarizeStrategy`: compress old messages into a summary |
+| `summarize_agent` | `cargo run --example summarize_agent` | Real-model streaming agent with summary compression |
+
+### Channels
+
+| Example | Run | What it shows |
+| --- | --- | --- |
+| ✦ `message_channel` | `cargo run --example message_channel` | All four channel implementations (Cli / Mpsc / Broadcast / Watch) |
+| `confirm_agent` | `cargo run --example confirm_agent` | Human confirmation via `MessageChannel` |
+| `mpsc_agent` | `cargo run --example mpsc_agent` | Two-agent conversation over `MpscChannel` |
+| `broadcast_agent` | `cargo run --example broadcast_agent` | One-to-many broadcast notifications |
+| `watch_agent` | `cargo run --example watch_agent` | Latest-value status publishing via `WatchChannel` |
+| ✦ `event_channel` | `cargo run --example event_channel` | Subscribing to the event stream (self-contained) |
+| `event_channel_agent` | `cargo run --example event_channel_agent` | Real-model agent observed through an `EventChannel` |
+
+### Output, skills, cancellation
+
+| Example | Run | What it shows |
+| --- | --- | --- |
+| ✦ `structured` | `cargo run --example structured` | Typed output with `run_typed` and JSON Schema validation |
+| ✦ `skill` | `cargo run --example skill` | Skills: discovery, progressive disclosure, activation |
+| ✦ `cancellation` | `cargo run --example cancellation` | Cooperative cancellation mid-reply, then continue |
+
+## ⚙️ Configuration
+
+Examples read configuration from `.env` (copy `.example.env` to `.env` and
+fill in real values); environment variables override directly:
+
+| Variable | Default | Used for |
+| --- | --- | --- |
+| `MOLO_API_KEY` | *(empty)* | API key; may be left empty for local endpoints without auth (e.g. Ollama) |
+| `MOLO_BASE_URL` | `https://api.openai.com/v1` | OpenAI-compatible endpoint |
+| `MOLO_MODEL` | `gpt-4o-mini` | Model name |
+| `MOLO_MAX_TOKENS` | — | Window/context budget (window/summarize examples) |
+| `MOLO_SUMMARY_MAX_TOKENS` | `150` | Summary output cap (summarize examples) |
+
+## 📖 Documentation
+
+- Rustdoc: `cargo doc --no-deps` or [docs.rs](https://docs.rs/molo)
+- [简体中文文档](docs/README.zh-CN.md) (Chinese README)
+
+## 📄 License
+
+Licensed under either of [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE),
+at your option.

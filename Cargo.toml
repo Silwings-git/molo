@@ -1,0 +1,48 @@
+[workspace]
+members = [".", "molo-macros"]
+resolver = "2"
+
+[package]
+name = "molo"
+version = "0.2.0"
+edition = "2024"
+rust-version = "1.97"
+description = "A lightweight Rust agent framework"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/Silwings-git/molo.git"
+readme = "README.md"
+keywords = ["agent", "llm", "ai", "framework"]
+categories = ["artificial-intelligence"]
+authors = ["silwings"]
+# Internal project files are excluded from the published package
+exclude = [".example.env", "docs/", ".github/"]
+
+[dependencies]
+# The path is stripped at publish time; the version is what crates.io resolves
+molo-macros = { path = "molo-macros", version = "0.2.0" }
+async-stream = "0.3"
+async-trait = "0.1"
+futures = "0.3"
+indexmap = "2"
+jsonschema = "0.49"
+reqwest = { version = "0.13", features = ["json", "stream"] }
+rmcp = { version = "3.1.2", default-features = false, features = ["client", "transport-child-process", "transport-streamable-http-client-reqwest"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+schemars = "1"
+thiserror = "2"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "io-std", "io-util", "fs", "process", "net", "time"] }
+tokio-util = "0.7.19"
+tracing = "0.1"
+
+[dev-dependencies]
+rmcp = { version = "3.1.2", features = ["server", "transport-io"] }
+dotenvy = "0.15"
+evalexpr = "13"
+tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
+criterion = "0.7"
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+
+[[bench]]
+name = "bench"
+harness = false

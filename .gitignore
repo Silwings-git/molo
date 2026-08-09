@@ -1,0 +1,4 @@
+/target
+
+# Local environment variables; see .example.env for the template
+.env

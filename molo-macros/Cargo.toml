@@ -1,0 +1,20 @@
+[package]
+name = "molo-macros"
+version = "0.2.0"
+edition = "2024"
+rust-version = "1.97"
+description = "Procedural macros for molo: one-shot tool definitions (#[molo::tool])"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/Silwings-git/molo-macros.git"
+readme = "README.md"
+keywords = ["agent", "llm", "ai", "macro"]
+categories = ["artificial-intelligence", "development-tools::procedural-macro-helpers"]
+authors = ["silwings"]
+
+[lib]
+proc-macro = true
+
+[dependencies]
+proc-macro2 = "1"
+quote = "1"
+syn = { version = "2", features = ["full"] }
