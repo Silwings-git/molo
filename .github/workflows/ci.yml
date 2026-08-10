@@ -2,7 +2,7 @@ name: CI
 
 on:
   push:
-    branches: [main, dev]
+    branches: [master]
   pull_request:
   workflow_dispatch:
 
@@ -15,7 +15,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        rust: [1.88.0, stable] # MSRV + latest
+        rust: [1.97.0, stable] # MSRV + latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@master
