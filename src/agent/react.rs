@@ -826,8 +826,8 @@ impl ReActAgent {
         }
     }
 
-    /// Assemble the full prompt for each request: System first (base prompt
-    /// + skill disclosure, per the assembly mode), followed by Memory's
+    /// Assemble the full prompt for each request: System first (base prompt +
+    /// skill disclosure, per the assembly mode), followed by Memory's
     /// conversation history.
     ///
     /// Assembly happens when the conversation starts and is not written to

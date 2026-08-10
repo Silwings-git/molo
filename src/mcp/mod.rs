@@ -212,8 +212,8 @@ impl McpClient {
         self
     }
 
-    /// Timeout for the whole connect flow (default 10s): child process startup
-    /// + protocol handshake. A timeout returns [`McpError::Connect`] with
+    /// Timeout for the whole connect flow (default 10s): child process startup +
+    /// protocol handshake. A timeout returns [`McpError::Connect`] with
     /// "timed out" in the message. Increase it for slow startup scenarios such
     /// as npx's first-run package fetch.
     pub fn with_connect_timeout(&mut self, timeout: Duration) -> &mut Self {
