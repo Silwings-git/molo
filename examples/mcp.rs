@@ -147,9 +147,10 @@ impl ServerHandler for FakeServer {
                     .unwrap_or_default();
                 Ok(CallToolResult::success(vec![ContentBlock::text(text.to_string())]).into())
             }
-            "fail" => {
-                Ok(CallToolResult::error(vec![ContentBlock::text("tool execution failed (demo)")]).into())
-            }
+            "fail" => Ok(CallToolResult::error(vec![ContentBlock::text(
+                "tool execution failed (demo)",
+            )])
+            .into()),
             name => Err(ErrorData::invalid_params(
                 format!("unknown tool: {name}"),
                 None,

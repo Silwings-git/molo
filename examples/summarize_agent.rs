@@ -141,7 +141,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     std::io::stdout().flush()?;
                 }
                 MessageChunk::ToolCall {
-                    id, name, arguments,
+                    id,
+                    name,
+                    arguments,
                 } => {
                     println!("\n  → calling {name}(#{id}), arguments: {arguments}");
                 }

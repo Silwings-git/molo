@@ -91,7 +91,9 @@ Rules:
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    println!("== Path 1: progressive disclosure (menu always present + load_skill reads on demand) ==");
+    println!(
+        "== Path 1: progressive disclosure (menu always present + load_skill reads on demand) =="
+    );
 
     // 1. Parse SKILL.md (pure in-memory, synchronous); registry add is the basis for hot plugging.
     let registry = SkillRegistry::new();
@@ -111,8 +113,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         },
         FakeReply::Text("Reviewed per the skill process; found 2 issues.".into()),
     ])));
-    let mut agent = ReActAgent::new(fake.clone(), ToolRegistry::new(), "You are a code review assistant")
-        .with_skills(registry);
+    let mut agent = ReActAgent::new(
+        fake.clone(),
+        ToolRegistry::new(),
+        "You are a code review assistant",
+    )
+    .with_skills(registry);
 
     let answer = agent.run("review the changes under docs/").await?;
     println!("answer: {answer}");
@@ -135,15 +141,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     println!();
-    println!("== Path 2: explicit user activation (activate_skill; the body is not decided by the model) ==");
+    println!(
+        "== Path 2: explicit user activation (activate_skill; the body is not decided by the model) =="
+    );
 
     let registry = SkillRegistry::new();
     registry.add(Skill::parse(RELEASE_NOTES_SKILL)?);
     let fake = SharedFake(Arc::new(FakeProvider::new([FakeReply::Text(
         "OK, generated the release notes per the rules.".into(),
     )])));
-    let mut agent =
-        ReActAgent::new(fake.clone(), ToolRegistry::new(), "You are a release assistant").with_skills(registry);
+    let mut agent = ReActAgent::new(
+        fake.clone(),
+        ToolRegistry::new(),
+        "You are a release assistant",
+    )
+    .with_skills(registry);
     // The user / application layer activates directly: the body is merged into the system prompt immediately; the model does not need to call load_skill.
     assert!(agent.activate_skill("release-notes"));
     let answer = agent.run("generate the release notes").await?;
@@ -157,7 +169,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     println!();
-    println!("== Path 3: multi-source directory discovery (from_dirs, user directory + project directory merged) ==");
+    println!(
+        "== Path 3: multi-source directory discovery (from_dirs, user directory + project directory merged) =="
+    );
 
     // Self-contained demo: write two sets of skill files into a temp directory, then scan across sources.
     let dir = std::env::temp_dir().join(format!("molo-skill-demo-{}", std::process::id()));

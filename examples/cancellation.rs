@@ -80,7 +80,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
-    let mut stream = agent.run_stream_cancellable("say something", &token).await?;
+    let mut stream = agent
+        .run_stream_cancellable("say something", &token)
+        .await?;
     let mut got = String::new();
     while let Some(event) = stream.next().await {
         match event? {

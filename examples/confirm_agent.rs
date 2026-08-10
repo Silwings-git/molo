@@ -115,7 +115,10 @@ impl Tool for ConfirmTool {
         let args: ConfirmArgs = serde_json::from_value(arguments)?;
         let answer = self
             .channel
-            .ask(&format!("Confirm executing \"{}\"? Reply yes or no", args.operation))
+            .ask(&format!(
+                "Confirm executing \"{}\"? Reply yes or no",
+                args.operation
+            ))
             .await
             .map_err(|e| ToolError::Execution(e.to_string()))?;
         if answer == "yes" {

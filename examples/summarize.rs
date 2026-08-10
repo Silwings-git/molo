@@ -24,9 +24,7 @@
 
 use std::sync::Arc;
 
-use molo::memory::{
-    CharTokenCounter, Memory, SummarizeStrategy, TokenCounter, WindowMemory,
-};
+use molo::memory::{CharTokenCounter, Memory, SummarizeStrategy, TokenCounter, WindowMemory};
 use molo::{ContentBlock, FakeProvider, FakeReply, Message};
 
 /// Total tokens of a message sequence, counting the same way as WindowMemory.
@@ -70,11 +68,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     ]));
 
     // Budget: 30 tokens; the full 4 rounds cost 48 > 30, triggering compression.
-    let mut memory = WindowMemory::new(30)
-        .with_strategy(Arc::new(SummarizeStrategy::new(fake.clone())));
+    let mut memory =
+        WindowMemory::new(30).with_strategy(Arc::new(SummarizeStrategy::new(fake.clone())));
     for i in 1..=4 {
-        memory.record(Message::user(format!("question for round {i}"))).await?;
-        memory.record(Message::assistant(format!("reply for round {i}"))).await?;
+        memory
+            .record(Message::user(format!("question for round {i}")))
+            .await?;
+        memory
+            .record(Message::assistant(format!("reply for round {i}")))
+            .await?;
     }
     let full_tokens = count_tokens(&[
         Message::user("question for round 1"),
@@ -88,7 +90,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let context = memory.context().await?;
     let tokens = count_tokens(&context).await?;
-    println!("1. first compression: 8 messages → {} ≈ {tokens} tokens (summary + most recent round)", context.len());
+    println!(
+        "1. first compression: 8 messages → {} ≈ {tokens} tokens (summary + most recent round)",
+        context.len()
+    );
     for message in &context {
         println!("   {message:?}");
     }
@@ -104,12 +109,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         again.len()
     );
     assert_eq!(again, context);
-    assert_eq!(fake.requests().len(), 1, "after compression, under-budget fetches must not call the summarizer model again");
+    assert_eq!(
+        fake.requests().len(),
+        1,
+        "after compression, under-budget fetches must not call the summarizer model again"
+    );
 
     // Append rounds 5 and 6 (≈ 50 > 30): compress again — the old summary is merged into the new one as input.
     for i in 5..=6 {
-        memory.record(Message::user(format!("question for round {i}"))).await?;
-        memory.record(Message::assistant(format!("reply for round {i}"))).await?;
+        memory
+            .record(Message::user(format!("question for round {i}")))
+            .await?;
+        memory
+            .record(Message::assistant(format!("reply for round {i}")))
+            .await?;
     }
     let context = memory.context().await?;
     let tokens = count_tokens(&context).await?;
@@ -122,7 +135,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     assert_eq!(context.len(), 3);
     assert_eq!(context[1], Message::user("question for round 6"));
-    assert_eq!(fake.requests().len(), 2, "each compression calls the summarizer model once");
+    assert_eq!(
+        fake.requests().len(),
+        2,
+        "each compression calls the summarizer model once"
+    );
 
     // The second compression's request input: verify the old summary was merged in (incremental compression).
     let requests = fake.requests();
@@ -130,8 +147,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         unreachable!("summary input is a user message");
     };
     let ContentBlock::Text(text) = &blocks[0];
-    assert!(text.contains("A and B have been answered"), "incremental compression must carry the previous summary");
-    println!("4. the summarizer model received 2 requests in total; the second request's input contains the previous summary (incremental merge)");
+    assert!(
+        text.contains("A and B have been answered"),
+        "incremental compression must carry the previous summary"
+    );
+    println!(
+        "4. the summarizer model received 2 requests in total; the second request's input contains the previous summary (incremental merge)"
+    );
 
     Ok(())
 }

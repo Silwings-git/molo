@@ -151,7 +151,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     ]);
     let mut session_registry = ToolRegistry::new();
     session_registry.register(SessionTool);
-    let mut agent = react_agent!(fake, session_registry, "You are an assistant").with_state(state.clone());
+    let mut agent =
+        react_agent!(fake, session_registry, "You are an assistant").with_state(state.clone());
     println!("2. application writes across runs (a new agent reuses the same state):");
     run_and_show(&mut agent, "query the current user").await?;
 
@@ -161,7 +162,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         state.get::<Session>().unwrap(),
         state.get::<usize>().unwrap_or(0)
     );
-    println!("   → shared by cloning: any tool / Agent holding state.clone() shares the same instance");
+    println!(
+        "   → shared by cloning: any tool / Agent holding state.clone() shares the same instance"
+    );
 
     Ok(())
 }

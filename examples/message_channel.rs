@@ -88,7 +88,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     channel.notify("Starting the task...").await?;
 
     // 2. ask: request-response; with multiple concurrent asks, the channel guarantees only one request is presented at a time.
-    let answer = channel.ask("Execute a dangerous operation? Reply yes or no").await?;
+    let answer = channel
+        .ask("Execute a dangerous operation? Reply yes or no")
+        .await?;
     println!("you replied: {answer}");
 
     // 3. The injection shape of a tool holding the channel: ConfirmTool asks internally; execution is pause-resume.
@@ -119,7 +121,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let broadcast = BroadcastChannel::new(16);
     let worker_a = broadcast.subscribe();
     let worker_b = broadcast.subscribe();
-    broadcast.notify("all workers, the task is starting").await?;
+    broadcast
+        .notify("all workers, the task is starting")
+        .await?;
     let (msg_a, msg_b) = tokio::join!(worker_a.recv(), worker_b.recv());
     println!("worker A received: {}", msg_a?.text());
     println!("worker B received: {}", msg_b?.text());

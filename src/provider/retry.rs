@@ -620,6 +620,9 @@ mod tests {
             assert!(d > 0.0 && d < 1.0);
             seen.insert(d.to_bits());
         }
-        assert!(seen.len() > 1, "LCG draws must be dispersed (state advancing)");
+        assert!(
+            seen.len() > 1,
+            "LCG draws must be dispersed (state advancing)"
+        );
     }
 }

@@ -33,7 +33,9 @@ struct CalcArgs {
 }
 
 /// Struct argument: one macro line generates the tool (registered name = function name).
-#[molo::tool(description = "Evaluates a math expression; supports basic arithmetic and parentheses")]
+#[molo::tool(
+    description = "Evaluates a math expression; supports basic arithmetic and parentheses"
+)]
 async fn calculator(args: CalcArgs) -> Result<String, ToolError> {
     let value =
         evalexpr::eval(&args.expression).map_err(|e| ToolError::Execution(e.to_string()))?;

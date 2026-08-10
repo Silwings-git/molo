@@ -1010,7 +1010,10 @@ mod tests {
 
     #[test]
     fn content_to_text_joins_text_blocks() {
-        let blocks = vec![ContentBlock::text("first line"), ContentBlock::text("second line")];
+        let blocks = vec![
+            ContentBlock::text("first line"),
+            ContentBlock::text("second line"),
+        ];
         assert_eq!(content_to_text(&blocks), "first line\nsecond line");
     }
 
@@ -1034,7 +1037,11 @@ mod tests {
 
     #[test]
     fn map_tool_keeps_prefix_and_passthrough() {
-        let tool = RmcpTool::new("echo", "description", tool_schema(json!({ "type": "object" })));
+        let tool = RmcpTool::new(
+            "echo",
+            "description",
+            tool_schema(json!({ "type": "object" })),
+        );
         let mapped = map_tool("fs", tool, true);
         assert_eq!(mapped.name, "fs__echo");
         assert_eq!(mapped.raw_name, "echo");

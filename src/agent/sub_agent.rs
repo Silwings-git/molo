@@ -669,11 +669,15 @@ mod tests {
     async fn dynamic_factory_fresh_agent_per_call() {
         let spawns = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let spawns_factory = spawns.clone();
-        let tool =
-            SubAgentTool::from_factory("delegate", "One-shot delegation", json!({}), move |_args| {
+        let tool = SubAgentTool::from_factory(
+            "delegate",
+            "One-shot delegation",
+            json!({}),
+            move |_args| {
                 spawns_factory.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 Ok(Box::new(RecordingAgent::default()))
-            });
+            },
+        );
 
         tool.call(json!({ "q": 1 }), &SharedState::default())
             .await
@@ -976,7 +980,17 @@ mod tests {
                 .iter()
                 .any(|m| matches!(m, Message::System(s) if s.contains("review expert")))
         );
-        assert!(reqs[1].messages.iter().any(|m| user_has_text(m, "task one")));
-        assert!(reqs[1].messages.iter().any(|m| user_has_text(m, "task two")));
+        assert!(
+            reqs[1]
+                .messages
+                .iter()
+                .any(|m| user_has_text(m, "task one"))
+        );
+        assert!(
+            reqs[1]
+                .messages
+                .iter()
+                .any(|m| user_has_text(m, "task two"))
+        );
     }
 }

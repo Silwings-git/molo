@@ -2162,8 +2162,7 @@ mod tests {
         let mut aggregator = ToolCallAggregator::default();
         let line1 =
             r#"data: {"choices":[{"delta":{"reasoning_content":"first"},"finish_reason":null}]}"#;
-        let line2 =
-            r#"data: {"choices":[{"delta":{"reasoning_content":" multiply"},"finish_reason":null}]}"#;
+        let line2 = r#"data: {"choices":[{"delta":{"reasoning_content":" multiply"},"finish_reason":null}]}"#;
         let line3 = r#"data: {"choices":[{"delta":{"content":"answer"},"finish_reason":"stop"}]}"#;
 
         assert!(parse_events(line1, &mut aggregator).is_empty());
@@ -2283,7 +2282,8 @@ mod tests {
         // Text and tool requests in the same turn: Deltas are emitted as they
         // arrive, tool calls whole at the end of the turn.
         let mut aggregator = ToolCallAggregator::default();
-        let line1 = r#"data: {"choices":[{"delta":{"content":"let me compute"},"finish_reason":null}]}"#;
+        let line1 =
+            r#"data: {"choices":[{"delta":{"content":"let me compute"},"finish_reason":null}]}"#;
         let line2 = r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"name":"calculator","arguments":"{}"}}]},"finish_reason":"tool_calls"}]}"#;
 
         assert_eq!(

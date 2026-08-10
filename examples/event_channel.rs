@@ -147,7 +147,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Environment side: create the channel → inject it into the agent → subscribe.
     let channel = BroadcastEventChannel::new(256);
     let mut rx = channel.subscribe();
-    let mut agent = molo::react_agent!(fake, registry, "You are an assistant").with_event_channel(channel);
+    let mut agent =
+        molo::react_agent!(fake, registry, "You are an assistant").with_event_channel(channel);
 
     println!("== subscribing to the EventChannel to observe a run ==");
     agent.run("execute the two tools").await?;
@@ -169,7 +170,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     .with_event_channel(channel);
     agent.run("are you there").await?;
     drop(agent);
-    println!("== MpscEventChannel (single consumer, strictly ordered and lossless within capacity) ==");
+    println!(
+        "== MpscEventChannel (single consumer, strictly ordered and lossless within capacity) =="
+    );
     while let Some(event) = rx.recv().await {
         println!("  [{}]", event.name());
     }

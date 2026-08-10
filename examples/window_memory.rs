@@ -129,10 +129,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     // After materialization, under budget: the next fetch is a direct clone, zero recompute.
     let again = memory.context().await?;
-    println!("   → fetched again: {} (under budget, zero recompute)", again.len());
+    println!(
+        "   → fetched again: {} (under budget, zero recompute)",
+        again.len()
+    );
     // Appending new messages breaks the budget → chained compression: input = the last compression result + new messages.
     memory.record(Message::user("question for round 5")).await?;
-    memory.record(Message::assistant("reply for round 5")).await?;
+    memory
+        .record(Message::assistant("reply for round 5"))
+        .await?;
     let context = memory.context().await?;
     println!(
         "   → compressed again after appending round 5: {} (input includes the previous summary)",

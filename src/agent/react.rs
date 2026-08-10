@@ -1983,7 +1983,11 @@ mod tests {
             .record(Message::assistant("first-round reply"))
             .await
             .unwrap();
-        agent.memory.record(Message::user("second round")).await.unwrap();
+        agent
+            .memory
+            .record(Message::user("second round"))
+            .await
+            .unwrap();
         agent
             .memory
             .record(Message::assistant("second-round reply"))
@@ -1993,7 +1997,10 @@ mod tests {
         let ctx = agent.memory.context().await.unwrap();
         assert_eq!(
             ctx,
-            vec![Message::user("second round"), Message::assistant("second-round reply")]
+            vec![
+                Message::user("second round"),
+                Message::assistant("second-round reply")
+            ]
         );
     }
 
@@ -2524,7 +2531,10 @@ mod tests {
 
         let id_a = agent_a.next_run_id();
         let id_b = agent_b.next_run_id();
-        assert_ne!(id_a, id_b, "back-to-back instances must not collide on run_id");
+        assert_ne!(
+            id_a, id_b,
+            "back-to-back instances must not collide on run_id"
+        );
         // Same format as the trace tests: run-{ts}-{n}.
         assert!(id_a.starts_with("run-") && id_b.starts_with("run-"));
     }
@@ -3237,7 +3247,10 @@ mod tests {
         }
         let fake = SharedFake::new([FakeReply::Text(r#"{"temperature":"30"}"#.into())]);
         let mut agent = agent(fake.clone(), "");
-        let err: AgentError = agent.run_typed::<Weather>("Beijing weather").await.unwrap_err();
+        let err: AgentError = agent
+            .run_typed::<Weather>("Beijing weather")
+            .await
+            .unwrap_err();
         assert!(matches!(err, AgentError::StructuredParse(_)));
     }
 
@@ -3291,7 +3304,10 @@ mod tests {
     #[tokio::test]
     async fn structured_output_stream_exhausts_retry_budget() {
         let schema = serde_json::json!({ "type": "object" });
-        let fake = SharedFake::new([FakeReply::Text("bad1".into()), FakeReply::Text("bad2".into())]);
+        let fake = SharedFake::new([
+            FakeReply::Text("bad1".into()),
+            FakeReply::Text("bad2".into()),
+        ]);
         let mut agent = agent(fake.clone(), "").with_config(AgentConfig {
             max_structured_retries: 1,
             ..Default::default()
@@ -4340,7 +4356,10 @@ mod tests {
 
         agent.run("Are you there").await.unwrap();
         let system = system_text(&fake);
-        assert!(system.starts_with("You are an assistant"), "base prompt must come first: {system}");
+        assert!(
+            system.starts_with("You are an assistant"),
+            "base prompt must come first: {system}"
+        );
         assert!(system.contains("- code-review: Review code"));
         assert!(system.contains("- greet: Say hello"));
     }
@@ -4348,11 +4367,8 @@ mod tests {
     #[tokio::test]
     async fn with_skills_registers_load_skill() {
         let fake = SharedFake::new([FakeReply::Text("OK".into())]);
-        let mut agent = agent(fake.clone(), "You are an assistant").with_skills(skill_registry(&[(
-            "greet",
-            "Say hello",
-            "Hello body",
-        )]));
+        let mut agent = agent(fake.clone(), "You are an assistant")
+            .with_skills(skill_registry(&[("greet", "Say hello", "Hello body")]));
 
         // The tool is registered into the registry; the schema reaches the
         // request's tools, visible to the model.
@@ -4375,11 +4391,8 @@ mod tests {
             },
             FakeReply::Text("Done".into()),
         ]);
-        let mut agent = agent(fake.clone(), "You are an assistant").with_skills(skill_registry(&[(
-            "greet",
-            "Say hello",
-            "Hello body",
-        )]));
+        let mut agent = agent(fake.clone(), "You are an assistant")
+            .with_skills(skill_registry(&[("greet", "Say hello", "Hello body")]));
 
         let answer = agent.run("Say hello").await.unwrap();
         assert_eq!(answer, "Done");
@@ -4408,11 +4421,8 @@ mod tests {
             },
             FakeReply::Text("Try another".into()),
         ]);
-        let mut agent = agent(fake.clone(), "You are an assistant").with_skills(skill_registry(&[(
-            "greet",
-            "Say hello",
-            "Hello body",
-        )]));
+        let mut agent = agent(fake.clone(), "You are an assistant")
+            .with_skills(skill_registry(&[("greet", "Say hello", "Hello body")]));
 
         agent.run("Load skill").await.unwrap();
         tool_result_contains(&fake, "not found");
@@ -4441,10 +4451,11 @@ mod tests {
     #[tokio::test]
     async fn with_skills_inline_embeds_all_bodies() {
         let fake = SharedFake::new([FakeReply::Text("OK".into())]);
-        let mut agent = agent(fake.clone(), "You are an assistant").with_skills_inline(skill_registry(&[
-            ("greet", "Say hello", "Hello body"),
-            ("other", "Another", "Other content"),
-        ]));
+        let mut agent =
+            agent(fake.clone(), "You are an assistant").with_skills_inline(skill_registry(&[
+                ("greet", "Say hello", "Hello body"),
+                ("other", "Another", "Other content"),
+            ]));
         assert!(!agent.registry.names().contains(&"load_skill".to_string()));
 
         agent.run("Are you there").await.unwrap();
@@ -4491,11 +4502,8 @@ mod tests {
     #[tokio::test]
     async fn deactivate_skill_returns_to_menu() {
         let fake = SharedFake::new([FakeReply::Text("OK".into())]);
-        let mut agent = agent(fake.clone(), "You are an assistant").with_skills(skill_registry(&[(
-            "greet",
-            "Say hello",
-            "Hello body",
-        )]));
+        let mut agent = agent(fake.clone(), "You are an assistant")
+            .with_skills(skill_registry(&[("greet", "Say hello", "Hello body")]));
         assert!(agent.activate_skill("greet"));
         assert!(agent.deactivate_skill("greet"));
 
@@ -4529,7 +4537,8 @@ mod tests {
     #[tokio::test]
     async fn empty_skills_registry_zero_cost() {
         let fake = SharedFake::new([FakeReply::Text("OK".into())]);
-        let mut agent = agent(fake.clone(), "You are an assistant").with_skills(SkillRegistry::new());
+        let mut agent =
+            agent(fake.clone(), "You are an assistant").with_skills(SkillRegistry::new());
         agent.run("Are you there").await.unwrap();
         // Empty registry: the system prompt is unchanged.
         assert_eq!(system_text(&fake), "You are an assistant");
@@ -4544,7 +4553,8 @@ mod tests {
             FakeReply::Text("first round".into()),
             FakeReply::Text("second round".into()),
         ]);
-        let mut swap_agent = agent(fake.clone(), "You are an assistant").with_skills(SkillRegistry::new());
+        let mut swap_agent =
+            agent(fake.clone(), "You are an assistant").with_skills(SkillRegistry::new());
 
         swap_agent.run("Are you there").await.unwrap();
         // The application side hot-swaps via the pub skills handle: it takes
@@ -4564,7 +4574,8 @@ mod tests {
             },
             FakeReply::Text("Done".into()),
         ]);
-        let mut late_agent = agent(fake2.clone(), "You are an assistant").with_skills(SkillRegistry::new());
+        let mut late_agent =
+            agent(fake2.clone(), "You are an assistant").with_skills(SkillRegistry::new());
         late_agent
             .skills
             .add(skill("late", "Skill added later", "Late body"));
@@ -4602,7 +4613,11 @@ mod tests {
         ]);
         let mut agent = agent(fake.clone(), "You are an assistant")
             .with_memory(crate::memory::WindowMemory::new(3))
-            .with_skills(skill_registry(&[("greet", "Say hello", "Skill body content")]));
+            .with_skills(skill_registry(&[(
+                "greet",
+                "Say hello",
+                "Skill body content",
+            )]));
 
         agent.run("Load").await.unwrap();
         agent.run("round two").await.unwrap();
@@ -4628,9 +4643,18 @@ mod tests {
             })
             .collect();
         let joined = texts.join("|");
-        assert!(joined.contains("Skill body content"), "skill body should stay resident: {joined}");
-        assert!(joined.contains("round three"), "latest round should be kept: {joined}");
-        assert!(!joined.contains("round two"), "middle regular rounds should be trimmed: {joined}");
+        assert!(
+            joined.contains("Skill body content"),
+            "skill body should stay resident: {joined}"
+        );
+        assert!(
+            joined.contains("round three"),
+            "latest round should be kept: {joined}"
+        );
+        assert!(
+            !joined.contains("round two"),
+            "middle regular rounds should be trimmed: {joined}"
+        );
     }
 
     #[tokio::test]

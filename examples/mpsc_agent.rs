@@ -53,7 +53,9 @@ impl Tool for AskExpertTool {
     fn schema(&self) -> ToolSchema {
         ToolSchema {
             name: "ask_expert".into(),
-            description: "Hands the question to the expert agent for an answer; returns the expert's reply.".into(),
+            description:
+                "Hands the question to the expert agent for an answer; returns the expert's reply."
+                    .into(),
             parameters: serde_json::to_value(schemars::schema_for!(AskArgs))
                 .expect("tool schema must serialize"),
         }

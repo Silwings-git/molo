@@ -1273,7 +1273,10 @@ mod tests {
     }
 
     fn minimal(name: &str) -> Skill {
-        Skill::parse(&format!("---\nname: {name}\ndescription: description\n---\nbody")).unwrap()
+        Skill::parse(&format!(
+            "---\nname: {name}\ndescription: description\n---\nbody"
+        ))
+        .unwrap()
     }
 
     // ---------- parsing: valid input ----------
@@ -1365,8 +1368,9 @@ Review steps.
     fn parse_allowed_tools_flow_list_unbalanced_brackets_rejected() {
         // Unbalanced brackets: explicit error instead of silently
         // producing garbage tool names.
-        let err = Skill::parse("---\nname: a\ndescription: description\nallowed-tools: [Bash\n---\nbody")
-            .unwrap_err();
+        let err =
+            Skill::parse("---\nname: a\ndescription: description\nallowed-tools: [Bash\n---\nbody")
+                .unwrap_err();
         assert!(err.to_string().contains("unbalanced brackets"));
     }
 
@@ -1387,9 +1391,10 @@ Review steps.
     fn parse_body_with_blank_line_after_delimiter() {
         // A blank line immediately after the end delimiter is formatting;
         // strip it.
-        let skill =
-            Skill::parse("---\nname: a\ndescription: description\n---\n\nfirst body line\n\nsecond body line")
-                .unwrap();
+        let skill = Skill::parse(
+            "---\nname: a\ndescription: description\n---\n\nfirst body line\n\nsecond body line",
+        )
+        .unwrap();
         assert_eq!(skill.body(), "first body line\n\nsecond body line");
     }
 
@@ -1409,7 +1414,8 @@ Review steps.
 
     #[test]
     fn parse_quoted_values_stripped() {
-        let skill = Skill::parse("---\nname: a\ndescription: \"quoted description\"\n---\n").unwrap();
+        let skill =
+            Skill::parse("---\nname: a\ndescription: \"quoted description\"\n---\n").unwrap();
         assert_eq!(skill.description(), "quoted description");
     }
 
@@ -1438,7 +1444,9 @@ Review steps.
 
     #[test]
     fn parse_missing_end_delimiter() {
-        let err = Skill::parse("---\nname: a\ndescription: description\nbody without end delimiter").unwrap_err();
+        let err =
+            Skill::parse("---\nname: a\ndescription: description\nbody without end delimiter")
+                .unwrap_err();
         assert!(matches!(err, SkillError::InvalidFrontmatter(_)));
     }
 
@@ -1502,8 +1510,8 @@ Review steps.
 
     #[test]
     fn parse_metadata_inline_value_rejected() {
-        let err =
-            Skill::parse("---\nname: a\ndescription: description\nmetadata: foo\n---\n").unwrap_err();
+        let err = Skill::parse("---\nname: a\ndescription: description\nmetadata: foo\n---\n")
+            .unwrap_err();
         assert!(matches!(err, SkillError::InvalidFrontmatter(_)));
     }
 
@@ -1523,7 +1531,8 @@ Review steps.
     fn parse_invalid_allowed_tool_entries() {
         // Unclosed parens / trailing content after parens / empty entries.
         for bad in ["Bash(git:*", "Bash)git:*", "()", "(x)"] {
-            let content = format!("---\nname: a\ndescription: description\nallowed-tools: {bad}\n---\n");
+            let content =
+                format!("---\nname: a\ndescription: description\nallowed-tools: {bad}\n---\n");
             assert!(
                 matches!(
                     Skill::parse(&content),
@@ -1676,7 +1685,11 @@ Review steps.
         let skill_dir = dir.join("a");
         std::fs::create_dir_all(&skill_dir).unwrap();
         let secret = dir.join("secret.md");
-        std::fs::write(&secret, "---\nname: a\ndescription: description\n---\nsecret body").unwrap();
+        std::fs::write(
+            &secret,
+            "---\nname: a\ndescription: description\n---\nsecret body",
+        )
+        .unwrap();
         std::os::unix::fs::symlink(&secret, skill_dir.join("SKILL.md")).unwrap();
 
         let err = Skill::from_dir(&skill_dir).await.unwrap_err();

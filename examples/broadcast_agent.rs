@@ -52,7 +52,8 @@ impl Tool for NotifyWorkersTool {
     fn schema(&self) -> ToolSchema {
         ToolSchema {
             name: "notify_workers".into(),
-            description: "Broadcasts a message to all workers; returns success when broadcast.".into(),
+            description: "Broadcasts a message to all workers; returns success when broadcast."
+                .into(),
             parameters: serde_json::to_value(schemars::schema_for!(NotifyArgs))
                 .expect("tool schema must serialize"),
         }

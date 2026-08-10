@@ -219,7 +219,9 @@ impl SummarizeStrategy {
             }
         };
         let Some(summary) = summary else {
-            return fallback.trim_with_counts(messages, counts, budget, counter).await;
+            return fallback
+                .trim_with_counts(messages, counts, budget, counter)
+                .await;
         };
 
         let mut result = Vec::with_capacity(keep + 1);
@@ -256,7 +258,8 @@ impl TrimStrategy for SummarizeStrategy {
         for m in messages {
             counts.push(count_message(counter, m).await?);
         }
-        self.trim_with_counts(messages, &counts, budget, counter).await
+        self.trim_with_counts(messages, &counts, budget, counter)
+            .await
     }
 
     async fn trim_with_counts(
@@ -274,7 +277,8 @@ impl TrimStrategy for SummarizeStrategy {
         }
         debug_assert_eq!(messages.len(), counts.len());
         let fallback = WindowDrop;
-        self.trim_impl(messages, counts, budget, counter, &fallback).await
+        self.trim_impl(messages, counts, budget, counter, &fallback)
+            .await
     }
 }
 
@@ -323,10 +327,10 @@ fn messages_to_text(messages: &[Message]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Arc;
     use crate::memory::{CharTokenCounter, Memory, WindowMemory};
     use crate::message::ToolCall;
     use crate::provider::{FakeProvider, FakeReply, ProviderError};
+    use std::sync::Arc;
 
     /// Builds a conversation (round `start` through round `n`; about 11 tokens
     /// per round).
@@ -354,13 +358,18 @@ mod tests {
     /// the summarizer only receives the compacted part (kept rounds excluded).
     #[tokio::test]
     async fn summarizes_old_rounds_and_keeps_recent() {
-        let fake = Arc::new(FakeProvider::new([FakeReply::Text("Key points from earlier rounds".into())]));
+        let fake = Arc::new(FakeProvider::new([FakeReply::Text(
+            "Key points from earlier rounds".into(),
+        )]));
         let mut memory = WindowMemory::new(30).with_strategy(strategy(fake.clone()));
         record_rounds(&mut memory, 1, 4).await;
 
         let context = memory.context().await.unwrap();
         assert_eq!(context.len(), 3);
-        assert_eq!(context[0], Message::system(format!("{SUMMARY_PREFIX}Key points from earlier rounds")));
+        assert_eq!(
+            context[0],
+            Message::system(format!("{SUMMARY_PREFIX}Key points from earlier rounds"))
+        );
         assert_eq!(context[1], Message::user("Question from round 4"));
         assert_eq!(context[2], Message::assistant("Answer from round 4"));
 
@@ -369,7 +378,9 @@ mod tests {
         let requests = fake.requests();
         assert_eq!(requests.len(), 1);
         let messages = &requests[0].messages;
-        assert!(matches!(&messages[0], Message::System(p) if p.contains("conversation-history compressor")));
+        assert!(
+            matches!(&messages[0], Message::System(p) if p.contains("conversation-history compressor"))
+        );
         let Message::User(blocks) = &messages[1] else {
             panic!("expected user message");
         };
@@ -387,8 +398,9 @@ mod tests {
         // round is 11 tokens ("Question/Answer from round N"): keep the recent
         // 2 rounds (22); adding a 3rd (33 > 26) stops. Result: [summary,
         // round 3, round 4].
-        let mut memory = WindowMemory::new(30)
-            .with_strategy(Arc::new(SummarizeStrategy::new(fake.clone()).with_summary_max_tokens(4)));
+        let mut memory = WindowMemory::new(30).with_strategy(Arc::new(
+            SummarizeStrategy::new(fake.clone()).with_summary_max_tokens(4),
+        ));
         record_rounds(&mut memory, 1, 4).await;
 
         let context = memory.context().await.unwrap();
@@ -405,15 +417,19 @@ mod tests {
             FakeReply::Text("first segment highlights".into()),
             FakeReply::Text("merged highlights".into()),
         ]));
-        let mut memory = WindowMemory::new(30)
-            .with_strategy(Arc::new(SummarizeStrategy::new(fake.clone()).with_summary_max_tokens(4)));
+        let mut memory = WindowMemory::new(30).with_strategy(Arc::new(
+            SummarizeStrategy::new(fake.clone()).with_summary_max_tokens(4),
+        ));
         record_rounds(&mut memory, 1, 4).await;
         memory.context().await.unwrap(); // first compaction → [summary, u3, a3, u4, a4]
 
         // Append rounds 5 and 6: over budget again → second compaction.
         record_rounds(&mut memory, 5, 6).await;
         let context = memory.context().await.unwrap();
-        assert_eq!(context[0], Message::system(format!("{SUMMARY_PREFIX}merged highlights")));
+        assert_eq!(
+            context[0],
+            Message::system(format!("{SUMMARY_PREFIX}merged highlights"))
+        );
         // Budget 30 minus reserve 4 → 26: keep the 2 most recent rounds
         // (11 + 11); the earlier messages (including the old summary) go to the
         // second summarization. Result: [new summary, u5, a5, u6, a6].
@@ -459,7 +475,10 @@ mod tests {
         // Storage was not materialized: still over budget on the second call →
         // the strategy runs again, this time succeeding.
         let context = memory.context().await.unwrap();
-        assert_eq!(context[0], Message::system(format!("{SUMMARY_PREFIX}second attempt succeeded")));
+        assert_eq!(
+            context[0],
+            Message::system(format!("{SUMMARY_PREFIX}second attempt succeeded"))
+        );
         assert_eq!(fake.requests().len(), 2);
     }
 
@@ -482,12 +501,20 @@ mod tests {
     async fn single_round_over_budget_returns_as_is() {
         let fake = Arc::new(FakeProvider::new([FakeReply::Text("summary".into())]));
         let mut memory = WindowMemory::new(5).with_strategy(strategy(fake.clone()));
-        memory.record(Message::user("An extremely long user message, over budget in a single round")).await.unwrap();
+        memory
+            .record(Message::user(
+                "An extremely long user message, over budget in a single round",
+            ))
+            .await
+            .unwrap();
         memory.record(Message::assistant("Reply")).await.unwrap();
 
         let context = memory.context().await.unwrap();
         assert_eq!(context.len(), 2);
-        assert!(fake.requests().is_empty(), "with nothing to compact the summarizer must not be called");
+        assert!(
+            fake.requests().is_empty(),
+            "with nothing to compact the summarizer must not be called"
+        );
     }
 
     /// Defensive: an empty message list is returned as-is.

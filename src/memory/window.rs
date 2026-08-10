@@ -1027,7 +1027,9 @@ mod tests {
     async fn keeps_last_round_even_when_over_budget() {
         let mut memory = WindowMemory::new(3);
         memory
-            .record(Message::user("An extremely long user message, over budget in a single round"))
+            .record(Message::user(
+                "An extremely long user message, over budget in a single round",
+            ))
             .await
             .unwrap();
         memory.record(Message::assistant("Reply")).await.unwrap();
@@ -1360,7 +1362,9 @@ mod tests {
         #[async_trait::async_trait]
         impl TokenCounter for FailingCounter {
             async fn count(&self, _text: &str) -> Result<usize, MemoryError> {
-                Err(MemoryError::TokenCount("remote counting API unavailable".into()))
+                Err(MemoryError::TokenCount(
+                    "remote counting API unavailable".into(),
+                ))
             }
         }
 
@@ -1446,14 +1450,16 @@ mod tests {
         let mut all_kept = true;
         for _ in 0..5 {
             let context = memory.context().await.unwrap();
-            if !context
-                .iter()
-                .any(|m| matches!(m, Message::ToolResult { content, .. } if content == "skill body"))
-            {
+            if !context.iter().any(
+                |m| matches!(m, Message::ToolResult { content, .. } if content == "skill body"),
+            ) {
                 all_kept = false;
                 break;
             }
         }
-        assert!(all_kept, "the protected message must survive repeated trims");
+        assert!(
+            all_kept,
+            "the protected message must survive repeated trims"
+        );
     }
 }

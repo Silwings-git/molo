@@ -35,7 +35,9 @@ async fn main() -> Result<(), molo::AgentError> {
         "You are a weather assistant; output JSON only",
     );
 
-    let weather: Weather = agent.run_typed("How is the weather in Beijing today").await?;
+    let weather: Weather = agent
+        .run_typed("How is the weather in Beijing today")
+        .await?;
     println!(
         "typed output: city = {}, temperature = {}°C, condition = {}",
         weather.city, weather.temperature, weather.condition
