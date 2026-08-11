@@ -316,9 +316,8 @@ fn stream_events(
                 usage: Some(Usage::default()),
             }),
         ]),
-        // Order matches the StreamEvent docs: content Deltas come first, and
-        // Reasoning is emitted whole at the end of the turn (same reordering
-        // behavior as OpenAiProvider's wire handling).
+        // Scripted order: the content Delta first, then the Reasoning
+        // fragment, then Done.
         FakeReply::TextWithReasoning { content, reasoning } => Ok(vec![
             Ok(StreamEvent::Delta(content)),
             Ok(StreamEvent::Reasoning(reasoning)),
@@ -527,8 +526,8 @@ mod tests {
         }]);
 
         let mut stream = fake.stream_chat(ChatRequest::default()).await.unwrap();
-        // Order matches the StreamEvent docs: content Deltas first, Reasoning
-        // at the end of the turn.
+        // Scripted order: the content Delta first, then the Reasoning
+        // fragment, then Done.
         assert_eq!(
             stream.next().await.unwrap().unwrap(),
             StreamEvent::Delta("hi".into())

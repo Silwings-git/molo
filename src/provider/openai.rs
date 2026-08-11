@@ -665,9 +665,13 @@ fn parse_sse_line(
         events.push(Ok(StreamEvent::Delta(content)));
     }
     if let Some(reasoning) = choice.delta.reasoning_content
-        && let Err(e) = tool_calls.push_reasoning(&reasoning)
+        && !tool_calls.errored
     {
-        return line_error(tool_calls, e);
+        // Reasoning fragments are forwarded as they arrive (like Delta), not
+        // deferred to the end of the turn: consumers render thinking in real
+        // time. Each fragment is bounded by the SSE line limit, so no
+        // aggregation-side size check is needed.
+        events.push(Ok(StreamEvent::Reasoning(reasoning)));
     }
 
     if let Some(calls) = choice.delta.tool_calls {
@@ -678,14 +682,11 @@ fn parse_sse_line(
         }
     }
     if let Some(finish_reason) = choice.finish_reason {
-        // No success events after an error has been seen: ToolCall /
-        // Reasoning are blocked just like Done / usage.
+        // No success events after an error has been seen: ToolCall is
+        // blocked just like Done / usage.
         if !tool_calls.errored {
-            // The model has finished this turn: all reasoning and tool-request
-            // fragments have necessarily arrived; emit them whole.
-            if let Some(reasoning) = tool_calls.take_reasoning() {
-                events.push(Ok(StreamEvent::Reasoning(reasoning)));
-            }
+            // The model has finished this turn: all tool-request fragments
+            // have necessarily arrived; emit them whole.
             for call in tool_calls.take_all() {
                 events.push(Ok(StreamEvent::ToolCall {
                     id: call.id,
@@ -718,20 +719,19 @@ fn map_finish_reason(reason: &str) -> FinishReason {
 /// The model may request several tools in one turn; fragments are attributed
 /// by `index`. `arguments` fragments with the same index are concatenated in
 /// arrival order; id / name are only carried by the first fragment. Reasoning
-/// (thinking) increments are also concatenated here.
+/// (thinking) is not aggregated here: reasoning fragments are forwarded as
+/// they arrive (see [`parse_sse_line`]).
 ///
 /// It also stashes the Done that only becomes complete at the end of the
-/// stream: the reason is recorded when finish_reason arrives (tools /
-/// reasoning are emitted whole then), usage arrives later (the usage-only
-/// trailing chunk), and when the stream terminates
+/// stream: the reason is recorded when finish_reason arrives (tools are
+/// emitted whole then), usage arrives later (the usage-only trailing chunk),
+/// and when the stream terminates
 /// ([`flush_done`](ToolCallAggregator::flush_done)) all three are combined
 /// into the Done.
 #[derive(Default)]
 struct ToolCallAggregator {
     /// Tool calls received so far, in order of first appearance.
     calls: Vec<AccumulatedCall>,
-    /// The full reasoning text; fragments are concatenated in arrival order.
-    reasoning: String,
     /// The model has finished this turn (finish_reason has arrived); the Done
     /// is emitted with the usage when the stream terminates.
     done_reason: Option<FinishReason>,
@@ -752,8 +752,8 @@ struct ToolCallAggregator {
 /// malicious / broken endpoint: an error is produced and the stream
 /// terminates.
 const MAX_TOOL_CALLS: usize = 64;
-/// Cumulative limit for aggregated text (arguments / reasoning) (1 MiB);
-/// exceeding it produces an error and terminates the stream.
+/// Cumulative limit for aggregated tool-argument text (1 MiB); exceeding it
+/// produces an error and terminates the stream.
 const MAX_ACCUMULATED_TEXT: usize = 1 << 20;
 
 /// Unified error for size-limit violations (non-HTTP source; status counts
@@ -832,22 +832,6 @@ impl ToolCallAggregator {
             });
         }
         Ok(())
-    }
-
-    /// Appends a reasoning increment.
-    fn push_reasoning(&mut self, reasoning: &str) -> Result<(), ProviderError> {
-        if self.reasoning.len() + reasoning.len() > MAX_ACCUMULATED_TEXT {
-            return Err(limit_error("reasoning exceeds size limit"));
-        }
-        self.reasoning.push_str(reasoning);
-        Ok(())
-    }
-
-    /// Takes this turn's complete reasoning and clears it; returns None when
-    /// there was no reasoning this turn.
-    fn take_reasoning(&mut self) -> Option<String> {
-        let reasoning = std::mem::take(&mut self.reasoning);
-        (!reasoning.is_empty()).then_some(reasoning)
     }
 
     /// Takes all aggregated calls from this turn and clears them.
@@ -2156,23 +2140,26 @@ mod tests {
     }
 
     #[test]
-    fn stream_aggregates_reasoning_chunks() {
-        // Reasoning fragments arrive across lines and are aggregated into the
-        // full text, emitted whole at the end of the turn.
+    fn stream_forwards_reasoning_chunks() {
+        // Reasoning fragments are forwarded as they arrive (not deferred to
+        // the end of the turn): each line's fragment is emitted immediately.
         let mut aggregator = ToolCallAggregator::default();
         let line1 =
             r#"data: {"choices":[{"delta":{"reasoning_content":"first"},"finish_reason":null}]}"#;
         let line2 = r#"data: {"choices":[{"delta":{"reasoning_content":" multiply"},"finish_reason":null}]}"#;
         let line3 = r#"data: {"choices":[{"delta":{"content":"answer"},"finish_reason":"stop"}]}"#;
 
-        assert!(parse_events(line1, &mut aggregator).is_empty());
-        assert!(parse_events(line2, &mut aggregator).is_empty());
+        assert_eq!(
+            parse_events(line1, &mut aggregator),
+            vec![StreamEvent::Reasoning("first".to_string())]
+        );
+        assert_eq!(
+            parse_events(line2, &mut aggregator),
+            vec![StreamEvent::Reasoning(" multiply".to_string())]
+        );
         assert_eq!(
             parse_events(line3, &mut aggregator),
-            vec![
-                StreamEvent::Delta("answer".to_string()),
-                StreamEvent::Reasoning("first multiply".to_string()),
-            ]
+            vec![StreamEvent::Delta("answer".to_string())]
         );
         assert_eq!(
             aggregator.flush_done(),
@@ -2185,8 +2172,9 @@ mod tests {
 
     #[test]
     fn stream_reasoning_with_tool_call() {
-        // Tool request after reasoning: at the end of the turn the complete
-        // reasoning is emitted first, then the tool call, then Done.
+        // Reasoning fragments arrive before the tool request and are forwarded
+        // immediately; the tool call is still emitted whole at the end of the
+        // turn, followed by Done.
         let mut aggregator = ToolCallAggregator::default();
         let line1 =
             r#"data: {"choices":[{"delta":{"reasoning_content":"all"},"finish_reason":null}]}"#;
@@ -2194,18 +2182,21 @@ mod tests {
             r#"data: {"choices":[{"delta":{"reasoning_content":" set"},"finish_reason":null}]}"#;
         let line3 = r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"name":"calculator","arguments":"{}"}}]},"finish_reason":"tool_calls"}]}"#;
 
-        assert!(parse_events(line1, &mut aggregator).is_empty());
-        assert!(parse_events(line2, &mut aggregator).is_empty());
+        assert_eq!(
+            parse_events(line1, &mut aggregator),
+            vec![StreamEvent::Reasoning("all".to_string())]
+        );
+        assert_eq!(
+            parse_events(line2, &mut aggregator),
+            vec![StreamEvent::Reasoning(" set".to_string())]
+        );
         assert_eq!(
             parse_events(line3, &mut aggregator),
-            vec![
-                StreamEvent::Reasoning("all set".to_string()),
-                StreamEvent::ToolCall {
-                    id: "call_1".to_string(),
-                    name: "calculator".to_string(),
-                    arguments: "{}".to_string(),
-                },
-            ]
+            vec![StreamEvent::ToolCall {
+                id: "call_1".to_string(),
+                name: "calculator".to_string(),
+                arguments: "{}".to_string(),
+            },]
         );
         assert_eq!(
             aggregator.flush_done(),
