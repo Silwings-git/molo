@@ -11,6 +11,7 @@ use crate::provider::{
 };
 use crate::tool::ToolSchema;
 use async_trait::async_trait;
+use base64::Engine;
 use futures::stream::{BoxStream, Stream, StreamExt, unfold};
 use serde::Serialize;
 use std::collections::BTreeMap;
@@ -1172,7 +1173,7 @@ struct StreamOptions {
 struct OpenAiMessage {
     role: String,
     /// Content: a string (single text block) or an array of content blocks
-    /// (multiple blocks, e.g. future image-text mixes).
+    /// (multiple blocks, e.g. image-text mixes).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     content: Option<serde_json::Value>,
     /// The model's reasoning; provided by thinking models like DeepSeek /
@@ -1252,20 +1253,38 @@ impl OpenAiMessage {
 /// Maps the content blocks of a user message to the wire content field.
 ///
 /// A single text block stays a string (compatible with existing wire
-/// shapes); multiple blocks (future images etc.) serialize to an array of
-/// content blocks `[{"type": "text", "text": "..."}]`.
+/// shapes); multiple blocks (mixed text / image) serialize to an array of
+/// content blocks `[{"type": "text", "text": "..."}, {"type": "image_url",
+/// "image_url": {"url": "data:image/png;base64,..."}}]`.
 fn user_content(blocks: &[ContentBlock]) -> Option<serde_json::Value> {
     match blocks {
         [ContentBlock::Text(text)] => Some(serde_json::Value::String(text.clone())),
         blocks => {
-            let parts: Vec<serde_json::Value> = blocks
-                .iter()
-                .map(|block| match block {
-                    ContentBlock::Text(text) => serde_json::json!({"type": "text", "text": text}),
-                })
-                .collect();
+            let parts: Vec<serde_json::Value> = blocks.iter().map(content_block_wire).collect();
             (!parts.is_empty()).then_some(serde_json::Value::Array(parts))
         }
+    }
+}
+
+/// One content block → the wire content-block shape.
+///
+/// Images are carried as the OpenAI-compatible `image_url` block with a
+/// base64 data URL built from the raw bytes (no URL passed through: the
+/// framework only ships images it holds itself; callers with a hosted URL
+/// can still reference it via a text block).
+fn content_block_wire(block: &ContentBlock) -> serde_json::Value {
+    match block {
+        ContentBlock::Text(text) => serde_json::json!({"type": "text", "text": text}),
+        ContentBlock::Image(image) => serde_json::json!({
+            "type": "image_url",
+            "image_url": {
+                "url": format!(
+                    "data:{};base64,{}",
+                    image.mime_type,
+                    base64::engine::general_purpose::STANDARD.encode(&image.data)
+                )
+            }
+        }),
     }
 }
 
@@ -1431,6 +1450,7 @@ struct OpenAiErrorDetail {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::message::ImageContent;
     use reqwest::header::{HeaderMap, RETRY_AFTER};
     use serde_json::json;
 
@@ -1499,6 +1519,49 @@ mod tests {
                 "content": [
                     {"type": "text", "text": "take a look:"},
                     {"type": "text", "text": "see the attachment"}
+                ]
+            })
+        );
+    }
+
+    #[test]
+    fn maps_image_block_to_wire_data_url() {
+        // An image block serializes to the OpenAI-compatible image_url block
+        // with a base64 data URL; a single image block forces the array shape
+        // (a bare string would not be a valid image carrier).
+        let message = Message::user_blocks(vec![ContentBlock::Image(ImageContent::new(
+            "image/png",
+            b"fake-png-bytes".to_vec(),
+        ))]);
+        let expected_b64 = base64::engine::general_purpose::STANDARD.encode(b"fake-png-bytes");
+        assert_eq!(
+            serde_json::to_value(OpenAiMessage::from_message(&message)).unwrap(),
+            json!({
+                "role": "user",
+                "content": [{
+                    "type": "image_url",
+                    "image_url": {"url": format!("data:image/png;base64,{expected_b64}")}
+                }]
+            })
+        );
+    }
+
+    #[test]
+    fn maps_mixed_text_and_image_blocks() {
+        // Text + image in one user message: both serialize into the content
+        // block array, text as text and image as image_url (the wire shape
+        // consumed by qwen-vl / gpt-4o-class multimodal models).
+        let message = Message::user_blocks(vec![
+            ContentBlock::Text("what is this?".into()),
+            ContentBlock::Image(ImageContent::new("image/jpeg", vec![1, 2, 3])),
+        ]);
+        assert_eq!(
+            serde_json::to_value(OpenAiMessage::from_message(&message)).unwrap(),
+            json!({
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "what is this?"},
+                    {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64,AQID"}}
                 ]
             })
         );

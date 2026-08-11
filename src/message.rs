@@ -5,9 +5,9 @@
 //! messages) serialize these types directly, no manual mapping needed.
 //!
 //! A full conversation history is expressed as a [`Message`] sequence; each
-//! message consists of [content blocks](ContentBlock), currently text only.
+//! message consists of [content blocks](ContentBlock) (text / images).
 //! The structured entry point of the content model is [`ContentBlock`] — to
-//! add multimodal content (images / files), add a variant there; the shape
+//! add multimodal content (files / audio), add a variant there; the shape
 //! of [`Message`] stays unchanged, and consumers just match the new variant.
 
 use serde::{Deserialize, Serialize};
@@ -95,8 +95,8 @@ pub enum Message {
     /// System instruction describing the agent's role and behavior
     /// constraints.
     System(String),
-    /// User input, made of content blocks (currently text only; multimodal
-    /// blocks are added as real needs arise).
+    /// User input, made of content blocks (text / images; multimodal blocks
+    /// like audio are added as real needs arise).
     User(Vec<ContentBlock>),
     /// Assistant reply: text + reasoning + requested tool calls (multiple
     /// requests in one turn stay together).
@@ -127,25 +127,66 @@ pub enum Message {
 
 /// A content block within a message.
 ///
-/// The structured entry point of the content model: currently text only; to
-/// add multimodal content (images / files), add a variant here — the shape
+/// The structured entry point of the content model: text and image blocks; to
+/// add multimodal content (files / audio), add a variant here — the shape
 /// of [`Message`] stays unchanged, and consumers just match the new variant.
 ///
 /// # Example
 ///
 /// ```
-/// use molo::{ContentBlock, Message};
+/// use molo::{ContentBlock, ImageContent, Message};
 ///
 /// let msg = Message::user_blocks(vec![
-///     ContentBlock::Text("How is the weather in Beijing today?".into()),
+///     ContentBlock::Text("What is in this picture?".into()),
+///     ContentBlock::Image(ImageContent::new("image/png", vec![0x89, b'P', b'N', b'G'])),
 /// ]);
 ///
-/// assert_eq!(msg, Message::user("How is the weather in Beijing today?"));
+/// assert_eq!(msg, Message::user_blocks(vec![
+///     ContentBlock::Text("What is in this picture?".into()),
+///     ContentBlock::Image(ImageContent::new("image/png", vec![0x89, b'P', b'N', b'G'])),
+/// ]));
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum ContentBlock {
     /// A text block.
     Text(String),
+    /// An image block (raw bytes + MIME type). Provider implementations
+    /// encode it for the wire format (e.g. the OpenAI-compatible
+    /// `image_url` content block with a base64 data URL); Memory counts it
+    /// as no tokens and summarizers render it as a placeholder.
+    Image(ImageContent),
+}
+
+/// Raw image data carried in a [`ContentBlock::Image`].
+///
+/// Stores the raw bytes so callers never need to base64-encode; serialization
+/// (session persistence / cross-process transport) keeps the bytes as-is.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct ImageContent {
+    /// MIME type of the image, e.g. `image/png` / `image/jpeg`; used to build
+    /// the wire data URL (`data:<mime>;base64,...`).
+    pub mime_type: String,
+    /// Raw image bytes (not yet base64-encoded).
+    pub data: Vec<u8>,
+}
+
+impl ImageContent {
+    /// Constructs from raw bytes and a MIME type.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use molo::ImageContent;
+    ///
+    /// let image = ImageContent::new("image/png", std::fs::read("logo.png").unwrap_or_default());
+    /// assert_eq!(image.mime_type, "image/png");
+    /// ```
+    pub fn new(mime_type: impl Into<String>, data: Vec<u8>) -> Self {
+        Self {
+            mime_type: mime_type.into(),
+            data,
+        }
+    }
 }
 
 impl Message {
@@ -160,8 +201,8 @@ impl Message {
         Self::User(vec![ContentBlock::Text(content.into())])
     }
 
-    /// User input made of content blocks (currently text only; multimodal
-    /// blocks are added as real needs arise).
+    /// User input made of content blocks (text / images; multimodal blocks
+    /// like audio are added as real needs arise).
     pub fn user_blocks(blocks: Vec<ContentBlock>) -> Self {
         Self::User(blocks)
     }

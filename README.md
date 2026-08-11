@@ -233,6 +233,7 @@ Self-contained examples (no real API needed) are marked ✦.
 | --- | --- | --- |
 | `chat` | `cargo run --example chat` | Plain chat with a real model |
 | `chat_stream` | `cargo run --example chat_stream` | Streaming chat, tokens as they arrive |
+| `multimodal` | `cargo run --example multimodal -- <image path>` | Image input (`ContentBlock::Image`) to a multimodal model |
 | ✦ `fake_provider` | `cargo run --example fake_provider` | Scripted replies for testing your own loop |
 | `retry` | `cargo run --example retry` | `RetryProvider` wrapper |
 | `usage` | `cargo run --example usage` | Per-run execution summary (tokens, rounds) |

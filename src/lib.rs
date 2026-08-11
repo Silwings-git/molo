@@ -138,7 +138,7 @@ pub use memory::{
     Budget, CharTokenCounter, InMemoryMemory, Memory, MemoryError, SummarizeStrategy, TokenCounter,
     TrimResult, TrimStrategy, WindowDrop, WindowMemory,
 };
-pub use message::{ContentBlock, Message, ToolCall};
+pub use message::{ContentBlock, ImageContent, Message, ToolCall};
 pub use message_channel::{
     BroadcastChannel, BroadcastReceiver, ChannelError, CliMessageChannel, IncomingMessage,
     MessageChannel, MpscChannel, WatchChannel, WatchReceiver,

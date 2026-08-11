@@ -297,7 +297,13 @@ fn messages_to_text(messages: &[Message]) -> String {
             Message::User(blocks) => {
                 let text: String = blocks
                     .iter()
-                    .map(|ContentBlock::Text(t)| t.as_str())
+                    .map(|block| match block {
+                        ContentBlock::Text(t) => t.clone(),
+                        // The summary keeps a placeholder so the context
+                        // "an image was there" survives compression (the
+                        // bytes themselves cannot be summarized).
+                        ContentBlock::Image(image) => format!("[image: {}]", image.mime_type),
+                    })
                     .collect::<Vec<_>>()
                     .join(" ");
                 lines.push(format!("user: {text}"));
@@ -384,7 +390,9 @@ mod tests {
         let Message::User(blocks) = &messages[1] else {
             panic!("expected user message");
         };
-        let ContentBlock::Text(text) = &blocks[0];
+        let ContentBlock::Text(text) = &blocks[0] else {
+            panic!("expected a text block");
+        };
         assert!(text.contains("Question from round 1") && text.contains("Question from round 3"));
         assert!(!text.contains("Question from round 4"));
     }
@@ -443,7 +451,9 @@ mod tests {
         let Message::User(blocks) = &requests[1].messages[1] else {
             panic!("expected user message");
         };
-        let ContentBlock::Text(text) = &blocks[0];
+        let ContentBlock::Text(text) = &blocks[0] else {
+            panic!("expected a text block");
+        };
         assert!(text.contains("first segment highlights"));
     }
 

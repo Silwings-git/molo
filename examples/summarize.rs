@@ -36,8 +36,11 @@ async fn count_tokens(messages: &[Message]) -> Result<usize, molo::memory::Memor
             Message::System(s) => total += counter.count(s).await?,
             Message::User(blocks) => {
                 for block in blocks {
-                    let ContentBlock::Text(t) = block;
-                    total += counter.count(t).await?;
+                    match block {
+                        ContentBlock::Text(t) => total += counter.count(t).await?,
+                        // Images carry no text to count (mirrors WindowMemory).
+                        ContentBlock::Image(_) => {}
+                    }
                 }
             }
             Message::Assistant {
@@ -146,7 +149,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let Message::User(blocks) = &requests[1].messages[1] else {
         unreachable!("summary input is a user message");
     };
-    let ContentBlock::Text(text) = &blocks[0];
+    let ContentBlock::Text(text) = &blocks[0] else {
+        panic!("expected a text block");
+    };
     assert!(
         text.contains("A and B have been answered"),
         "incremental compression must carry the previous summary"

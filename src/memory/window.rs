@@ -234,11 +234,13 @@ pub(crate) async fn count_message(
         Message::User(blocks) => {
             let mut total = 0usize;
             for b in blocks {
-                // Only the Text variant exists today; adding multimodal
-                // variants later will force this back to a match by the
-                // compiler.
-                let ContentBlock::Text(t) = b;
-                total += counter.count(t).await?;
+                match b {
+                    ContentBlock::Text(t) => total += counter.count(t).await?,
+                    // Images carry no text to count; the message stays in
+                    // the window whole so the image still reaches the
+                    // provider.
+                    ContentBlock::Image(_) => {}
+                }
             }
             Ok(total)
         }

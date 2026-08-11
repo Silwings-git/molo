@@ -22,6 +22,7 @@ exclude = [".example.env", "docs/", ".github/"]
 molo-macros = { path = "molo-macros", version = "0.2.2" }
 async-stream = "0.3"
 async-trait = "0.1"
+base64 = "0.22"
 futures = "0.3"
 indexmap = "2"
 jsonschema = "0.49"
