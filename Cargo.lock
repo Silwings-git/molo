@@ -1223,7 +1223,7 @@ dependencies = [
 
 [[package]]
 name = "molo"
-version = "0.2.2"
+version = "0.2.3"
 dependencies = [
  "async-stream",
  "async-trait",
@@ -1249,7 +1249,7 @@ dependencies = [
 
 [[package]]
 name = "molo-macros"
-version = "0.2.2"
+version = "0.2.3"
 dependencies = [
  "proc-macro2",
  "quote",
