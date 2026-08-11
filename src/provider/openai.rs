@@ -1253,9 +1253,9 @@ impl OpenAiMessage {
 /// Maps the content blocks of a user message to the wire content field.
 ///
 /// A single text block stays a string (compatible with existing wire
-/// shapes); multiple blocks (mixed text / image) serialize to an array of
-/// content blocks `[{"type": "text", "text": "..."}, {"type": "image_url",
-/// "image_url": {"url": "data:image/png;base64,..."}}]`.
+/// shapes); multiple blocks (mixed text / image / pass-through) serialize to
+/// an array of content blocks `[{"type": "text", "text": "..."},
+/// {"type": "image_url", "image_url": {"url": "data:image/png;base64,..."}}]`.
 fn user_content(blocks: &[ContentBlock]) -> Option<serde_json::Value> {
     match blocks {
         [ContentBlock::Text(text)] => Some(serde_json::Value::String(text.clone())),
@@ -1285,6 +1285,9 @@ fn content_block_wire(block: &ContentBlock) -> serde_json::Value {
                 )
             }
         }),
+        // Pass-through: the caller built the wire block (e.g. `input_audio`
+        // / `file`), the provider ships it verbatim.
+        ContentBlock::Wire(value) => value.clone(),
     }
 }
 
@@ -1542,6 +1545,36 @@ mod tests {
                     "type": "image_url",
                     "image_url": {"url": format!("data:image/png;base64,{expected_b64}")}
                 }]
+            })
+        );
+    }
+
+    #[test]
+    fn passes_through_wire_blocks() {
+        // Vendor-shaped blocks (e.g. input_audio / file parts) pass through
+        // into the content array verbatim — no framework-side knowledge of
+        // the modality needed.
+        let message = Message::user_blocks(vec![
+            ContentBlock::Wire(json!({
+                "type": "input_audio",
+                "input_audio": {
+                    "data": "UklGRi4A",
+                    "format": "wav"
+                }
+            })),
+            ContentBlock::Text("transcribe this".into()),
+        ]);
+        assert_eq!(
+            serde_json::to_value(OpenAiMessage::from_message(&message)).unwrap(),
+            json!({
+                "role": "user",
+                "content": [
+                    {
+                        "type": "input_audio",
+                        "input_audio": {"data": "UklGRi4A", "format": "wav"}
+                    },
+                    {"type": "text", "text": "transcribe this"}
+                ]
             })
         );
     }

@@ -303,6 +303,15 @@ fn messages_to_text(messages: &[Message]) -> String {
                         // "an image was there" survives compression (the
                         // bytes themselves cannot be summarized).
                         ContentBlock::Image(image) => format!("[image: {}]", image.mime_type),
+                        // Pass-through blocks are rendered by their wire
+                        // type (e.g. `[audio]`); unknown shapes degrade to
+                        // a generic marker.
+                        ContentBlock::Wire(value) => {
+                            match value.get("type").and_then(|t| t.as_str()) {
+                                Some(kind) => format!("[{kind}]"),
+                                None => "[content]".to_string(),
+                            }
+                        }
                     })
                     .collect::<Vec<_>>()
                     .join(" ");

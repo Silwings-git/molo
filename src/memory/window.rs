@@ -236,10 +236,10 @@ pub(crate) async fn count_message(
             for b in blocks {
                 match b {
                     ContentBlock::Text(t) => total += counter.count(t).await?,
-                    // Images carry no text to count; the message stays in
-                    // the window whole so the image still reaches the
-                    // provider.
-                    ContentBlock::Image(_) => {}
+                    // Images and pass-through blocks carry no text to count;
+                    // the message stays in the window whole so the content
+                    // still reaches the provider.
+                    ContentBlock::Image(_) | ContentBlock::Wire(_) => {}
                 }
             }
             Ok(total)

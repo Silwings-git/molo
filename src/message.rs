@@ -5,10 +5,11 @@
 //! messages) serialize these types directly, no manual mapping needed.
 //!
 //! A full conversation history is expressed as a [`Message`] sequence; each
-//! message consists of [content blocks](ContentBlock) (text / images).
-//! The structured entry point of the content model is [`ContentBlock`] — to
-//! add multimodal content (files / audio), add a variant there; the shape
-//! of [`Message`] stays unchanged, and consumers just match the new variant.
+//! message consists of [content blocks](ContentBlock) (text / images, or
+//! vendor-shaped blocks passed through verbatim via [`ContentBlock::Wire`]).
+//! The structured entry point of the content model is [`ContentBlock`] — the
+//! shape of [`Message`] stays unchanged, and consumers just match the new
+//! variant.
 
 use serde::{Deserialize, Serialize};
 
@@ -95,8 +96,8 @@ pub enum Message {
     /// System instruction describing the agent's role and behavior
     /// constraints.
     System(String),
-    /// User input, made of content blocks (text / images; multimodal blocks
-    /// like audio are added as real needs arise).
+    /// User input, made of content blocks (text / images / vendor-shaped
+    /// pass-through blocks).
     User(Vec<ContentBlock>),
     /// Assistant reply: text + reasoning + requested tool calls (multiple
     /// requests in one turn stay together).
@@ -127,9 +128,8 @@ pub enum Message {
 
 /// A content block within a message.
 ///
-/// The structured entry point of the content model: text and image blocks; to
-/// add multimodal content (files / audio), add a variant here — the shape
-/// of [`Message`] stays unchanged, and consumers just match the new variant.
+/// The structured entry point of the content model: text and image blocks,
+/// plus vendor-shaped pass-through blocks ([`Wire`](ContentBlock::Wire)).
 ///
 /// # Example
 ///
@@ -155,6 +155,14 @@ pub enum ContentBlock {
     /// `image_url` content block with a base64 data URL); Memory counts it
     /// as no tokens and summarizers render it as a placeholder.
     Image(ImageContent),
+    /// A vendor-shaped content block passed through verbatim (e.g. the
+    /// `input_audio` / `file` parts of OpenAI-compatible endpoints, whose
+    /// shapes vary per vendor and keep evolving).
+    ///
+    /// For any modality without a typed variant, build the wire block
+    /// yourself and wrap it here; the provider inserts it into the content
+    /// array as-is. Whatever your endpoint accepts, this block can carry it.
+    Wire(serde_json::Value),
 }
 
 /// Raw image data carried in a [`ContentBlock::Image`].
@@ -201,8 +209,8 @@ impl Message {
         Self::User(vec![ContentBlock::Text(content.into())])
     }
 
-    /// User input made of content blocks (text / images; multimodal blocks
-    /// like audio are added as real needs arise).
+    /// User input made of content blocks (text / images / vendor-shaped
+    /// pass-through blocks).
     pub fn user_blocks(blocks: Vec<ContentBlock>) -> Self {
         Self::User(blocks)
     }

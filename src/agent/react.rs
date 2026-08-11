@@ -4637,7 +4637,9 @@ mod tests {
                     .iter()
                     .map(|b| match b {
                         crate::ContentBlock::Text(t) => t.clone(),
-                        crate::ContentBlock::Image(_) => String::new(),
+                        crate::ContentBlock::Image(_) | crate::ContentBlock::Wire(_) => {
+                            String::new()
+                        }
                     })
                     .collect(),
                 _ => String::new(),

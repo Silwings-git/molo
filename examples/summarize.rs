@@ -38,8 +38,9 @@ async fn count_tokens(messages: &[Message]) -> Result<usize, molo::memory::Memor
                 for block in blocks {
                     match block {
                         ContentBlock::Text(t) => total += counter.count(t).await?,
-                        // Images carry no text to count (mirrors WindowMemory).
-                        ContentBlock::Image(_) => {}
+                        // Images and pass-through blocks carry no text to
+                        // count (mirrors WindowMemory).
+                        ContentBlock::Image(_) | ContentBlock::Wire(_) => {}
                     }
                 }
             }
