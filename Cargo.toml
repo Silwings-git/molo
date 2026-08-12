@@ -15,7 +15,7 @@ keywords = ["agent", "llm", "ai", "framework"]
 categories = ["artificial-intelligence"]
 authors = ["silwings"]
 # Internal project files are excluded from the published package
-exclude = [".example.env", "docs/", ".github/"]
+exclude = [".example.env", "AGENTS.md", "CLAUDE.md", "docs/", ".github/"]
 
 [dependencies]
 # The path is stripped at publish time; the version is what crates.io resolves
