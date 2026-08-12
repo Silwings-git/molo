@@ -49,7 +49,9 @@ mod sub_agent;
 
 pub use config::AgentConfig;
 pub use events::ReActEvent;
-pub use react::ReActAgent;
+pub use react::{
+    ReActAgent, SerialToolRoundExecutor, ToolCallOutcome, ToolRoundCtx, ToolRoundExecutor,
+};
 pub use structured::{
     StructuredOutcome, StructuredValidator, structured_retry_message, validate_structured,
 };

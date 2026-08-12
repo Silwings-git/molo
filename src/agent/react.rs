@@ -12,8 +12,10 @@
 //! conversations auto-trim the oldest rounds); replace it with
 //! [`with_memory`](ReActAgent::with_memory) when you need something custom.
 //!
-//! Pre-call approval at the loop level is implemented by the application
-//! layer; this module doesn't build it in.
+//! Pre-call approval at the loop level is not built in; a custom
+//! [`ToolRoundExecutor`] injected via
+//! [`with_tool_round_executor`](ReActAgent::with_tool_round_executor) is
+//! the application-side hook for round-level gates.
 
 use super::config::AgentConfig;
 use super::structured::{StructuredOutcome, StructuredValidator};
@@ -62,7 +64,8 @@ use tracing::Instrument;
 /// Returns [`ReActAgent`](crate::agent::ReActAgent); chained
 /// [`with_memory`](ReActAgent::with_memory) / [`with_config`](ReActAgent::with_config) /
 /// [`with_state`](ReActAgent::with_state) / [`with_event_channel`](ReActAgent::with_event_channel) /
-/// [`with_skills`](ReActAgent::with_skills) work as usual.
+/// [`with_skills`](ReActAgent::with_skills) /
+/// [`with_tool_round_executor`](ReActAgent::with_tool_round_executor) work as usual.
 /// `ReActAgent::new` keeps a single signature; the macro handles the
 /// multiple shapes.
 ///
@@ -122,7 +125,8 @@ macro_rules! react_agent {
 /// Assembly: three required parameters (Provider / ToolRegistry /
 /// system_prompt) + chained optional
 /// ([`with_memory`](ReActAgent::with_memory) / [`with_config`](ReActAgent::with_config) /
-/// [`with_state`](ReActAgent::with_state) / [`with_event_channel`](ReActAgent::with_event_channel));
+/// [`with_state`](ReActAgent::with_state) / [`with_event_channel`](ReActAgent::with_event_channel) /
+/// [`with_tool_round_executor`](ReActAgent::with_tool_round_executor));
 /// for simpler assembly use the macro [`react_agent!`](crate::react_agent).
 ///
 /// # Examples
@@ -211,6 +215,11 @@ pub struct ReActAgent {
     /// Observation channel (optional, not attached by default): the loop
     /// pushes process events here, and the host side subscribes.
     events: Option<Arc<dyn EventChannel>>,
+    /// Tool-round execution policy (default: [`SerialToolRoundExecutor`] —
+    /// calls run one by one, in request order). The application injects a
+    /// custom policy (order / concurrency / approval gates) via
+    /// [`with_tool_round_executor`](ReActAgent::with_tool_round_executor).
+    executor: Box<dyn ToolRoundExecutor>,
     /// Skill registry (optional, empty by default): held when skills are
     /// assembled; the application reads and writes this field directly
     /// across runs (hot-swappable — additions/removals take effect on the
@@ -305,6 +314,7 @@ impl ReActAgent {
             config: AgentConfig::default(),
             state: SharedState::default(),
             events: None,
+            executor: Box::new(SerialToolRoundExecutor),
             skills: Arc::new(SkillRegistry::new()),
             enabled_skills: None,
             activated_skills: Vec::new(),
@@ -443,6 +453,76 @@ impl ReActAgent {
     /// [`ReActEvent`](crate::agent::ReActEvent) for the event set.
     pub fn with_event_channel(mut self, channel: impl EventChannel + 'static) -> Self {
         self.events = Some(Arc::new(channel));
+        self
+    }
+
+    /// Replace the default tool-round executor (default:
+    /// [`SerialToolRoundExecutor`] — the round's calls run one by one, in
+    /// request order) with a custom round policy: order / concurrency /
+    /// approval gates.
+    ///
+    /// The executor decides *how* the round's tool calls are executed; the
+    /// per-call mechanics (tool span, ToolStarted / ToolCompleted events,
+    /// registry dispatch) stay framework-owned via
+    /// [`ToolRoundCtx::run`]. Each outcome is recorded (and, on the
+    /// streaming path, dispatched) by the agent as the executor's stream
+    /// yields it. The round stays atomic by contract — the executor owns
+    /// that responsibility.
+    ///
+    /// # Examples
+    ///
+    /// A round policy that runs the round's calls concurrently; outcomes
+    /// flow back as each completes:
+    ///
+    /// ```
+    /// # #[tokio::main]
+    /// # async fn main() -> Result<(), molo::AgentError> {
+    /// use molo::agent::{
+    ///     Agent, ReActAgent, ToolCallOutcome, ToolRoundCtx, ToolRoundExecutor,
+    /// };
+    /// use molo::message::ToolCall;
+    /// use molo::provider::{FakeProvider, FakeReply};
+    /// use molo::tool::ToolRegistry;
+    /// use futures::stream::{BoxStream, FuturesUnordered};
+    /// use futures::StreamExt;
+    ///
+    /// #[derive(Default)]
+    /// struct ParallelToolRoundExecutor;
+    ///
+    /// #[molo::async_trait]
+    /// impl ToolRoundExecutor for ParallelToolRoundExecutor {
+    ///     async fn execute_round<'a>(
+    ///         &'a mut self,
+    ///         ctx: ToolRoundCtx<'a>,
+    ///         calls: Vec<ToolCall>,
+    ///     ) -> BoxStream<'a, ToolCallOutcome> {
+    ///         // The run futures borrow ctx, so they materialize inside the
+    ///         // generator (which owns ctx), not across the return.
+    ///         Box::pin(async_stream::stream! {
+    ///             let mut tasks = FuturesUnordered::new();
+    ///             for call in calls {
+    ///                 tasks.push(ctx.run(call));
+    ///             }
+    ///             while let Some(outcome) = tasks.next().await {
+    ///                 yield outcome;
+    ///             }
+    ///         })
+    ///     }
+    /// }
+    ///
+    /// let mut agent = ReActAgent::new(
+    ///     FakeProvider::new([FakeReply::Text("Hello".into())]),
+    ///     ToolRegistry::new(),
+    ///     "",
+    /// )
+    /// .with_tool_round_executor(ParallelToolRoundExecutor);
+    ///
+    /// assert_eq!(agent.run("Are you there").await?, "Hello");
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn with_tool_round_executor(mut self, executor: impl ToolRoundExecutor + 'static) -> Self {
+        self.executor = Box::new(executor);
         self
     }
 
@@ -804,18 +884,23 @@ impl ReActAgent {
                 // its ToolResult, breaking the next round's message
                 // sequence. Cancellation takes effect naturally after the
                 // tool round ends, before the next round's conversation.
-                // When multiple tools in the same round have all run, their
-                // results are fed back one by one right after.
-                for call in tool_calls {
-                    // Execution + events + span live in run_tool_call
-                    // (shared by both paths); the text is recorded and fed
-                    // back to the model.
-                    let outcome = self.run_tool_call(call, run_id, counters.rounds).await;
+                // The round policy (default: one by one, in request order)
+                // is injected via the ToolRoundExecutor; each outcome is
+                // recorded as it arrives.
+                let ctx = ToolRoundCtx {
+                    run_id,
+                    round: counters.rounds,
+                    registry: &self.registry,
+                    state: &self.state,
+                    events: &self.events,
+                };
+                let mut outcomes = self.executor.execute_round(ctx, tool_calls).await;
+                while let Some(outcome) = outcomes.next().await {
                     // Protected results (skill bodies, etc.) are recorded
                     // via record_protected, exempt from window trimming;
                     // when recording fails, the error text is recorded as a
                     // fallback (memory integrity, see record_tool_result).
-                    self.record_tool_result(&outcome).await?;
+                    record_tool_result(&mut self.memory, &outcome).await?;
                 }
                 Ok::<Option<String>, AgentError>(None)
             }
@@ -893,23 +978,65 @@ impl ReActAgent {
         }
         out
     }
+}
 
-    /// Execute a single tool call (shared by the run / run_stream paths):
-    /// tool span + ToolStarted / ToolCompleted events + registry execution,
-    /// returning [`ToolCallOutcome`] — where recording and streaming
-    /// dispatch happen is up to the caller (streaming dispatches first,
-    /// then records).
-    async fn run_tool_call(
-        &mut self,
-        call: ToolCall,
-        run_id: &str,
-        round: usize,
-    ) -> ToolCallOutcome {
+/// What a round policy gets handed to execute one tool round.
+///
+/// The agent constructs the context and passes it by value to your
+/// [`ToolRoundExecutor::execute_round`]; you only read it, and execute
+/// calls through [`run`](ToolRoundCtx::run) — the framework-owned per-call
+/// mechanics (span, events, registry dispatch) stay out of your hands, so
+/// a custom policy reorders / parallelizes / gates calls without
+/// reimplementing any of that. See [`ToolRoundExecutor`] for a working
+/// example.
+pub struct ToolRoundCtx<'a> {
+    /// The run id (the correlation key carried by spans and events).
+    pub run_id: &'a str,
+    /// The current round number (carried into the tool span).
+    pub round: usize,
+    /// The tool registry (call dispatch + protected declarations).
+    pub registry: &'a ToolRegistry,
+    /// Shared state, injected into every tool call.
+    pub state: &'a SharedState,
+    /// The observation channel (None when not attached).
+    pub events: &'a Option<Arc<dyn EventChannel>>,
+}
+
+impl fmt::Debug for ToolRoundCtx<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // The observation channel is opaque (no Debug on the trait
+        // object); finish_non_exhaustive marks the omission.
+        f.debug_struct("ToolRoundCtx")
+            .field("run_id", &self.run_id)
+            .field("round", &self.round)
+            .field("registry", &self.registry)
+            .field("state", &self.state)
+            .finish_non_exhaustive()
+    }
+}
+
+impl ToolRoundCtx<'_> {
+    /// Execute one tool call with the framework's standard mechanics and
+    /// return its outcome.
+    ///
+    /// Call this for each call your policy decides to run: the call is
+    /// dispatched to the registry (tool span + ToolStarted / ToolCompleted
+    /// events included), and the outcome carries the result text — a
+    /// tool's failure is **not** an error here, it rides along in
+    /// [`content`](ToolCallOutcome::content) — plus the protected flag the
+    /// agent needs for recording. What you yield is what the agent records
+    /// (and, on the streaming path, dispatches).
+    ///
+    /// Takes `&self` rather than `&mut self`: the mechanics are all shared
+    /// borrows, so a policy can hold multiple `run` futures concurrently
+    /// (see the parallel example on
+    /// [`with_tool_round_executor`](ReActAgent::with_tool_round_executor)).
+    pub async fn run(&self, call: ToolCall) -> ToolCallOutcome {
         // Tool-call span: carries duration; records error on failure. The
         // span is created while the run is on the stack (ambient parent on
         // both paths, see the span-construction comments), so the hierarchy
         // is correct automatically.
-        let tool_span = span_tool(run_id, round, &call.name);
+        let tool_span = span_tool(self.run_id, self.round, &call.name);
         // Tool-started event (carries id / arguments; subscribers pair it
         // with ToolCompleted by id).
         self.publish(|| {
@@ -924,7 +1051,7 @@ impl ReActAgent {
         // Display) is recorded and fed back to the model.
         let result = self
             .registry
-            .call(&call.name, &call.arguments, &self.state)
+            .call(&call.name, &call.arguments, self.state)
             .instrument(tool_span.clone())
             .await;
         if let Err(e) = &result {
@@ -955,54 +1082,188 @@ impl ReActAgent {
         }
     }
 
-    /// Record a tool result, falling back to recording the error text
-    /// before re-raising on failure.
-    ///
-    /// The tool has already run (side effects happened), so its result text
-    /// must not be lost: an Assistant message recorded without its
-    /// ToolResult leaves the memory incomplete, the next request would
-    /// carry an unpaired assistant/tool sequence, real endpoints reject it
-    /// (400), and the reported cause would be disconnected from the real
-    /// failure. If the fallback recording itself fails, the error is
-    /// swallowed — the original error takes priority, and there's no point
-    /// retrying when the same Memory keeps failing.
-    async fn record_tool_result(&mut self, outcome: &ToolCallOutcome) -> Result<(), AgentError> {
-        let message = Message::tool_result(outcome.call.id.clone(), outcome.content.clone());
-        let record_result = if outcome.protected {
-            self.memory.record_protected(message).await
-        } else {
-            self.memory.record(message).await
-        };
-        match record_result {
-            Ok(()) => Ok(()),
-            Err(e) => {
-                let fallback = Message::tool_result(
-                    outcome.call.id.clone(),
-                    format!("memory record failed: {e}"),
-                );
-                let _ = if outcome.protected {
-                    self.memory.record_protected(fallback).await
-                } else {
-                    self.memory.record(fallback).await
-                };
-                Err(e.into())
-            }
+    /// Publish an event (no-op when no channel is attached). Takes a
+    /// construction closure rather than the event itself: with no
+    /// observation channel attached (the default), construction cost is
+    /// zero.
+    fn publish<E: AgentEvent + 'static>(&self, make_event: impl FnOnce() -> Arc<E>) {
+        if let Some(pipe) = self.events {
+            pipe.publish(make_event());
         }
     }
 }
 
-/// The execution outcome of one tool call: the call info is returned as-is,
-/// and the caller decides recording and dispatch.
-struct ToolCallOutcome {
+/// Round-level tool-call policy: decides how one round's tool calls are
+/// executed — order, concurrency, approval gates. Inject it with
+/// [`with_tool_round_executor`](ReActAgent::with_tool_round_executor); the
+/// default [`SerialToolRoundExecutor`] runs calls one by one in request
+/// order, the classic serial loop with identical behavior.
+///
+/// The executor owns *how* calls run; the framework owns *that* they run
+/// correctly: every call goes through [`ToolRoundCtx::run`], which carries
+/// the standard mechanics (tool span, ToolStarted / ToolCompleted events,
+/// registry dispatch, protected-result declaration) — a custom executor
+/// can reorder, parallelize, or gate calls without reimplementing any of
+/// that.
+///
+/// # Contract
+///
+/// - **Atomicity**: tool rounds are executed atomically and never
+///   interrupted — tools are user code with no cancellation interface, and
+///   a partial execution risks side effects; cancellation takes effect
+///   after the round ends, before the next round's conversation. An
+///   executor that interrupts mid-round accepts that risk itself.
+/// - **Outcomes stream back as they complete**: the agent records (and,
+///   on the streaming path, dispatches) each outcome as the stream yields
+///   it. Dropping the stream early aborts the rest of the round —
+///   already-produced outcomes stay recorded, and the model adapts to the
+///   partial results.
+/// - **Decisions feed back as text**: to deny a call (approval gate, rate
+///   limit, ...), yield a synthetic [`ToolCallOutcome`] carrying the
+///   decision text — it reaches the model through the normal ToolResult
+///   channel without the tool ever running.
+///
+/// # Examples
+///
+/// An approval gate: calls to "dangerous" are denied without running,
+/// everything else executes as usual.
+///
+/// ```
+/// # #[tokio::main]
+/// # async fn main() -> Result<(), molo::AgentError> {
+/// use molo::agent::{
+///     Agent, ReActAgent, ToolCallOutcome, ToolRoundCtx, ToolRoundExecutor,
+/// };
+/// use molo::message::ToolCall;
+/// use molo::provider::{FakeProvider, FakeReply};
+/// use molo::tool::ToolRegistry;
+/// use futures::stream::BoxStream;
+///
+/// #[derive(Default)]
+/// struct ApprovalGateToolRoundExecutor;
+///
+/// #[molo::async_trait]
+/// impl ToolRoundExecutor for ApprovalGateToolRoundExecutor {
+///     async fn execute_round<'a>(
+///         &'a mut self,
+///         ctx: ToolRoundCtx<'a>,
+///         calls: Vec<ToolCall>,
+///     ) -> BoxStream<'a, ToolCallOutcome> {
+///         Box::pin(async_stream::stream! {
+///             for call in calls {
+///                 if call.name == "dangerous" {
+///                     yield ToolCallOutcome {
+///                         call,
+///                         content: "denied by approval gate".into(),
+///                         protected: false,
+///                     };
+///                 } else {
+///                     yield ctx.run(call).await;
+///                 }
+///             }
+///         })
+///     }
+/// }
+///
+/// let mut agent = ReActAgent::new(
+///     FakeProvider::new([FakeReply::Text("Hello".into())]),
+///     ToolRegistry::new(),
+///     "",
+/// )
+/// .with_tool_round_executor(ApprovalGateToolRoundExecutor);
+///
+/// assert_eq!(agent.run("Are you there").await?, "Hello");
+/// # Ok(())
+/// # }
+/// ```
+#[async_trait::async_trait]
+pub trait ToolRoundExecutor: Send + Sync {
+    /// Execute one tool round: decide the policy over `calls` — which to
+    /// run, in what order, with what concurrency — and yield each
+    /// [`ToolCallOutcome`] as it completes.
+    ///
+    /// Use [`ToolRoundCtx::run`] to execute a call; its futures borrow
+    /// `ctx`, so when the policy runs calls concurrently, the futures must
+    /// materialize inside the returned stream (which owns `ctx`) rather
+    /// than across this method's return — see the parallel example on
+    /// [`with_tool_round_executor`](ReActAgent::with_tool_round_executor).
+    ///
+    /// # Errors
+    ///
+    /// None at the round level: a tool's failure is not an error here — it
+    /// rides along in the outcome's text, which the agent records and
+    /// feeds back to the model.
+    async fn execute_round<'a>(
+        &'a mut self,
+        ctx: ToolRoundCtx<'a>,
+        calls: Vec<ToolCall>,
+    ) -> BoxStream<'a, ToolCallOutcome>;
+}
+
+/// The default round policy: execute the round's calls one by one, in
+/// request order — the classic serial loop, identical behavior.
+///
+/// This is the executor used when none is injected, so you usually don't
+/// need to name it; reach for it when replacing the default with a custom
+/// policy and keeping the serial behavior handy as a fallback:
+///
+/// ```
+/// use molo::agent::SerialToolRoundExecutor;
+/// use molo::agent::ToolRoundExecutor;
+///
+/// let serial: Box<dyn ToolRoundExecutor> = Box::new(SerialToolRoundExecutor::default());
+/// ```
+#[derive(Debug, Default, Clone, Copy)]
+pub struct SerialToolRoundExecutor;
+
+#[async_trait::async_trait]
+impl ToolRoundExecutor for SerialToolRoundExecutor {
+    async fn execute_round<'a>(
+        &'a mut self,
+        ctx: ToolRoundCtx<'a>,
+        calls: Vec<ToolCall>,
+    ) -> BoxStream<'a, ToolCallOutcome> {
+        Box::pin(async_stream::stream! {
+            for call in calls {
+                yield ctx.run(call).await;
+            }
+        })
+    }
+}
+
+/// The execution outcome of one tool call: the call info, the text fed
+/// back to the model, and the recording metadata.
+///
+/// `run` produces outcomes; policies can also construct **synthetic**
+/// outcomes to feed a decision back to the model without running the tool
+/// (see the approval-gate example on [`ToolRoundExecutor`]) — the agent
+/// records the text through the normal ToolResult channel:
+///
+/// ```
+/// use molo::agent::ToolCallOutcome;
+/// use molo::message::ToolCall;
+///
+/// let denied = ToolCallOutcome {
+///     call: ToolCall {
+///         id: "call_1".into(),
+///         name: "dangerous".into(),
+///         arguments: "{}".into(),
+///     },
+///     content: "denied by approval gate".into(),
+///     protected: false,
+/// };
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToolCallOutcome {
     /// The call as-is (with id / name / arguments, used for event pairing
     /// and locating the record).
-    call: ToolCall,
+    pub call: ToolCall,
     /// The text fed back (Ok result / Err's Display, visible to the model).
-    content: String,
+    pub content: String,
     /// Whether the result is protected (declared by the tool via
     /// [`Tool::protected_output`](crate::Tool::protected_output); protected
     /// results are exempt from window trimming when recorded).
-    protected: bool,
+    pub protected: bool,
 }
 
 impl ReActAgent {
@@ -1264,6 +1525,49 @@ fn stream_end(
     match error {
         AgentError::Cancelled => Ok(MessageChunk::Cancelled),
         e => Err(e),
+    }
+}
+
+/// Record a tool result, falling back to recording the error text before
+/// re-raising on failure.
+///
+/// The tool has already run (side effects happened), so its result text
+/// must not be lost: an Assistant message recorded without its ToolResult
+/// leaves the memory incomplete, the next request would carry an unpaired
+/// assistant/tool sequence, real endpoints reject it (400), and the
+/// reported cause would be disconnected from the real failure. If the
+/// fallback recording itself fails, the error is swallowed — the original
+/// error takes priority, and there's no point retrying when the same
+/// Memory keeps failing.
+///
+/// A free function rather than a method: while the round's outcome stream
+/// is consumed, the agent's registry / state / events are borrowed (via
+/// [`ToolRoundCtx`]); recording goes through the memory field directly —
+/// a disjoint borrow (same rationale as publish_ended / stream_end).
+async fn record_tool_result(
+    memory: &mut Box<dyn Memory>,
+    outcome: &ToolCallOutcome,
+) -> Result<(), AgentError> {
+    let message = Message::tool_result(outcome.call.id.clone(), outcome.content.clone());
+    let record_result = if outcome.protected {
+        memory.record_protected(message).await
+    } else {
+        memory.record(message).await
+    };
+    match record_result {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            let fallback = Message::tool_result(
+                outcome.call.id.clone(),
+                format!("memory record failed: {e}"),
+            );
+            let _ = if outcome.protected {
+                memory.record_protected(fallback).await
+            } else {
+                memory.record(fallback).await
+            };
+            Err(e.into())
+        }
     }
 }
 
@@ -1649,15 +1953,21 @@ impl ReActAgent {
                     break;
                 }
 
-                // Tool round: execute one by one, feeding results back
-                // right after each.
+                // Tool round: the round policy (default: execute one by
+                // one, feeding results back right after each) is injected
+                // via the ToolRoundExecutor; each outcome is dispatched
+                // and recorded as it arrives.
                 tool_calls_total += calls.len();
                 tool_rounds += 1;
-                for call in calls {
-                    // Execution + events + span live in run_tool_call
-                    // (shared by both paths); the result text is fed back
-                    // right after, then recorded.
-                    let outcome = self.run_tool_call(call, &run_id, rounds).await;
+                let ctx = ToolRoundCtx {
+                    run_id: &run_id,
+                    round: rounds,
+                    registry: &self.registry,
+                    state: &self.state,
+                    events: &self.events,
+                };
+                let mut outcomes = self.executor.execute_round(ctx, calls).await;
+                while let Some(outcome) = outcomes.next().await {
                     yield Ok(MessageChunk::ToolResult {
                         id: outcome.call.id.clone(),
                         name: outcome.call.name.clone(),
@@ -1667,13 +1977,14 @@ impl ReActAgent {
                     // via record_protected, exempt from window trimming;
                     // when recording fails, the error text is recorded as a
                     // fallback (memory integrity, see record_tool_result).
-                    if let Err(e) = self.record_tool_result(&outcome).await {
+                    if let Err(e) = record_tool_result(&mut self.memory, &outcome).await {
                         yield stream_end(&self.events, &run_span, rounds, tool_calls_total,
                             usage_total, e);
                         // Errors are produced as Err items and terminate
                         // the stream — the break must exit the whole round
-                        // loop, not just the tool for (otherwise the loop
-                        // would continue to the next round after an Err).
+                        // loop, not just the outcome loop (otherwise the
+                        // loop would continue to the next round after an
+                        // Err).
                         break 'rounds;
                     }
                 }
@@ -3392,6 +3703,137 @@ mod tests {
             Message::Assistant { tool_calls, .. } if tool_calls.len() == 1
         ));
         assert!(matches!(&ctx[2], Message::ToolResult { content, .. } if content == "42"));
+    }
+
+    /// Custom tool-round executor injection (non-streaming): the round
+    /// policy is the application's to own — here, calls run in reversed
+    /// order, and a call the policy refuses is answered with a synthetic
+    /// denial outcome (the tool never runs). Memory records results in
+    /// the order the policy yields them.
+    #[tokio::test]
+    async fn custom_tool_round_executor() {
+        // Deny the "alpha" call on the first round, run everything else;
+        // yield outcomes in reversed order.
+        #[derive(Default)]
+        struct DenyAlphaToolRoundExecutor {
+            denied: bool,
+        }
+        #[async_trait::async_trait]
+        impl ToolRoundExecutor for DenyAlphaToolRoundExecutor {
+            async fn execute_round<'a>(
+                &'a mut self,
+                ctx: ToolRoundCtx<'a>,
+                calls: Vec<ToolCall>,
+            ) -> BoxStream<'a, ToolCallOutcome> {
+                let mut outcomes = Vec::with_capacity(calls.len());
+                for call in calls.into_iter().rev() {
+                    if call.name == "alpha" && !self.denied {
+                        self.denied = true;
+                        // Policy refuses: a synthetic outcome feeds the
+                        // denial text back through the normal ToolResult
+                        // channel, without running the tool.
+                        outcomes.push(ToolCallOutcome {
+                            call,
+                            content: "denied by policy".into(),
+                            protected: false,
+                        });
+                    } else {
+                        outcomes.push(ctx.run(call).await);
+                    }
+                }
+                Box::pin(futures::stream::iter(outcomes))
+            }
+        }
+
+        let (alpha_tool, alpha_calls) = FakeTool::new("alpha", "A");
+        let (beta_tool, beta_calls) = FakeTool::new("beta", "B");
+        let mut registry = ToolRegistry::new();
+        registry.register(alpha_tool);
+        registry.register(beta_tool);
+        let fake = SharedFake::new([
+            FakeReply::ToolCalls {
+                content: "".into(),
+                calls: vec![call("c1", "alpha", "{}"), call("c2", "beta", "{}")],
+            },
+            FakeReply::Text("done".into()),
+        ]);
+        let mut agent = agent_with_registry(fake.clone(), registry, AgentConfig::default())
+            .with_tool_round_executor(DenyAlphaToolRoundExecutor::default());
+
+        let answer = agent.run("Compute").await.unwrap();
+        assert_eq!(answer, "done");
+        // alpha never ran (denied); beta ran once.
+        assert_eq!(alpha_calls.load(Ordering::Relaxed), 0);
+        assert_eq!(beta_calls.load(Ordering::Relaxed), 1);
+        // The second request carries the round's results in the order the
+        // policy yielded them: beta (executed) first, then alpha (denied).
+        let requests = fake.requests();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[1].messages[2], Message::tool_result("c2", "B"),);
+        assert_eq!(
+            requests[1].messages[3],
+            Message::tool_result("c1", "denied by policy"),
+        );
+    }
+
+    /// Custom tool-round executor injection (streaming): each outcome is
+    /// dispatched as a ToolResult chunk as the policy yields it, in the
+    /// policy's order.
+    #[tokio::test]
+    async fn custom_tool_round_executor_streaming() {
+        #[derive(Default)]
+        struct ReversedToolRoundExecutor;
+        #[async_trait::async_trait]
+        impl ToolRoundExecutor for ReversedToolRoundExecutor {
+            async fn execute_round<'a>(
+                &'a mut self,
+                ctx: ToolRoundCtx<'a>,
+                calls: Vec<ToolCall>,
+            ) -> BoxStream<'a, ToolCallOutcome> {
+                let mut outcomes = Vec::with_capacity(calls.len());
+                for call in calls.into_iter().rev() {
+                    outcomes.push(ctx.run(call).await);
+                }
+                Box::pin(futures::stream::iter(outcomes))
+            }
+        }
+
+        let (alpha_tool, _) = FakeTool::new("alpha", "A");
+        let (beta_tool, _) = FakeTool::new("beta", "B");
+        let mut registry = ToolRegistry::new();
+        registry.register(alpha_tool);
+        registry.register(beta_tool);
+        let fake = SharedFake::new([
+            FakeReply::ToolCalls {
+                content: "".into(),
+                calls: vec![call("c1", "alpha", "{}"), call("c2", "beta", "{}")],
+            },
+            FakeReply::Text("done".into()),
+        ]);
+        let mut agent = agent_with_registry(fake.clone(), registry, AgentConfig::default())
+            .with_tool_round_executor(ReversedToolRoundExecutor);
+
+        let mut stream = agent.run_stream("Compute").await.unwrap();
+        let mut results = Vec::new();
+        let mut done = false;
+        while let Some(item) = stream.next().await {
+            match item.unwrap() {
+                MessageChunk::ToolResult { id, content, .. } => {
+                    results.push((id, content));
+                }
+                MessageChunk::Done(_) => done = true,
+                _ => {}
+            }
+        }
+        assert!(done);
+        // Dispatched in policy order: beta (reversed) before alpha.
+        assert_eq!(
+            results,
+            vec![
+                ("c2".to_string(), "B".to_string()),
+                ("c1".to_string(), "A".to_string())
+            ]
+        );
     }
 
     /// Mid-stream cancellation: already-dispatched Deltas are kept, a
