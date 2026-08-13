@@ -32,6 +32,8 @@ use crate::effect::{EffectObservation, EffectRequest};
 use crate::event_channel::EventChannel;
 use crate::memory::{Memory, WindowMemory};
 use crate::message::{Message, ToolCall};
+#[cfg(feature = "harness")]
+use crate::provider::FakeProvider;
 use crate::provider::{
     ChatRequest, FinishReason, ModelOptions, Provider, ProviderError, StreamEvent, Usage,
 };
@@ -337,6 +339,17 @@ impl ReActAgent {
             skill_mode: SkillMode::None,
             kernel_state: None,
         }
+    }
+
+    /// Constructs a provider-free ReAct kernel for use with an outer
+    /// [`HarnessRuntime`](crate::harness::HarnessRuntime).
+    ///
+    /// The runtime owns provider execution; this kernel only assembles
+    /// model requests, runs immediate tools, requests governed effects, and
+    /// consumes observations.
+    #[cfg(feature = "harness")]
+    pub fn kernel(tools: ToolRegistry, system_prompt: impl Into<String>) -> Self {
+        Self::new(FakeProvider::new([]), tools, system_prompt)
     }
 
     /// Replace the default Memory (default
@@ -2007,7 +2020,7 @@ impl ReActAgent {
 type TraceSpan = tracing::Span;
 
 #[cfg(not(feature = "tracing"))]
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct TraceSpan;
 
 #[cfg(feature = "tracing")]

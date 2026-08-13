@@ -103,10 +103,11 @@ model -> tool/effect request -> risk classification -> policy check
 
 ## 现状与目标
 
-`0.2.x` 是单个 `molo` crate 加 `molo-macros`，交付的是 agent-runtime 一侧：
-`ReActAgent` loop、provider、memory、tool registry、MCP、skills、structured
-output、event 与 cancellation。harness 与 coding workload 层尚未成为独立
-crate。
+`0.3.x` 是单个 `molo` crate 加 `molo-macros`，交付的是 agent-runtime 一侧与
+可选 harness runtime：`ReActAgent` loop、provider、memory、tool registry、
+effect protocol、`HarnessRuntime`、`BasicHarness`、MCP、skills、structured
+output、event 与 cancellation。coding workload 层尚未成为独立 crate，生产级
+filesystem/shell/git/patch executor 仍属于后续 `molo-coding` 演进范围。
 
 上述拆分是演进方向，将逐步抽取，而不是一次性完成。在 1.0 之前，当目标
 架构需要时，public API 允许跨 0.x minor 破坏性变更，每次 breaking change

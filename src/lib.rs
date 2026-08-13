@@ -26,6 +26,7 @@
 //!   enables `structured` because macro-generated schemas use `schemars`.
 //! - `skills`: Agent Skills protocol support.
 //! - `mcp`: MCP client adapter support.
+//! - `harness`: `HarnessRuntime` and governed effect execution.
 //! - `cli-channel`: [`CliMessageChannel`] for stdin/stdout interaction.
 //! - `tracing`: internal tracing spans and logs.
 //! - `full`: all optional capabilities above.
@@ -136,6 +137,8 @@
 pub mod agent;
 pub mod effect;
 pub mod event_channel;
+#[cfg(feature = "harness")]
+pub mod harness;
 #[cfg(feature = "mcp")]
 pub mod mcp;
 pub mod memory;
@@ -170,6 +173,19 @@ pub use effect::{
     EffectSource, EffectStatus, RiskLevel,
 };
 pub use event_channel::{BroadcastEventChannel, EventChannel, EventReceiver, MpscEventChannel};
+#[cfg(feature = "harness")]
+pub use harness::{
+    AgentActionSummary, AlwaysAllowApprovalBroker, AlwaysDenyApprovalBroker, ApprovalBroker,
+    ApprovalDecision, ApprovalError, ApprovalRequest, AuditError, AuditEvent, AuditSink,
+    BasicHarness, ClassifiedEffect, DefaultPolicyEngine, DefaultRiskClassifier, EffectExecutor,
+    ExecutionError, ExecutionPolicy, ExecutionPolicySummary, Harness, HarnessConfig, HarnessError,
+    HarnessRuntime, HarnessRuntimeConfig, HarnessRuntimeError, LimitedOutput, ModelSummary,
+    NetworkPolicy, NoopAuditSink, NoopEffectExecutor, NoopRedactor, NoopTranscriptStore,
+    OutputLimit, PatternRedactor, PolicyDecision, PolicyEngine, RawEffectOutput, RedactedText,
+    RedactionRecord, Redactor, RouterEffectExecutor, SandboxPolicy, StaticApprovalBroker,
+    StaticEffectExecutor, TranscriptError, TranscriptRecord, TranscriptStore, VecAuditSink,
+    VecTranscriptStore,
+};
 #[cfg(feature = "mcp")]
 pub use mcp::{McpClient, McpError, McpTool};
 pub use memory::{
