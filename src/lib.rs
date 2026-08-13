@@ -1,7 +1,21 @@
-//! molo — an AI agent framework.
+//! molo — an embeddable Rust agent runtime and harness framework.
 #![warn(missing_docs)]
 //!
-//! molo = **Mo**del **Lo**op: a lightweight Rust agent framework.
+//! molo = **Mo**del **Lo**op: an embeddable Rust runtime and harness
+//! framework for building safe, extensible tool-calling agents, with
+//! first-class support for coding-agent workloads.
+//!
+//! molo is a library, not an end-user agent product. You assemble agents
+//! from its building blocks — model interaction, reasoning loop, memory,
+//! tools, structured output, and observability. The target architecture also
+//! includes an optional harness layer (approval, sandbox, audit, transcript)
+//! that governs and executes side effects, and an optional coding-workload
+//! SDK (workspace, shell, git, patch, repo context). The `0.2.x` crate
+//! currently ships the agent-runtime side of that picture; the harness and
+//! coding layers are being introduced as optional components in later
+//! releases. Public API breaking changes are expected throughout 0.x when
+//! they serve the target architecture, and each one ships with a migration
+//! path.
 //!
 //! # Quick Start
 //!

@@ -2,10 +2,11 @@
 
 # molo
 
-**Mo**del **Lo**op · A lightweight Rust agent framework
+**Mo**del **Lo**op · An embeddable Rust agent runtime and harness framework
 
-Build LLM agents from building blocks — the reasoning loop, tool calling,
-context management, and all the wiring are already done for you.
+molo is an embeddable Rust runtime and harness framework for building safe,
+extensible tool-calling agents, with first-class support for coding-agent
+workloads.
 
 [![crates.io](https://img.shields.io/crates/v/molo.svg)](https://crates.io/crates/molo)
 [![docs.rs](https://docs.rs/molo/badge.svg)](https://docs.rs/molo)
@@ -13,11 +14,28 @@ context management, and all the wiring are already done for you.
 [![License](https://img.shields.io/crates/l/molo.svg)](LICENSE-APACHE)
 [![MSRV](https://img.shields.io/badge/rustc-1.97%2B-orange.svg)](https://github.com/Silwings-git/molo)
 
-English · [简体中文](docs/README.zh-CN.md)
-
 </div>
 
 ---
+
+molo is a framework and SDK, not an end-user agent product. You assemble
+agents — including CLI coding agents — from its building blocks: model
+interaction, reasoning loop, context management, tool calling, structured
+output, and observability. The target architecture adds two optional layers
+on top: a harness that governs and executes side effects (approval, sandbox,
+audit, transcript), and a coding-workload SDK (workspace, shell, git, patch,
+repo context). See [Architecture](docs/architecture.md) for the layer
+boundaries and dependency rules.
+
+## Status
+
+molo is in an early 0.x phase with a planned architecture evolution. The
+`0.2.x` crate currently ships the agent-runtime side: the `ReActAgent`
+reasoning loop, provider, memory, tools, MCP, skills, structured output, and
+observability. The harness and coding-workload layers are being designed and
+will land as optional components in later releases. Public API breaking
+changes are expected throughout 0.x when they serve the target architecture;
+each one ships with a migration path.
 
 ## ✨ Features
 
@@ -284,7 +302,8 @@ fill in real values); environment variables override directly:
 ## 📖 Documentation
 
 - Rustdoc: `cargo doc --no-deps` or [docs.rs](https://docs.rs/molo)
-- [简体中文文档](docs/README.zh-CN.md) (Chinese README)
+- [Architecture](docs/architecture.md) — layer boundaries, dependency
+  direction, and the side-effect execution model
 
 ## 📄 License
 
