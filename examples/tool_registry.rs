@@ -9,7 +9,10 @@
 //! restricts a sub-agent's tool scope). The tool-call loop wired to a real
 //! model is in `examples/tool_agent.rs`.
 
-use molo::{SharedState, Tool, ToolError, ToolRegistry, ToolSchema};
+use molo::{
+    RunContext, SharedState, Tool, ToolCall, ToolContext, ToolError, ToolOutput, ToolRegistry,
+    ToolResult, ToolSchema,
+};
 use schemars::JsonSchema;
 use serde::Deserialize;
 
@@ -27,23 +30,23 @@ struct Calculator;
 #[async_trait::async_trait]
 impl Tool for Calculator {
     fn schema(&self) -> ToolSchema {
-        ToolSchema {
-            name: "calculator".into(),
-            description: "Evaluates a math expression; supports basic arithmetic and parentheses, e.g. \"(1 + 2) * 3\".".into(),
-            parameters: serde_json::to_value(schemars::schema_for!(CalcArgs))
+        ToolSchema::new(
+            "calculator",
+            "Evaluates a math expression; supports basic arithmetic and parentheses, e.g. \"(1 + 2) * 3\".",
+            serde_json::to_value(schemars::schema_for!(CalcArgs))
                 .expect("tool schema must serialize"),
-        }
+        )
     }
 
     async fn call(
         &self,
         arguments: serde_json::Value,
-        _state: &SharedState,
-    ) -> Result<String, ToolError> {
+        _context: ToolContext<'_>,
+    ) -> Result<ToolResult, ToolError> {
         let args: CalcArgs = serde_json::from_value(arguments)?;
         let value =
             evalexpr::eval(&args.expression).map_err(|e| ToolError::Execution(e.to_string()))?;
-        Ok(value.to_string())
+        Ok(ToolOutput::text(value.to_string()).into())
     }
 }
 
@@ -53,22 +56,22 @@ struct CurrentTime;
 #[async_trait::async_trait]
 impl Tool for CurrentTime {
     fn schema(&self) -> ToolSchema {
-        ToolSchema {
-            name: "current_time".into(),
-            description: "Returns the current Unix timestamp in seconds.".into(),
-            parameters: serde_json::json!({ "type": "object", "properties": {} }),
-        }
+        ToolSchema::new(
+            "current_time",
+            "Returns the current Unix timestamp in seconds.",
+            serde_json::json!({ "type": "object", "properties": {} }),
+        )
     }
 
     async fn call(
         &self,
         _arguments: serde_json::Value,
-        _state: &SharedState,
-    ) -> Result<String, ToolError> {
+        _context: ToolContext<'_>,
+    ) -> Result<ToolResult, ToolError> {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_err(|e| ToolError::Execution(e.to_string()))?;
-        Ok(now.as_secs().to_string())
+        Ok(ToolOutput::text(now.as_secs().to_string()).into())
     }
 }
 
@@ -77,6 +80,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 1. Register: chained register; the registration order is the order returned by names / schemas.
     let mut registry = ToolRegistry::new();
     registry.register(Calculator).register(CurrentTime);
+    let run = RunContext::new("tool-registry-example");
+    let state = SharedState::new();
 
     // 2. names / schemas: in registration order.
     println!("1. registered tools: {:?}", registry.names());
@@ -91,10 +96,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!(
         "2. call calculator: {}",
         registry
-            .call(
+            .call_named(
                 "calculator",
                 r#"{"expression": "(1 + 2) * 3"}"#,
-                &SharedState::new()
+                &run,
+                &state
             )
             .await?
     );
@@ -104,14 +110,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!(
         "3. call a nonexistent tool: {}",
         registry
-            .call("nope", "{}", &SharedState::new())
+            .call_named("nope", "{}", &run, &state)
             .await
             .unwrap_err()
     );
     println!(
         "4. call with non-JSON arguments:  {}",
         registry
-            .call("calculator", "not valid JSON", &SharedState::new())
+            .call_named("calculator", "not valid JSON", &run, &state)
             .await
             .unwrap_err()
     );
@@ -122,7 +128,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .get("calculator")
         .expect("calculator must be registered");
     let result = calculator
-        .call(serde_json::json!({}), &SharedState::new())
+        .call(
+            serde_json::json!({}),
+            ToolContext::new(&run, &state, "manual-call", "calculator"),
+        )
         .await;
     match result {
         Ok(_) => println!("5. (unexpected success)"),
@@ -136,9 +145,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!(
         "   → the sub-registry can execute too: {}",
         sub.call(
-            "calculator",
-            r#"{"expression": "7 * 6"}"#,
-            &SharedState::new()
+            &ToolCall {
+                id: "sub-call".into(),
+                name: "calculator".into(),
+                arguments: r#"{"expression": "7 * 6"}"#.into(),
+            },
+            &run,
+            &state,
         )
         .await?
     );

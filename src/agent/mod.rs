@@ -63,14 +63,139 @@ pub use structured::{
 };
 pub use sub_agent::{PoolError, SubAgentPool, SubAgentTool};
 
+use crate::effect::{EffectObservation, EffectRequest};
 use crate::memory::MemoryError;
-use crate::provider::ProviderError;
-use crate::run::{RunContext, RunOutput, RunRequest, TypedRunOutput};
+use crate::provider::{ChatRequest, ChatResponse, ProviderError};
+use crate::run::{RunContext, RunMetadata, RunOutput, RunRequest, TypedRunOutput};
 use futures::stream::BoxStream;
 use std::fmt;
 use tokio_util::sync::CancellationToken;
 
 pub use crate::run::RunSummary;
+
+/// Provider request emitted by a step-wise [`AgentKernel`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct ModelRequest {
+    /// Model request id, unique within the run or agent implementation.
+    pub id: String,
+    /// Provider chat request to execute.
+    pub chat: ChatRequest,
+    /// Framework/application metadata.
+    pub metadata: RunMetadata,
+}
+
+impl ModelRequest {
+    /// Constructs a model request.
+    pub fn new(id: impl Into<String>, chat: ChatRequest) -> Self {
+        Self {
+            id: id.into(),
+            chat,
+            metadata: RunMetadata::new(),
+        }
+    }
+
+    /// Sets framework/application metadata.
+    pub fn with_metadata(mut self, metadata: RunMetadata) -> Self {
+        self.metadata = metadata;
+        self
+    }
+}
+
+/// Successful provider response observed by a step-wise [`AgentKernel`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct ModelObservation {
+    /// Model request id matching [`ModelRequest::id`].
+    pub request_id: String,
+    /// Provider response.
+    pub response: ChatResponse,
+    /// Framework/application metadata.
+    pub metadata: RunMetadata,
+}
+
+impl ModelObservation {
+    /// Constructs a model observation.
+    pub fn new(request_id: impl Into<String>, response: ChatResponse) -> Self {
+        Self {
+            request_id: request_id.into(),
+            response,
+            metadata: RunMetadata::new(),
+        }
+    }
+
+    /// Sets framework/application metadata.
+    pub fn with_metadata(mut self, metadata: RunMetadata) -> Self {
+        self.metadata = metadata;
+        self
+    }
+}
+
+/// Observation fed back to a step-wise [`AgentKernel`].
+#[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
+pub enum Observation {
+    /// Successful model response.
+    Model(ModelObservation),
+    /// Effect observation produced by an outer harness.
+    Effect(EffectObservation),
+    /// Batch effect observations produced by an outer harness.
+    ///
+    /// This is the companion to [`AgentAction::RequestEffects`]. The outer
+    /// runtime may execute the requests sequentially or in parallel, then
+    /// feeds the completed set back to the kernel as one step.
+    Effects(Vec<EffectObservation>),
+}
+
+/// Next action requested by a step-wise [`AgentKernel`].
+#[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
+pub enum AgentAction {
+    /// The run is complete.
+    Respond {
+        /// Final structured run output.
+        output: RunOutput,
+    },
+    /// The outer runtime should execute a provider request and feed back
+    /// [`Observation::Model`].
+    RequestModel {
+        /// Provider request.
+        request: ModelRequest,
+    },
+    /// The outer runtime should govern and execute an effect request, then
+    /// feed back [`Observation::Effect`].
+    RequestEffect {
+        /// Effect request.
+        request: EffectRequest,
+    },
+    /// The outer runtime should govern and execute multiple effect requests,
+    /// then feed back [`Observation::Effects`].
+    RequestEffects {
+        /// Effect requests.
+        requests: Vec<EffectRequest>,
+    },
+}
+
+/// Step-wise agent kernel boundary.
+///
+/// A kernel maintains reasoning state and decides the next action. It does
+/// not execute provider requests or side effects directly; an outer runtime
+/// drives those actions and feeds successful observations back through
+/// [`observe`](AgentKernel::observe).
+#[async_trait::async_trait]
+pub trait AgentKernel: Send {
+    /// Starts a run and returns the first action.
+    async fn start(
+        &mut self,
+        request: RunRequest,
+        context: &RunContext,
+    ) -> Result<AgentAction, AgentError>;
+
+    /// Consumes an observation and returns the next action.
+    async fn observe(
+        &mut self,
+        observation: Observation,
+        context: &RunContext,
+    ) -> Result<AgentAction, AgentError>;
+}
 
 /// Reasoning-loop interface: one `run` takes the user input, drives the
 /// reasoning loop, and returns the final answer.
@@ -474,4 +599,12 @@ pub enum AgentError {
     /// The run-level deadline elapsed before the run completed.
     #[error("run deadline exceeded")]
     DeadlineExceeded,
+    /// A tool requested a side effect, but this high-level agent run has no
+    /// harness driver to govern and execute it.
+    #[error("effect requires harness: {0}")]
+    EffectRequiresHarness(String),
+    /// A step-wise kernel received an observation that does not match its
+    /// current state.
+    #[error("invalid agent step: {0}")]
+    InvalidStep(String),
 }

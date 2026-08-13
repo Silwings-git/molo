@@ -38,7 +38,7 @@
 use molo::AgentError;
 use molo::agent::{Agent, AgentEvent, ReActEvent};
 use molo::event_channel::{BroadcastEventChannel, EventChannel};
-use molo::tool::{SharedState, Tool, ToolError, ToolSchema};
+use molo::tool::{Tool, ToolContext, ToolError, ToolOutput, ToolResult, ToolSchema};
 
 /// Echo tool (success path).
 struct Echo;
@@ -46,18 +46,14 @@ struct Echo;
 #[async_trait::async_trait]
 impl Tool for Echo {
     fn schema(&self) -> ToolSchema {
-        ToolSchema {
-            name: "echo".into(),
-            description: "Echoes text back".into(),
-            parameters: serde_json::json!({}),
-        }
+        ToolSchema::new("echo", "Echoes text back", serde_json::json!({}))
     }
     async fn call(
         &self,
         _arguments: serde_json::Value,
-        _state: &SharedState,
-    ) -> Result<String, ToolError> {
-        Ok("Echo: hello".into())
+        _context: ToolContext<'_>,
+    ) -> Result<ToolResult, ToolError> {
+        Ok(ToolOutput::text("Echo: hello").into())
     }
 }
 
@@ -67,17 +63,13 @@ struct Boom;
 #[async_trait::async_trait]
 impl Tool for Boom {
     fn schema(&self) -> ToolSchema {
-        ToolSchema {
-            name: "boom".into(),
-            description: "A tool that always fails".into(),
-            parameters: serde_json::json!({}),
-        }
+        ToolSchema::new("boom", "A tool that always fails", serde_json::json!({}))
     }
     async fn call(
         &self,
         _arguments: serde_json::Value,
-        _state: &SharedState,
-    ) -> Result<String, ToolError> {
+        _context: ToolContext<'_>,
+    ) -> Result<ToolResult, ToolError> {
         Err(ToolError::Execution("internal error".into()))
     }
 }

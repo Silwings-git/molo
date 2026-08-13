@@ -48,14 +48,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // ---- Path 1: call MCP tools directly ----
     let state = SharedState::new();
+    let run = molo::RunContext::new("mcp-example-direct");
     let text = registry
-        .call("fake__echo", r#"{"text":"hello, MCP!"}"#, &state)
+        .call_named("fake__echo", r#"{"text":"hello, MCP!"}"#, &run, &state)
         .await?;
     println!("direct call to fake__echo: {text}");
 
     // Tool-level failure: the error text is fed back via the registry; Display is the error text.
     let err = registry
-        .call("fake__fail", "{}", &state)
+        .call_named(
+            "fake__fail",
+            "{}",
+            &molo::RunContext::new("direct-call"),
+            &state,
+        )
         .await
         .expect_err("fail tool must fail");
     println!("tool-level failure fed back: {err}");

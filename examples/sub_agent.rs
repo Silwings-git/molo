@@ -35,7 +35,7 @@
 //! ```rust
 //! use molo::agent::{Agent, AgentError, SubAgentTool};
 //! use molo::provider::{FakeProvider, FakeReply};
-//! use molo::tool::{ToolError, ToolRegistry};
+//! use molo::tool::{ToolError, ToolRegistry, ToolResult};
 //! use molo::react_agent;
 //!
 //! /// Demo sub-agent: echoes the input back as-is.
@@ -88,7 +88,7 @@
 
 use molo::agent::{Agent, MessageChunk, ReActAgent, SubAgentPool};
 use molo::provider::OpenAiProvider;
-use molo::tool::{SharedState, Tool, ToolError, ToolRegistry, ToolSchema};
+use molo::tool::{Tool, ToolContext, ToolError, ToolOutput, ToolRegistry, ToolResult, ToolSchema};
 
 use futures::stream::StreamExt;
 use schemars::JsonSchema;
@@ -129,20 +129,19 @@ struct SpawnAgent {
 #[async_trait::async_trait]
 impl Tool for SpawnAgent {
     fn schema(&self) -> ToolSchema {
-        ToolSchema {
-            name: "spawn_agent".into(),
-            description: "Creates and names a sub-agent and immediately runs the task; afterwards send_agent can continue the conversation by name"
-                .into(),
-            parameters: serde_json::to_value(schemars::schema_for!(SpawnArgs))
+        ToolSchema::new(
+            "spawn_agent",
+            "Creates and names a sub-agent and immediately runs the task; afterwards send_agent can continue the conversation by name",
+            serde_json::to_value(schemars::schema_for!(SpawnArgs))
                 .expect("tool schema must serialize"),
-        }
+        )
     }
 
     async fn call(
         &self,
         arguments: serde_json::Value,
-        _state: &SharedState,
-    ) -> Result<String, ToolError> {
+        _context: ToolContext<'_>,
+    ) -> Result<ToolResult, ToolError> {
         let args: SpawnArgs = serde_json::from_value(arguments)?;
         // Convenience shape: the system prompt and task are defined by the model (main agent), assembled as a standard ReAct agent.
         let reply = self
@@ -160,7 +159,7 @@ impl Tool for SpawnAgent {
             )
             .await
             .map_err(ToolError::from)?;
-        Ok(reply)
+        Ok(ToolOutput::text(reply).into())
     }
 }
 
@@ -172,24 +171,26 @@ struct SendAgent {
 #[async_trait::async_trait]
 impl Tool for SendAgent {
     fn schema(&self) -> ToolSchema {
-        ToolSchema {
-            name: "send_agent".into(),
-            description: "Hands a new task to a previously created sub-agent (by name); it answers with its previous memory; if the name does not exist, spawn_agent first".into(),
-            parameters: serde_json::to_value(schemars::schema_for!(SendArgs))
+        ToolSchema::new(
+            "send_agent",
+            "Hands a new task to a previously created sub-agent (by name); it answers with its previous memory; if the name does not exist, spawn_agent first",
+            serde_json::to_value(schemars::schema_for!(SendArgs))
                 .expect("tool schema must serialize"),
-        }
+        )
     }
 
     async fn call(
         &self,
         arguments: serde_json::Value,
-        _state: &SharedState,
-    ) -> Result<String, ToolError> {
+        _context: ToolContext<'_>,
+    ) -> Result<ToolResult, ToolError> {
         let args: SendArgs = serde_json::from_value(arguments)?;
-        self.pool
+        let reply = self
+            .pool
             .send(&args.name, &args.message)
             .await
-            .map_err(ToolError::from)
+            .map_err(ToolError::from)?;
+        Ok(ToolOutput::text(reply).into())
     }
 }
 
@@ -201,20 +202,20 @@ struct ListAgents {
 #[async_trait::async_trait]
 impl Tool for ListAgents {
     fn schema(&self) -> ToolSchema {
-        ToolSchema {
-            name: "list_agents".into(),
-            description: "Lists the names of all created sub-agents".into(),
-            parameters: serde_json::json!({ "type": "object", "properties": {} }),
-        }
+        ToolSchema::new(
+            "list_agents",
+            "Lists the names of all created sub-agents",
+            serde_json::json!({ "type": "object", "properties": {} }),
+        )
     }
 
     async fn call(
         &self,
         _arguments: serde_json::Value,
-        _state: &SharedState,
-    ) -> Result<String, ToolError> {
+        _context: ToolContext<'_>,
+    ) -> Result<ToolResult, ToolError> {
         let names = self.pool.names().await;
-        Ok(names.join(", "))
+        Ok(ToolOutput::text(names.join(", ")).into())
     }
 }
 

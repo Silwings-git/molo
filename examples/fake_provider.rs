@@ -32,7 +32,7 @@ use futures::StreamExt;
 use molo::agent::{Agent, AgentError};
 use molo::memory::InMemoryMemory;
 use molo::provider::{ChatRequest, FakeProvider, FakeReply, Provider, ProviderError};
-use molo::tool::{SharedState, Tool, ToolError, ToolSchema};
+use molo::tool::{SharedState, Tool, ToolContext, ToolError, ToolOutput, ToolResult, ToolSchema};
 use molo::{
     Memory, Message, RunContext, RunMetadata, RunOutput, RunRequest, RunSummary, ToolCall,
     ToolRegistry,
@@ -44,19 +44,19 @@ struct Echo;
 #[async_trait::async_trait]
 impl Tool for Echo {
     fn schema(&self) -> ToolSchema {
-        ToolSchema {
-            name: "echo".into(),
-            description: "Returns the input text as-is.".into(),
-            parameters: serde_json::json!({}),
-        }
+        ToolSchema::new(
+            "echo",
+            "Returns the input text as-is.",
+            serde_json::json!({}),
+        )
     }
 
     async fn call(
         &self,
         arguments: serde_json::Value,
-        _state: &SharedState,
-    ) -> Result<String, ToolError> {
-        Ok(format!("echo: {arguments}"))
+        _context: ToolContext<'_>,
+    ) -> Result<ToolResult, ToolError> {
+        Ok(ToolOutput::text(format!("echo: {arguments}")).into())
     }
 }
 
@@ -100,6 +100,7 @@ impl Agent for SimpleAgent {
 
         // Tool definitions are the same every round, so compute them once; the model decides whether to call a tool based on them.
         let schemas = self.tools.schemas();
+        let state = SharedState::new();
 
         for _ in 0..self.max_tool_rounds {
             let response = self
@@ -141,8 +142,9 @@ impl Agent for SimpleAgent {
                 // Err's Display is "error as text"; still record it and feed it back as usual.
                 let content = self
                     .tools
-                    .call(&call.name, &call.arguments, &SharedState::new())
+                    .call(&call, &context, &state)
                     .await
+                    .map(|result| result.to_string())
                     .unwrap_or_else(|e| e.to_string());
                 self.memory
                     .record(Message::ToolResult {

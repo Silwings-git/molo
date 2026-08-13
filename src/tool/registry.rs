@@ -1,7 +1,7 @@
 //! ToolRegistry: the registry component — holds tools, responsible for
-//! lookup and execution by name.
+//! lookup and tool dispatch.
 //!
-//! This is the unified entry point where the agent loop executes tools; a
+//! This is the unified entry point where the agent loop dispatches tools; a
 //! single call completes four steps: "lookup → argument parsing →
 //! execution → error classification"; classification is carried by
 //! [`RegistryError`], and the "error-to-text passed back to the model"
@@ -15,7 +15,9 @@ use std::fmt;
 use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
 
-use super::{SharedState, Tool, ToolError, ToolSchema};
+use super::{SharedState, Tool, ToolContext, ToolError, ToolResult, ToolSchema};
+use crate::message::ToolCall;
+use crate::run::RunContext;
 
 /// Extract the message text from a panic payload (to pass back to the
 /// model); unknown types fall back to "unknown panic".
@@ -32,41 +34,43 @@ fn panic_message(payload: &(dyn Any + Send)) -> String {
     "unknown panic".into()
 }
 
-/// Tool registry: holds tools, responsible for lookup and execution by
-/// name.
+/// Tool registry: holds tools, responsible for lookup and dispatch by name.
 ///
 /// ```
 /// # #[tokio::main]
 /// # async fn main() -> Result<(), molo::RegistryError> {
-/// use molo::tool::{SharedState, Tool, ToolError, ToolRegistry, ToolSchema};
+/// use molo::tool::{SharedState, Tool, ToolContext, ToolError, ToolOutput, ToolRegistry, ToolResult, ToolSchema};
+/// use molo::{RunContext, ToolCall};
 /// use serde_json::json;
 ///
 /// struct Calculator;
 /// #[molo::async_trait]
 /// impl Tool for Calculator {
 ///     fn schema(&self) -> ToolSchema {
-///         ToolSchema {
-///             name: "calculator".into(),
-///             description: "Calculate".into(),
-///             parameters: json!({ "type": "object", "properties": {} }),
-///         }
+///         ToolSchema::new("calculator", "Calculate", json!({ "type": "object", "properties": {} }))
 ///     }
 ///     async fn call(
 ///         &self,
 ///         _arguments: serde_json::Value,
-///         _state: &SharedState,
-///     ) -> Result<String, ToolError> {
-///         Ok("42".into())
+///         _context: ToolContext<'_>,
+///     ) -> Result<ToolResult, ToolError> {
+///         Ok(ToolOutput::text("42").into())
 ///     }
 /// }
 ///
 /// let mut registry = ToolRegistry::new();
 /// registry.register(Calculator);
 /// let state = SharedState::new();
+/// let run = RunContext::new("run-1");
+/// let call = ToolCall {
+///     id: "call-1".into(),
+///     name: "calculator".into(),
+///     arguments: "{}".into(),
+/// };
 /// // The model requests a tool by name; error classification (not
 /// // registered / args not JSON / execution failed) rides along with Err.
-/// let result = registry.call("calculator", "{}", &state).await?;
-/// assert_eq!(result, "42");
+/// let result = registry.call(&call, &run, &state).await?;
+/// assert_eq!(result.output_content(), Some("42"));
 /// // Allowlist subset: the sub-registry shares the same tool instances as
 /// // the main registry.
 /// let sub = registry.subset(&["calculator"]).unwrap();
@@ -87,7 +91,7 @@ fn panic_message(payload: &(dyn Any + Send)) -> String {
 ///   [`subset`](ToolRegistry::subset) shares the same tool instances as
 ///   the main registry (the scenario where a main agent creates
 ///   sub-agents with a restricted tool set);
-/// - **`call` returns `Result<String, RegistryError>`** — classification
+/// - **`call` returns `Result<ToolResult, RegistryError>`** — classification
 ///   rides along with `Err` (tool not found / args not JSON / execution
 ///   failed), and `Err`'s Display is the "error-to-text" the agent loop
 ///   can pass straight back to the model (see [`RegistryError`]); callers
@@ -146,24 +150,20 @@ impl ToolRegistry {
     /// it:
     ///
     /// ```
-    /// use molo::tool::{SharedState, Tool, ToolError, ToolRegistry, ToolSchema};
+    /// use molo::tool::{Tool, ToolContext, ToolError, ToolRegistry, ToolResult, ToolSchema};
     /// use serde_json::json;
     ///
     /// struct Named(&'static str);
     /// #[molo::async_trait]
     /// impl Tool for Named {
     ///     fn schema(&self) -> ToolSchema {
-    ///         ToolSchema {
-    ///             name: self.0.into(),
-    ///             description: self.0.into(),
-    ///             parameters: json!({}),
-    ///         }
+    ///         ToolSchema::new(self.0, self.0, json!({}))
     ///     }
     ///     async fn call(
     ///         &self,
     ///         _arguments: serde_json::Value,
-    ///         _state: &SharedState,
-    ///     ) -> Result<String, ToolError> {
+    ///         _context: ToolContext<'_>,
+    ///     ) -> Result<ToolResult, ToolError> {
     ///         Ok("ok".into())
     ///     }
     /// }
@@ -198,14 +198,14 @@ impl ToolRegistry {
         self.tools.values().map(|t| t.schema()).collect()
     }
 
-    /// Get a tool reference by name, bypassing the registry's argument
+    /// Get a tool reference by name, bypassing the registry's JSON argument
     /// parsing to call [`Tool::call`] directly; returns `None` when not
     /// registered.
     pub fn get(&self, name: &str) -> Option<&dyn Tool> {
         self.tools.get(name).map(|t| t.as_ref())
     }
 
-    /// Look up and execute a tool by name.
+    /// Look up and dispatch a tool call.
     ///
     /// A single call completes three steps — "lookup → argument parsing →
     /// execution"; failure classifications are described by
@@ -217,8 +217,8 @@ impl ToolRegistry {
     /// - tool execution failed → [`RegistryError::Execution`](RegistryError::Execution)
     ///   (the underlying [`ToolError`] is reachable via `source()`).
     ///
-    /// `state` is injected into the tool at call time (see
-    /// [`SharedState`]); the agent loop passes its own state straight
+    /// `run` and `state` are injected into the tool through
+    /// [`ToolContext`]; the agent loop passes its own state straight
     /// through, so tools read and write the caller-provided instance.
     ///
     /// Tool panics do not escape this method: the panic is caught and
@@ -228,27 +228,28 @@ impl ToolRegistry {
     ///
     /// # Errors
     ///
-    /// The three failure classes are described above; `Err`'s **Display is
-    /// the "error-to-text"** — the agent loop passes `e.to_string()` back
-    /// to the model as a ToolResult, and the text is directly readable by
+    /// The three failure classes are described above. `Err`'s **Display is
+    /// the "error-to-text"**: the agent loop can pass `e.to_string()` back
+    /// to the model as a tool result, and the text is directly readable by
     /// the model.
     pub async fn call(
         &self,
-        name: &str,
-        arguments: &str,
+        call: &ToolCall,
+        run: &RunContext,
         state: &SharedState,
-    ) -> Result<String, RegistryError> {
-        let Some(tool) = self.tools.get(name) else {
-            return Err(RegistryError::NotFound(name.to_string()));
+    ) -> Result<ToolResult, RegistryError> {
+        let Some(tool) = self.tools.get(&call.name) else {
+            return Err(RegistryError::NotFound(call.name.clone()));
         };
-        let args = match serde_json::from_str(arguments) {
+        let args = match serde_json::from_str(&call.arguments) {
             Ok(value) => value,
             Err(e) => return Err(RegistryError::InvalidArguments(e.to_string())),
         };
+        let context = ToolContext::new(run, state, &call.id, &call.name);
         // The tool is user code, and panics are inputs an LLM-generated
         // argument could trigger: catch them as execution errors passed
         // back to the model instead of letting panics escape the framework.
-        let result = AssertUnwindSafe(tool.call(args, state))
+        let result = AssertUnwindSafe(tool.call(args, context))
             .catch_unwind()
             .await
             .map_err(|payload| {
@@ -257,7 +258,7 @@ impl ToolRegistry {
                 // the &dyn Any itself.
                 let message = panic_message(payload.as_ref());
                 RegistryError::Execution {
-                    name: name.to_string(),
+                    name: call.name.clone(),
                     source: ToolError::Execution(format!("panicked: {message}")),
                 }
             })?;
@@ -268,13 +269,41 @@ impl ToolRegistry {
         // / wrong types) count as argument errors: passed through as
         // InvalidArguments, so the model sees "invalid arguments: …"
         // rather than an execution failure with a "tool error:" prefix.
-        result.map_err(|e| match e {
-            ToolError::InvalidArguments(msg) => RegistryError::InvalidArguments(msg),
-            other => RegistryError::Execution {
-                name: name.to_string(),
-                source: other,
-            },
-        })
+        result
+            .map_err(|e| match e {
+                ToolError::InvalidArguments(msg) => RegistryError::InvalidArguments(msg),
+                other => RegistryError::Execution {
+                    name: call.name.clone(),
+                    source: other,
+                },
+            })
+            .map(|result| match result {
+                ToolResult::Effect(request) => ToolResult::Effect(
+                    request.with_source_if_missing(call.id.clone(), call.name.clone()),
+                ),
+                other => other,
+            })
+    }
+
+    /// Constructs a [`ToolCall`] from raw fields and dispatches it.
+    ///
+    /// This is a convenience wrapper for direct registry use in tests and
+    /// examples. Agent loops should prefer [`call`](Self::call), because they
+    /// already have the model's original tool-call id.
+    pub async fn call_named(
+        &self,
+        name: impl Into<String>,
+        arguments: impl Into<String>,
+        run: &RunContext,
+        state: &SharedState,
+    ) -> Result<ToolResult, RegistryError> {
+        let name = name.into();
+        let call = ToolCall {
+            id: format!("call-{name}"),
+            name,
+            arguments: arguments.into(),
+        };
+        self.call(&call, run, state).await
     }
 
     /// Trim a sub-registry by name (an allowlist) sharing the same tool
@@ -389,7 +418,7 @@ impl MissingTools {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tool::ToolError;
+    use crate::tool::{ToolError, ToolOutput};
     use std::error::Error;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -404,22 +433,18 @@ mod tests {
     #[async_trait::async_trait]
     impl Tool for FakeTool {
         fn schema(&self) -> ToolSchema {
-            ToolSchema {
-                name: self.name.into(),
-                description: self.output.into(),
-                parameters: serde_json::json!({}),
-            }
+            ToolSchema::new(self.name, self.output, serde_json::json!({}))
         }
 
         async fn call(
             &self,
             _arguments: serde_json::Value,
-            _state: &SharedState,
-        ) -> Result<String, ToolError> {
+            _context: ToolContext<'_>,
+        ) -> Result<ToolResult, ToolError> {
             if self.fail {
                 Err(ToolError::Execution("boom".into()))
             } else {
-                Ok(self.output.into())
+                Ok(ToolOutput::text(self.output).into())
             }
         }
     }
@@ -434,20 +459,16 @@ mod tests {
     #[async_trait::async_trait]
     impl Tool for CountingTool {
         fn schema(&self) -> ToolSchema {
-            ToolSchema {
-                name: self.name.into(),
-                description: "counts calls".into(),
-                parameters: serde_json::json!({}),
-            }
+            ToolSchema::new(self.name, "counts calls", serde_json::json!({}))
         }
 
         async fn call(
             &self,
             _arguments: serde_json::Value,
-            _state: &SharedState,
-        ) -> Result<String, ToolError> {
+            _context: ToolContext<'_>,
+        ) -> Result<ToolResult, ToolError> {
             self.calls.fetch_add(1, Ordering::Relaxed);
-            Ok("ok".into())
+            Ok(ToolOutput::text("ok").into())
         }
     }
 
@@ -467,6 +488,25 @@ mod tests {
             .register(echo("calculator"))
             .register(echo("search"));
         r
+    }
+
+    fn call(name: &str, arguments: &str) -> ToolCall {
+        ToolCall {
+            id: format!("call-{name}"),
+            name: name.into(),
+            arguments: arguments.into(),
+        }
+    }
+
+    async fn call_registry(
+        registry: &ToolRegistry,
+        name: &str,
+        arguments: &str,
+        state: &SharedState,
+    ) -> Result<ToolResult, RegistryError> {
+        registry
+            .call(&call(name, arguments), &RunContext::new("test-run"), state)
+            .await
     }
 
     #[test]
@@ -498,7 +538,9 @@ mod tests {
         assert_eq!(r.names(), vec!["a"]);
         assert_eq!(r.schemas()[0].description, "second");
         assert_eq!(
-            r.call("a", "{}", &SharedState::new()).await.unwrap(),
+            call_registry(&r, "a", "{}", &SharedState::new())
+                .await
+                .unwrap(),
             "second"
         );
     }
@@ -514,7 +556,15 @@ mod tests {
         // Bypass call: invoke Tool::call directly, keeping the error
         // semantics (Execution) in the Result.
         let tool = r.get("a").expect("registered");
-        let result = tool.call(serde_json::json!({}), &SharedState::new()).await;
+        let state = SharedState::new();
+        let run = RunContext::new("test-run");
+        let context = ToolContext {
+            run: &run,
+            state: &state,
+            tool_call_id: "call-a",
+            tool_name: "a",
+        };
+        let result = tool.call(serde_json::json!({}), context).await;
         assert!(matches!(result, Err(ToolError::Execution(_))));
         assert!(r.get("nope").is_none());
     }
@@ -523,7 +573,11 @@ mod tests {
     async fn call_succeeds() {
         assert_eq!(
             registry()
-                .call("calculator", "{}", &SharedState::new())
+                .call(
+                    &call("calculator", "{}"),
+                    &RunContext::new("test-run"),
+                    &SharedState::new()
+                )
                 .await
                 .unwrap(),
             "calculator"
@@ -535,7 +589,11 @@ mod tests {
         // Classification rides along with Err; Display is the
         // "error-to-text".
         let err = registry()
-            .call("nope", "{}", &SharedState::new())
+            .call(
+                &call("nope", "{}"),
+                &RunContext::new("test-run"),
+                &SharedState::new(),
+            )
             .await
             .unwrap_err();
         assert!(matches!(&err, RegistryError::NotFound(name) if name == "nope"));
@@ -545,7 +603,11 @@ mod tests {
     #[tokio::test]
     async fn call_invalid_json_returns_invalid_arguments() {
         let err = registry()
-            .call("calculator", "not-json", &SharedState::new())
+            .call(
+                &call("calculator", "not-json"),
+                &RunContext::new("test-run"),
+                &SharedState::new(),
+            )
             .await
             .unwrap_err();
         assert!(matches!(err, RegistryError::InvalidArguments(_)));
@@ -562,32 +624,36 @@ mod tests {
         #[async_trait::async_trait]
         impl Tool for StrictTool {
             fn schema(&self) -> ToolSchema {
-                ToolSchema {
-                    name: "strict".into(),
-                    description: "requires a".into(),
-                    parameters: serde_json::json!({
+                ToolSchema::new(
+                    "strict",
+                    "requires a",
+                    serde_json::json!({
                         "type": "object",
                         "properties": { "a": { "type": "integer" } },
                         "required": ["a"],
                     }),
-                }
+                )
             }
             async fn call(
                 &self,
                 arguments: serde_json::Value,
-                _state: &SharedState,
-            ) -> Result<String, ToolError> {
+                _context: ToolContext<'_>,
+            ) -> Result<ToolResult, ToolError> {
                 let a = arguments
                     .get("a")
                     .ok_or_else(|| ToolError::InvalidArguments("missing field `a`".into()))?;
-                Ok(a.to_string())
+                Ok(ToolOutput::text(a.to_string()).into())
             }
         }
 
         let mut r = ToolRegistry::new();
         r.register(StrictTool);
         let err = r
-            .call("strict", r#"{"b":1}"#, &SharedState::new())
+            .call(
+                &call("strict", r#"{"b":1}"#),
+                &RunContext::new("test-run"),
+                &SharedState::new(),
+            )
             .await
             .unwrap_err();
         assert!(matches!(&err, RegistryError::InvalidArguments(msg) if msg == "missing field `a`"));
@@ -606,7 +672,11 @@ mod tests {
         // single "tool error" prefix ("tool error: broken failed: ...");
         // source reaches the underlying ToolError.
         let err = r
-            .call("broken", "{}", &SharedState::new())
+            .call(
+                &call("broken", "{}"),
+                &RunContext::new("test-run"),
+                &SharedState::new(),
+            )
             .await
             .unwrap_err();
         assert_eq!(
@@ -624,17 +694,13 @@ mod tests {
         #[async_trait::async_trait]
         impl Tool for PanickingTool {
             fn schema(&self) -> ToolSchema {
-                ToolSchema {
-                    name: "panic".into(),
-                    description: "panics".into(),
-                    parameters: serde_json::json!({}),
-                }
+                ToolSchema::new("panic", "panics", serde_json::json!({}))
             }
             async fn call(
                 &self,
                 _arguments: serde_json::Value,
-                _state: &SharedState,
-            ) -> Result<String, ToolError> {
+                _context: ToolContext<'_>,
+            ) -> Result<ToolResult, ToolError> {
                 panic!("boom")
             }
         }
@@ -642,7 +708,11 @@ mod tests {
         let mut r = ToolRegistry::new();
         r.register(PanickingTool);
         let err = r
-            .call("panic", "{}", &SharedState::new())
+            .call(
+                &call("panic", "{}"),
+                &RunContext::new("test-run"),
+                &SharedState::new(),
+            )
             .await
             .unwrap_err();
         // Message carries the tool name + panic content, so the model /
@@ -697,7 +767,9 @@ mod tests {
         let sub = r.subset(&["a"]).unwrap();
         assert_eq!(sub.names(), vec!["a"]);
         assert_eq!(
-            sub.call("a", "{}", &SharedState::new()).await.unwrap(),
+            call_registry(&sub, "a", "{}", &SharedState::new())
+                .await
+                .unwrap(),
             "second"
         );
     }
@@ -721,8 +793,10 @@ mod tests {
         let sub = r.subset(&["counter"]).unwrap();
         // Parent and child each execute once; sharing one instance yields
         // count 2, not two independent instances.
-        r.call("counter", "{}", &SharedState::new()).await.unwrap();
-        sub.call("counter", "{}", &SharedState::new())
+        call_registry(&r, "counter", "{}", &SharedState::new())
+            .await
+            .unwrap();
+        call_registry(&sub, "counter", "{}", &SharedState::new())
             .await
             .unwrap();
         assert_eq!(calls.load(Ordering::Relaxed), 2);
@@ -739,8 +813,12 @@ mod tests {
             calls: calls.clone(),
         });
         let r2 = r.clone();
-        r.call("counter", "{}", &SharedState::new()).await.unwrap();
-        r2.call("counter", "{}", &SharedState::new()).await.unwrap();
+        call_registry(&r, "counter", "{}", &SharedState::new())
+            .await
+            .unwrap();
+        call_registry(&r2, "counter", "{}", &SharedState::new())
+            .await
+            .unwrap();
         assert_eq!(calls.load(Ordering::Relaxed), 2);
     }
 
@@ -752,19 +830,20 @@ mod tests {
         #[async_trait::async_trait]
         impl Tool for StateTool {
             fn schema(&self) -> ToolSchema {
-                ToolSchema {
-                    name: "state_tool".into(),
-                    description: "read and write shared state".into(),
-                    parameters: serde_json::json!({}),
-                }
+                ToolSchema::new(
+                    "state_tool",
+                    "read and write shared state",
+                    serde_json::json!({}),
+                )
             }
             async fn call(
                 &self,
                 _arguments: serde_json::Value,
-                state: &SharedState,
-            ) -> Result<String, ToolError> {
+                context: ToolContext<'_>,
+            ) -> Result<ToolResult, ToolError> {
+                let state = context.state;
                 state.with_mut::<usize>(|n| *n += 1);
-                Ok(format!("count={}", state.get::<usize>().unwrap_or(0)))
+                Ok(ToolOutput::text(format!("count={}", state.get::<usize>().unwrap_or(0))).into())
             }
         }
 
@@ -776,7 +855,13 @@ mod tests {
         // Consecutive calls on the same instance: count accumulates
         // (proving the tool reads and writes the caller-provided
         // instance).
-        assert_eq!(r.call("state_tool", "{}", &state).await.unwrap(), "count=1");
-        assert_eq!(r.call("state_tool", "{}", &state).await.unwrap(), "count=2");
+        assert_eq!(
+            call_registry(&r, "state_tool", "{}", &state).await.unwrap(),
+            "count=1"
+        );
+        assert_eq!(
+            call_registry(&r, "state_tool", "{}", &state).await.unwrap(),
+            "count=2"
+        );
     }
 }

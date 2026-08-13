@@ -25,7 +25,7 @@
 
 use futures::stream::StreamExt;
 use molo::provider::OpenAiProvider;
-use molo::tool::{SharedState, Tool, ToolError, ToolSchema};
+use molo::tool::{SharedState, Tool, ToolContext, ToolError, ToolOutput, ToolResult, ToolSchema};
 use molo::{
     ChatRequest, Message, MessageChannel, MpscChannel, Provider, StreamEvent, ToolCall,
     ToolRegistry,
@@ -51,25 +51,25 @@ struct AskExpertTool {
 #[async_trait::async_trait]
 impl Tool for AskExpertTool {
     fn schema(&self) -> ToolSchema {
-        ToolSchema {
-            name: "ask_expert".into(),
-            description:
-                "Hands the question to the expert agent for an answer; returns the expert's reply."
-                    .into(),
-            parameters: serde_json::to_value(schemars::schema_for!(AskArgs))
+        ToolSchema::new(
+            "ask_expert",
+            "Hands the question to the expert agent for an answer; returns the expert's reply.",
+            serde_json::to_value(schemars::schema_for!(AskArgs))
                 .expect("tool schema must serialize"),
-        }
+        )
     }
 
     async fn call(
         &self,
         arguments: serde_json::Value,
-        _state: &SharedState,
-    ) -> Result<String, ToolError> {
+        _context: ToolContext<'_>,
+    ) -> Result<ToolResult, ToolError> {
         let args: AskArgs = serde_json::from_value(arguments)?;
         self.channel
             .ask(&args.question)
             .await
+            .map(ToolOutput::text)
+            .map(Into::into)
             .map_err(|e| ToolError::Execution(e.to_string()))
     }
 }
@@ -116,6 +116,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         channel: Arc::new(expert_ask),
     });
     let tool_schemas = registry.schemas();
+    let run_context = molo::RunContext::new("mpsc-agent-example");
+    let state = SharedState::new();
 
     let mut messages = vec![Message::system(
         "You are a helpful assistant. Use the calculator tool when you need to \
@@ -174,8 +176,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 println!("  → calling {}, arguments: {}", call.name, call.arguments);
                 // Err's Display is "error as text"; still record it and feed it back as usual.
                 let content = registry
-                    .call(&call.name, &call.arguments, &SharedState::new())
+                    .call(&call, &run_context, &state)
                     .await
+                    .map(|result| result.to_string())
                     .unwrap_or_else(|e| e.to_string());
                 println!("  → {} returned: {content}", call.name);
                 messages.push(Message::ToolResult {
@@ -235,23 +238,23 @@ struct Calculator;
 #[async_trait::async_trait]
 impl Tool for Calculator {
     fn schema(&self) -> ToolSchema {
-        ToolSchema {
-            name: "calculator".into(),
-            description: "Evaluates a math expression; supports basic arithmetic and parentheses, e.g. \"(1 + 2) * 3\".".into(),
-            parameters: serde_json::to_value(schemars::schema_for!(CalcArgs))
+        ToolSchema::new(
+            "calculator",
+            "Evaluates a math expression; supports basic arithmetic and parentheses, e.g. \"(1 + 2) * 3\".",
+            serde_json::to_value(schemars::schema_for!(CalcArgs))
                 .expect("tool schema must serialize"),
-        }
+        )
     }
 
     async fn call(
         &self,
         arguments: serde_json::Value,
-        _state: &SharedState,
-    ) -> Result<String, ToolError> {
+        _context: ToolContext<'_>,
+    ) -> Result<ToolResult, ToolError> {
         let args: CalcArgs = serde_json::from_value(arguments)?;
         let value =
             evalexpr::eval(&args.expression).map_err(|e| ToolError::Execution(e.to_string()))?;
-        Ok(value.to_string())
+        Ok(ToolOutput::text(value.to_string()).into())
     }
 }
 

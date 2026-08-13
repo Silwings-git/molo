@@ -20,7 +20,7 @@
 
 use futures::stream::StreamExt;
 use molo::provider::OpenAiProvider;
-use molo::tool::{SharedState, Tool, ToolError, ToolSchema};
+use molo::tool::{SharedState, Tool, ToolContext, ToolError, ToolOutput, ToolResult, ToolSchema};
 use molo::{
     ChatRequest, Message, MessageChannel, Provider, StreamEvent, ToolCall, ToolRegistry,
     WatchChannel, WatchReceiver,
@@ -45,24 +45,26 @@ struct PublishStatusTool {
 #[async_trait::async_trait]
 impl Tool for PublishStatusTool {
     fn schema(&self) -> ToolSchema {
-        ToolSchema {
-            name: "publish_status".into(),
-            description: "Publishes a run status that all observers will take as the latest value; returns success when published.".into(),
-            parameters: serde_json::to_value(schemars::schema_for!(PublishArgs))
+        ToolSchema::new(
+            "publish_status",
+            "Publishes a run status that all observers will take as the latest value; returns success when published.",
+            serde_json::to_value(schemars::schema_for!(PublishArgs))
                 .expect("tool schema must serialize"),
-        }
+        )
     }
 
     async fn call(
         &self,
         arguments: serde_json::Value,
-        _state: &SharedState,
-    ) -> Result<String, ToolError> {
+        _context: ToolContext<'_>,
+    ) -> Result<ToolResult, ToolError> {
         let args: PublishArgs = serde_json::from_value(arguments)?;
         self.channel
             .notify(&args.status)
             .await
-            .map(|_| "Status published; observers can take the latest value.".to_string())
+            .map(|_| {
+                ToolOutput::text("Status published; observers can take the latest value.").into()
+            })
             .map_err(|e| ToolError::Execution(e.to_string()))
     }
 }
@@ -116,6 +118,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .register(Calculator)
         .register(PublishStatusTool { channel: watch });
     let tool_schemas = registry.schemas();
+    let run_context = molo::RunContext::new("watch-agent-example");
+    let state = SharedState::new();
 
     let mut messages = vec![Message::system(
         "You are a deployment assistant. Use the calculator tool when you need \
@@ -174,8 +178,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 println!("  → calling {}, arguments: {}", call.name, call.arguments);
                 // Err's Display is "error as text"; still record it and feed it back as usual.
                 let content = registry
-                    .call(&call.name, &call.arguments, &SharedState::new())
+                    .call(&call, &run_context, &state)
                     .await
+                    .map(|result| result.to_string())
                     .unwrap_or_else(|e| e.to_string());
                 println!("  → {} returned: {content}", call.name);
                 messages.push(Message::ToolResult {
@@ -203,23 +208,23 @@ struct Calculator;
 #[async_trait::async_trait]
 impl Tool for Calculator {
     fn schema(&self) -> ToolSchema {
-        ToolSchema {
-            name: "calculator".into(),
-            description: "Evaluates a math expression; supports basic arithmetic and parentheses, e.g. \"(1 + 2) * 3\".".into(),
-            parameters: serde_json::to_value(schemars::schema_for!(CalcArgs))
+        ToolSchema::new(
+            "calculator",
+            "Evaluates a math expression; supports basic arithmetic and parentheses, e.g. \"(1 + 2) * 3\".",
+            serde_json::to_value(schemars::schema_for!(CalcArgs))
                 .expect("tool schema must serialize"),
-        }
+        )
     }
 
     async fn call(
         &self,
         arguments: serde_json::Value,
-        _state: &SharedState,
-    ) -> Result<String, ToolError> {
+        _context: ToolContext<'_>,
+    ) -> Result<ToolResult, ToolError> {
         let args: CalcArgs = serde_json::from_value(arguments)?;
         let value =
             evalexpr::eval(&args.expression).map_err(|e| ToolError::Execution(e.to_string()))?;
-        Ok(value.to_string())
+        Ok(ToolOutput::text(value.to_string()).into())
     }
 }
 

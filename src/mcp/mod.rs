@@ -41,7 +41,10 @@ use rmcp::transport::child_process::TokioChildProcess;
 use rmcp::transport::streamable_http_client::StreamableHttpClientWorker;
 use rmcp::{ClientLifecycleMode, ClientServiceExt};
 
-use crate::tool::{SharedState, Tool, ToolError, ToolSchema};
+use crate::effect::RiskLevel;
+use crate::tool::{
+    SideEffectLevel, Tool, ToolContext, ToolError, ToolOutput, ToolPolicy, ToolResult, ToolSchema,
+};
 
 /// Connection shape: captured at construction, used at `connect()` time.
 #[derive(Debug)]
@@ -509,11 +512,17 @@ impl std::fmt::Debug for McpTool {
 #[async_trait::async_trait]
 impl Tool for McpTool {
     fn schema(&self) -> ToolSchema {
-        ToolSchema {
-            name: self.name.clone(),
-            description: self.description.clone(),
-            parameters: self.parameters.clone(),
-        }
+        ToolSchema::new(
+            self.name.clone(),
+            self.description.clone(),
+            self.parameters.clone(),
+        )
+        .with_policy(ToolPolicy {
+            side_effects: SideEffectLevel::External,
+            risk: RiskLevel::Medium,
+            timeout: Some(self.call_timeout),
+            ..Default::default()
+        })
     }
 
     /// Proxies a call: forwards arguments via `tools/call` and joins the
@@ -527,8 +536,8 @@ impl Tool for McpTool {
     async fn call(
         &self,
         arguments: serde_json::Value,
-        _state: &SharedState,
-    ) -> Result<String, ToolError> {
+        _context: ToolContext<'_>,
+    ) -> Result<ToolResult, ToolError> {
         let Some(args) = arguments.as_object() else {
             return Err(ToolError::InvalidArguments(
                 "mcp tool arguments must be a JSON object".into(),
@@ -559,7 +568,7 @@ impl Tool for McpTool {
             };
             Err(ToolError::Execution(message))
         } else {
-            Ok(text)
+            Ok(ToolOutput::text(text).into())
         }
     }
 }
@@ -678,7 +687,7 @@ fn content_to_text(blocks: &[ContentBlock]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tool::ToolRegistry;
+    use crate::tool::{SharedState, ToolContext, ToolRegistry};
     use rmcp::model::{
         CallToolResponse, CallToolResult, ListToolsResult, PaginatedRequestParams,
         ServerCapabilities, ServerInfo, Tool as RmcpTool,
@@ -688,6 +697,21 @@ mod tests {
     use rmcp::{ErrorData, ServerHandler, serve_server};
     use serde_json::json;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    async fn call_mcp_tool(
+        tool: &McpTool,
+        arguments: serde_json::Value,
+    ) -> Result<String, ToolError> {
+        let run = crate::RunContext::new("mcp-tool-test");
+        let state = SharedState::new();
+        let result = tool
+            .call(
+                arguments,
+                ToolContext::new(&run, &state, "call-mcp", &tool.schema().name),
+            )
+            .await?;
+        Ok(result.to_string())
+    }
 
     /// Streamable HTTP success path: starts a minimal stateless MCP-over-HTTP
     /// server locally (hand-written JSON-RPC responses, no new dependencies),
@@ -777,11 +801,11 @@ mod tests {
         assert_eq!(tools.len(), 1);
         assert_eq!(tools[0].schema().name, "http-server__echo");
 
-        let state = crate::tool::SharedState::new();
-        let text = tokio::time::timeout(Duration::from_secs(10), tools[0].call(json!({}), &state))
-            .await
-            .expect("call timed out")
-            .unwrap();
+        let text =
+            tokio::time::timeout(Duration::from_secs(10), call_mcp_tool(&tools[0], json!({})))
+                .await
+                .expect("call timed out")
+                .unwrap();
         assert_eq!(text, "pong");
         server.abort();
     }
@@ -885,8 +909,7 @@ mod tests {
         });
         let mut client = McpClient::from_url("s", format!("http://{addr}"));
         let tools = client.tools().await.unwrap();
-        let state = crate::tool::SharedState::new();
-        let text = tools[0].call(json!({}), &state).await.unwrap();
+        let text = call_mcp_tool(&tools[0], json!({})).await.unwrap();
         assert!(text.starts_with("hello"));
         assert!(text.contains("[structured]"));
         assert!(text.contains("\"answer\""));
@@ -921,8 +944,7 @@ mod tests {
         let mut client = McpClient::from_url("s", format!("http://{addr}"));
         client.with_call_timeout(Duration::from_millis(100));
         let tools = client.tools().await.unwrap();
-        let state = crate::tool::SharedState::new();
-        let err = tools[0].call(json!({}), &state).await.unwrap_err();
+        let err = call_mcp_tool(&tools[0], json!({})).await.unwrap_err();
         assert!(matches!(&err, ToolError::Execution(msg) if msg == "mcp tool call timed out"));
         server.abort();
     }
@@ -1098,12 +1120,13 @@ mod tests {
         assert_eq!(tools[0].schema().name, "fake__echo");
         assert_eq!(tools[1].schema().name, "fake__fail");
 
-        let state = SharedState::new();
         let echo = tools
             .iter()
             .find(|t| t.schema().name == "fake__echo")
             .unwrap();
-        let result = echo.call(json!({ "text": "hello" }), &state).await.unwrap();
+        let result = call_mcp_tool(echo, json!({ "text": "hello" }))
+            .await
+            .unwrap();
         assert_eq!(result, "hello");
 
         // Tool-level error → ToolError::Execution with the server text in the
@@ -1112,11 +1135,11 @@ mod tests {
             .iter()
             .find(|t| t.schema().name == "fake__fail")
             .unwrap();
-        let err = fail.call(json!({}), &state).await.unwrap_err();
+        let err = call_mcp_tool(fail, json!({})).await.unwrap_err();
         assert!(matches!(&err, ToolError::Execution(msg) if msg == "boom"));
 
         // Arguments that are not a JSON object → InvalidArguments.
-        let err = echo.call(json!([1, 2]), &state).await.unwrap_err();
+        let err = call_mcp_tool(echo, json!([1, 2])).await.unwrap_err();
         assert!(matches!(err, ToolError::InvalidArguments(_)));
     }
 
@@ -1131,7 +1154,12 @@ mod tests {
         }
         assert_eq!(registry.names(), vec!["echo", "fail"]);
         let result = registry
-            .call("echo", r#"{"text":"hi"}"#, &SharedState::new())
+            .call_named(
+                "echo",
+                r#"{"text":"hi"}"#,
+                &crate::RunContext::new("mcp-registry-test"),
+                &SharedState::new(),
+            )
             .await
             .unwrap();
         assert_eq!(result, "hi");

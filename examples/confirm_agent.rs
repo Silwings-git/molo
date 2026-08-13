@@ -35,7 +35,7 @@
 
 use futures::stream::StreamExt;
 use molo::provider::OpenAiProvider;
-use molo::tool::{SharedState, Tool, ToolError, ToolSchema};
+use molo::tool::{SharedState, Tool, ToolContext, ToolError, ToolOutput, ToolResult, ToolSchema};
 use molo::{
     ChatRequest, CliMessageChannel, Message, MessageChannel, Provider, StreamEvent, ToolCall,
     ToolRegistry,
@@ -59,23 +59,23 @@ struct Calculator;
 #[async_trait::async_trait]
 impl Tool for Calculator {
     fn schema(&self) -> ToolSchema {
-        ToolSchema {
-            name: "calculator".into(),
-            description: "Evaluates a math expression; supports basic arithmetic and parentheses, e.g. \"(1 + 2) * 3\".".into(),
-            parameters: serde_json::to_value(schemars::schema_for!(CalcArgs))
+        ToolSchema::new(
+            "calculator",
+            "Evaluates a math expression; supports basic arithmetic and parentheses, e.g. \"(1 + 2) * 3\".",
+            serde_json::to_value(schemars::schema_for!(CalcArgs))
                 .expect("tool schema must serialize"),
-        }
+        )
     }
 
     async fn call(
         &self,
         arguments: serde_json::Value,
-        _state: &SharedState,
-    ) -> Result<String, ToolError> {
+        _context: ToolContext<'_>,
+    ) -> Result<ToolResult, ToolError> {
         let args: CalcArgs = serde_json::from_value(arguments)?;
         let value =
             evalexpr::eval(&args.expression).map_err(|e| ToolError::Execution(e.to_string()))?;
-        Ok(value.to_string())
+        Ok(ToolOutput::text(value.to_string()).into())
     }
 }
 
@@ -99,19 +99,19 @@ struct ConfirmTool {
 #[async_trait::async_trait]
 impl Tool for ConfirmTool {
     fn schema(&self) -> ToolSchema {
-        ToolSchema {
-            name: "confirm".into(),
-            description: "Confirms with the user before executing a dangerous operation; only continue if the user replies yes, otherwise cancel.".into(),
-            parameters: serde_json::to_value(schemars::schema_for!(ConfirmArgs))
+        ToolSchema::new(
+            "confirm",
+            "Confirms with the user before executing a dangerous operation; only continue if the user replies yes, otherwise cancel.",
+            serde_json::to_value(schemars::schema_for!(ConfirmArgs))
                 .expect("tool schema must serialize"),
-        }
+        )
     }
 
     async fn call(
         &self,
         arguments: serde_json::Value,
-        _state: &SharedState,
-    ) -> Result<String, ToolError> {
+        _context: ToolContext<'_>,
+    ) -> Result<ToolResult, ToolError> {
         let args: ConfirmArgs = serde_json::from_value(arguments)?;
         let answer = self
             .channel
@@ -122,9 +122,9 @@ impl Tool for ConfirmTool {
             .await
             .map_err(|e| ToolError::Execution(e.to_string()))?;
         if answer == "yes" {
-            Ok("The user confirmed; you may proceed.".into())
+            Ok(ToolOutput::text("The user confirmed; you may proceed.").into())
         } else {
-            Ok("The user declined; do not execute.".into())
+            Ok(ToolOutput::text("The user declined; do not execute.").into())
         }
     }
 }
@@ -168,6 +168,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         channel: channel.clone(),
     });
     let tool_schemas = registry.schemas();
+    let run_context = molo::RunContext::new("confirm-agent-example");
+    let state = SharedState::new();
 
     let mut messages = vec![Message::system(
         "You are a helpful assistant. Use the calculator tool for calculations \
@@ -227,8 +229,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 println!("  → calling {}, arguments: {}", call.name, call.arguments);
                 // Err's Display is "error as text"; still record it and feed it back as usual.
                 let content = registry
-                    .call(&call.name, &call.arguments, &SharedState::new())
+                    .call(&call, &run_context, &state)
                     .await
+                    .map(|result| result.to_string())
                     .unwrap_or_else(|e| e.to_string());
                 println!("  → {} returned: {content}", call.name);
                 messages.push(Message::ToolResult {

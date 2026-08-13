@@ -8,9 +8,11 @@
 //! - Arguments: 0 or 1 of any type (a primitive or a
 //!   `#[derive(JsonSchema)]` struct) + an optional trailing `&SharedState`
 //!   (the macro recognizes it by name and injects it automatically);
-//! - Returns `Result<String, ToolError>`;
+//! - Returns `Result<String, ToolError>`, `Result<ToolOutput, ToolError>`, or
+//!   `Result<ToolResult, ToolError>`;
 //! - Attributes: `description` (required), `name` (optional, defaults to the
-//!   function name).
+//!   function name), plus optional policy hints such as `side_effects`,
+//!   `risk`, `requires_confirmation`, and `timeout_secs`.
 //!
 //! This example is **self-contained**, needs no API key, just run:
 //! `cargo run --example tool_macro`
@@ -34,7 +36,9 @@ struct CalcArgs {
 
 /// Struct argument: one macro line generates the tool (registered name = function name).
 #[molo::tool(
-    description = "Evaluates a math expression; supports basic arithmetic and parentheses"
+    description = "Evaluates a math expression; supports basic arithmetic and parentheses",
+    side_effects = "pure",
+    risk = "low"
 )]
 async fn calculator(args: CalcArgs) -> Result<String, ToolError> {
     let value =

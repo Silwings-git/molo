@@ -10,18 +10,23 @@
 //! - [`ToolRegistry`] — holds tools, looks up and executes by name; the
 //!   unified entry point between the agent loop and tools;
 //! - [`SharedState`] — a container for cross-tool shared state, injected
-//!   via the `state` parameter of [`Tool::call`].
+//!   via [`ToolContext`] on [`Tool::call`].
 
 pub use registry::{MissingTools, RegistryError, ToolRegistry};
 pub use shared_state::SharedState;
 
+use crate::effect::{DisplayOutput, EffectRequest, RiskLevel};
+use crate::run::{Artifact, RunContext, RunMetadata};
 use serde::{Deserialize, Serialize};
+use std::time::Duration;
 
-/// The definition of a tool as exposed to the model.
+/// The definition of a tool.
 ///
 /// The model decides whether to call the tool and how to generate arguments
 /// from `name` / `description` / `parameters`; Provider implementations map
-/// it to the vendor's wire format.
+/// those three fields to the vendor's wire format. [`ToolPolicy`] and
+/// [`ToolSchema::metadata`] are framework-facing metadata and are not sent to
+/// providers unless a provider adapter explicitly supports such annotations.
 ///
 /// # Example
 ///
@@ -29,17 +34,17 @@ use serde::{Deserialize, Serialize};
 /// use molo::tool::ToolSchema;
 /// use serde_json::json;
 ///
-/// let schema = ToolSchema {
-///     name: "get_weather".into(),
-///     description: "Get the weather for a given city".into(),
-///     parameters: json!({
+/// let schema = ToolSchema::new(
+///     "get_weather",
+///     "Get the weather for a given city",
+///     json!({
 ///         "type": "object",
 ///         "properties": {
 ///             "city": { "type": "string", "description": "City name" }
 ///         },
 ///         "required": ["city"]
 ///     }),
-/// };
+/// );
 ///
 /// assert_eq!(schema.name, "get_weather");
 /// ```
@@ -53,6 +58,296 @@ pub struct ToolSchema {
     /// JSON Schema for the arguments, preferably generated from a serde
     /// struct with `schemars::schema_for!`.
     pub parameters: serde_json::Value,
+    /// Framework-facing policy declaration.
+    pub policy: ToolPolicy,
+    /// Framework/application metadata.
+    pub metadata: RunMetadata,
+}
+
+impl ToolSchema {
+    /// Constructs a tool schema with default policy and no metadata.
+    pub fn new(
+        name: impl Into<String>,
+        description: impl Into<String>,
+        parameters: serde_json::Value,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            description: description.into(),
+            parameters,
+            policy: ToolPolicy::default(),
+            metadata: RunMetadata::new(),
+        }
+    }
+
+    /// Sets framework-facing policy metadata.
+    pub fn with_policy(mut self, policy: ToolPolicy) -> Self {
+        self.policy = policy;
+        self
+    }
+
+    /// Sets framework/application metadata.
+    pub fn with_metadata(mut self, metadata: RunMetadata) -> Self {
+        self.metadata = metadata;
+        self
+    }
+}
+
+/// Tool policy metadata declared by the tool author.
+///
+/// This is an input to registry events and future harness policy; it is not
+/// an authorization decision.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolPolicy {
+    /// Declared side-effect level.
+    pub side_effects: SideEffectLevel,
+    /// Default risk declaration.
+    pub risk: RiskLevel,
+    /// Whether the tool author recommends confirmation before execution.
+    pub requires_confirmation: bool,
+    /// Suggested timeout for tool/effect execution.
+    pub timeout: Option<Duration>,
+    /// Default memory policy for this tool's model-visible output.
+    pub memory_policy: ToolMemoryPolicy,
+}
+
+impl Default for ToolPolicy {
+    fn default() -> Self {
+        Self {
+            side_effects: SideEffectLevel::Pure,
+            risk: RiskLevel::Low,
+            requires_confirmation: false,
+            timeout: None,
+            memory_policy: ToolMemoryPolicy::Normal,
+        }
+    }
+}
+
+/// Declared side-effect level for a tool.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub enum SideEffectLevel {
+    /// Pure computation.
+    Pure,
+    /// Reads host/application state but does not write it.
+    ReadOnly,
+    /// Writes host/application state.
+    Write,
+    /// Interacts with an external system.
+    External,
+}
+
+/// Memory handling policy for model-visible tool/effect output.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub enum ToolMemoryPolicy {
+    /// Record normally.
+    #[default]
+    Normal,
+    /// Record as protected memory when supported by the memory implementation.
+    Protected,
+}
+
+impl ToolMemoryPolicy {
+    /// Whether the output should be recorded as protected memory.
+    pub fn is_protected(self) -> bool {
+        matches!(self, Self::Protected)
+    }
+}
+
+/// Model-visible output produced by a tool.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ToolOutput {
+    /// Text visible to the model through [`Message::ToolResult`](crate::Message::ToolResult).
+    pub content: String,
+    /// Optional host/UI display output.
+    pub display: Option<DisplayOutput>,
+    /// Artifact handles produced by the tool.
+    pub artifacts: Vec<Artifact>,
+    /// Memory policy for the model-visible content.
+    pub memory_policy: ToolMemoryPolicy,
+    /// Framework/application metadata.
+    pub metadata: RunMetadata,
+}
+
+impl ToolOutput {
+    /// Constructs plain text model-visible output.
+    pub fn text(content: impl Into<String>) -> Self {
+        Self {
+            content: content.into(),
+            display: None,
+            artifacts: Vec::new(),
+            memory_policy: ToolMemoryPolicy::Normal,
+            metadata: RunMetadata::new(),
+        }
+    }
+
+    /// Sets host/UI display output.
+    pub fn with_display(mut self, display: DisplayOutput) -> Self {
+        self.display = Some(display);
+        self
+    }
+
+    /// Sets artifact handles.
+    pub fn with_artifacts(mut self, artifacts: Vec<Artifact>) -> Self {
+        self.artifacts = artifacts;
+        self
+    }
+
+    /// Sets memory policy.
+    pub fn with_memory_policy(mut self, policy: ToolMemoryPolicy) -> Self {
+        self.memory_policy = policy;
+        self
+    }
+
+    /// Sets framework/application metadata.
+    pub fn with_metadata(mut self, metadata: RunMetadata) -> Self {
+        self.metadata = metadata;
+        self
+    }
+}
+
+impl From<String> for ToolOutput {
+    fn from(content: String) -> Self {
+        Self::text(content)
+    }
+}
+
+impl From<&str> for ToolOutput {
+    fn from(content: &str) -> Self {
+        Self::text(content)
+    }
+}
+
+/// Result of a tool call.
+///
+/// Pure or low-risk work can return [`ToolResult::Output`]. Side-effecting
+/// tools should return [`ToolResult::Effect`], allowing an outer harness to
+/// govern and execute the requested side effect.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub enum ToolResult {
+    /// Immediate model-visible output.
+    Output(ToolOutput),
+    /// Side-effect request for an outer harness.
+    Effect(EffectRequest),
+}
+
+impl ToolResult {
+    /// Returns model-visible text for immediate output results.
+    ///
+    /// Effect results return `None` because the side effect has not executed.
+    pub fn output_content(&self) -> Option<&str> {
+        match self {
+            Self::Output(output) => Some(&output.content),
+            Self::Effect(_) => None,
+        }
+    }
+
+    /// Returns model-visible text, or an empty string for effect requests
+    /// that have not executed yet.
+    pub fn content_or_empty(&self) -> &str {
+        self.output_content().unwrap_or("")
+    }
+}
+
+impl std::fmt::Display for ToolResult {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Output(output) => f.write_str(&output.content),
+            Self::Effect(request) => {
+                write!(
+                    f,
+                    "effect request: {} ({})",
+                    request.description, request.id
+                )
+            }
+        }
+    }
+}
+
+impl From<ToolOutput> for ToolResult {
+    fn from(output: ToolOutput) -> Self {
+        Self::Output(output)
+    }
+}
+
+impl From<String> for ToolResult {
+    fn from(content: String) -> Self {
+        Self::Output(ToolOutput::text(content))
+    }
+}
+
+impl From<&str> for ToolResult {
+    fn from(content: &str) -> Self {
+        Self::Output(ToolOutput::text(content))
+    }
+}
+
+impl PartialEq<str> for ToolResult {
+    fn eq(&self, other: &str) -> bool {
+        self.output_content() == Some(other)
+    }
+}
+
+impl PartialEq<&str> for ToolResult {
+    fn eq(&self, other: &&str) -> bool {
+        self == *other
+    }
+}
+
+impl PartialEq<ToolResult> for str {
+    fn eq(&self, other: &ToolResult) -> bool {
+        other == self
+    }
+}
+
+impl PartialEq<ToolResult> for &str {
+    fn eq(&self, other: &ToolResult) -> bool {
+        other == *self
+    }
+}
+
+impl PartialEq<String> for ToolResult {
+    fn eq(&self, other: &String) -> bool {
+        self == other.as_str()
+    }
+}
+
+impl PartialEq<ToolResult> for String {
+    fn eq(&self, other: &ToolResult) -> bool {
+        other == self
+    }
+}
+
+/// Context passed to a tool call.
+#[derive(Debug, Clone, Copy)]
+pub struct ToolContext<'a> {
+    /// Run execution context.
+    pub run: &'a RunContext,
+    /// Shared cross-tool state.
+    pub state: &'a SharedState,
+    /// Source model tool-call id.
+    pub tool_call_id: &'a str,
+    /// Tool name used for this call.
+    pub tool_name: &'a str,
+}
+
+impl<'a> ToolContext<'a> {
+    /// Constructs tool-call context.
+    pub fn new(
+        run: &'a RunContext,
+        state: &'a SharedState,
+        tool_call_id: &'a str,
+        tool_name: &'a str,
+    ) -> Self {
+        Self {
+            run,
+            state,
+            tool_call_id,
+            tool_name,
+        }
+    }
 }
 
 /// A tool an agent can invoke.
@@ -60,18 +355,19 @@ pub struct ToolSchema {
 /// A tool has two perspectives:
 /// - [`Tool::schema`] — the model perspective — tells the model what the
 ///   tool is and what its arguments look like;
-/// - [`Tool::call`] — the execution perspective — actually runs the
-///   model-provided arguments and returns a text result for the model.
+/// - [`Tool::call`] — parses model-provided arguments into an immediate
+///   [`ToolOutput`] or an [`EffectRequest`] to be executed by an outer
+///   harness.
 ///
 /// Implementations must be `Send + Sync`: the agent loop may execute tools
 /// concurrently on any thread. Tools that need to flow / share custom
-/// content across tools read and write the `state` parameter in `call`;
+/// content across tools read and write [`ToolContext::state`];
 /// tools that do not can ignore it (`_state`).
 ///
 /// # Example
 ///
 /// ```
-/// use molo::tool::{SharedState, Tool, ToolError, ToolSchema};
+/// use molo::tool::{Tool, ToolContext, ToolError, ToolOutput, ToolResult, ToolSchema};
 /// use serde_json::json;
 ///
 /// // A demo tool: returns a fixed time.
@@ -80,19 +376,19 @@ pub struct ToolSchema {
 /// #[molo::async_trait]
 /// impl Tool for TimeTool {
 ///     fn schema(&self) -> ToolSchema {
-///         ToolSchema {
-///             name: "time".into(),
-///             description: "Return the current time".into(),
-///             parameters: json!({ "type": "object", "properties": {} }),
-///         }
+///         ToolSchema::new(
+///             "time",
+///             "Return the current time",
+///             json!({ "type": "object", "properties": {} }),
+///         )
 ///     }
 ///
 ///     async fn call(
 ///         &self,
 ///         _arguments: serde_json::Value,
-///         _state: &SharedState,
-///     ) -> Result<String, ToolError> {
-///         Ok("12:00".into())
+///         _context: ToolContext<'_>,
+///     ) -> Result<ToolResult, ToolError> {
+///         Ok(ToolOutput::text("12:00").into())
 ///     }
 /// }
 ///
@@ -106,31 +402,14 @@ pub trait Tool: Send + Sync {
 
     /// Execution perspective: run this tool.
     ///
-    /// `arguments` is the model-generated arguments JSON (parsed uniformly
-    /// by the agent loop); `state` is the current agent's shared state (a
-    /// type-safe heterogeneous container, see [`SharedState`]) — tools
-    /// that need to flow / share custom content across tools read and
-    /// write it; tools that do not can ignore the parameter (`_state`).
-    /// Returns result text, which the agent passes back to the model as
-    /// [`ToolResult`](crate::Message::ToolResult).
+    /// `arguments` is the model-generated arguments JSON parsed by the
+    /// registry. `context` carries the run context, source tool-call id/name,
+    /// and the agent's shared state.
     async fn call(
         &self,
         arguments: serde_json::Value,
-        state: &SharedState,
-    ) -> Result<String, ToolError>;
-
-    /// Whether the tool result is protected: marked on record, exempt from
-    /// window trimming.
-    ///
-    /// Used for persistent behavioral guidance such as skill bodies — if a
-    /// tool result is trimmed by the window, the model silently degrades
-    /// (it keeps running but loses the specialized instructions, with no
-    /// visible error). Tools returning `true` have their results recorded
-    /// via `Memory::record_protected` and are never trimmed by window
-    /// Memory; the default is no protection.
-    fn protected_output(&self) -> bool {
-        false
-    }
+        context: ToolContext<'_>,
+    ) -> Result<ToolResult, ToolError>;
 }
 
 /// Reasons a tool call fails.
@@ -178,6 +457,7 @@ mod macro_tests {
     // implementations register, execute, and produce correct schemas.
 
     use super::{SharedState, ToolError, ToolRegistry};
+    use crate::RunContext;
     use schemars::JsonSchema;
     use serde::Deserialize;
 
@@ -301,24 +581,45 @@ mod macro_tests {
 
         assert_eq!(
             registry
-                .call("calculator", r#"{"expression":"1+1"}"#, &state)
+                .call_named(
+                    "calculator",
+                    r#"{"expression":"1+1"}"#,
+                    &RunContext::new("macro-test"),
+                    &state,
+                )
                 .await
                 .unwrap(),
             "calc:1+1"
         );
         assert_eq!(
             registry
-                .call("hello", r#"{"name":"molo"}"#, &state)
+                .call_named(
+                    "hello",
+                    r#"{"name":"molo"}"#,
+                    &RunContext::new("macro-test"),
+                    &state,
+                )
                 .await
                 .unwrap(),
             "hello,molo"
         );
-        assert_eq!(registry.call("now", "{}", &state).await.unwrap(), "now");
+        assert_eq!(
+            registry
+                .call_named("now", "{}", &RunContext::new("macro-test"), &state)
+                .await
+                .unwrap(),
+            "now"
+        );
 
         // Invalid arguments: Err's Display is the "error-to-text"
         // (macro-generated from_value + From<serde_json::Error>).
         let err = registry
-            .call("calculator", "not-json", &state)
+            .call_named(
+                "calculator",
+                "not-json",
+                &RunContext::new("macro-test"),
+                &state,
+            )
             .await
             .unwrap_err();
         assert!(err.to_string().starts_with("invalid arguments:"));
@@ -327,16 +628,27 @@ mod macro_tests {
         // (consecutive calls on the same instance accumulate the count).
         state.insert(0usize);
         assert_eq!(
-            registry.call("counter", "{}", &state).await.unwrap(),
+            registry
+                .call_named("counter", "{}", &RunContext::new("macro-test"), &state)
+                .await
+                .unwrap(),
             "count=1"
         );
         assert_eq!(
-            registry.call("counter", "{}", &state).await.unwrap(),
+            registry
+                .call_named("counter", "{}", &RunContext::new("macro-test"), &state)
+                .await
+                .unwrap(),
             "count=2"
         );
         assert_eq!(
             registry
-                .call("record", r#"{"action":"x"}"#, &state)
+                .call_named(
+                    "record",
+                    r#"{"action":"x"}"#,
+                    &RunContext::new("macro-test"),
+                    &state,
+                )
                 .await
                 .unwrap(),
             "recorded x, count=3"

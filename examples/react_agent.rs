@@ -37,7 +37,7 @@
 //!
 //! ```rust
 //! use molo::provider::{FakeProvider, FakeReply};
-//! use molo::tool::{SharedState, Tool, ToolError, ToolSchema};
+//! use molo::tool::{Tool, ToolContext, ToolError, ToolOutput, ToolResult, ToolSchema};
 //! use molo::{react_agent, ToolRegistry};
 //!
 //! /// Demo tool: returns the arguments as-is (ignores the shared state).
@@ -45,10 +45,10 @@
 //! #[async_trait::async_trait]
 //! impl Tool for Echo {
 //!     fn schema(&self) -> ToolSchema {
-//!         ToolSchema { name: "echo".into(), description: "Echoes back".into(), parameters: serde_json::json!({}) }
+//!         ToolSchema::new("echo", "Echoes back", serde_json::json!({}))
 //!     }
-//!     async fn call(&self, arguments: serde_json::Value, _state: &SharedState) -> Result<String, ToolError> {
-//!         Ok(arguments.to_string())
+//!     async fn call(&self, arguments: serde_json::Value, _context: ToolContext<'_>) -> Result<ToolResult, ToolError> {
+//!         Ok(ToolOutput::text(arguments.to_string()).into())
 //!     }
 //! }
 //!
@@ -78,7 +78,7 @@
 use molo::agent::{Agent, MessageChunk};
 use molo::provider::OpenAiProvider;
 use molo::react_agent;
-use molo::tool::{SharedState, Tool, ToolError, ToolSchema};
+use molo::tool::{Tool, ToolContext, ToolError, ToolOutput, ToolResult, ToolSchema};
 
 use futures::stream::StreamExt;
 use schemars::JsonSchema;
@@ -99,23 +99,23 @@ struct Calculator;
 #[async_trait::async_trait]
 impl Tool for Calculator {
     fn schema(&self) -> ToolSchema {
-        ToolSchema {
-            name: "calculator".into(),
-            description: "Evaluates a math expression; supports basic arithmetic and parentheses, e.g. \"(1 + 2) * 3\".".into(),
-            parameters: serde_json::to_value(schemars::schema_for!(CalcArgs))
+        ToolSchema::new(
+            "calculator",
+            "Evaluates a math expression; supports basic arithmetic and parentheses, e.g. \"(1 + 2) * 3\".",
+            serde_json::to_value(schemars::schema_for!(CalcArgs))
                 .expect("tool schema must serialize"),
-        }
+        )
     }
 
     async fn call(
         &self,
         arguments: serde_json::Value,
-        _state: &SharedState,
-    ) -> Result<String, ToolError> {
+        _context: ToolContext<'_>,
+    ) -> Result<ToolResult, ToolError> {
         let args: CalcArgs = serde_json::from_value(arguments)?;
         let value =
             evalexpr::eval(&args.expression).map_err(|e| ToolError::Execution(e.to_string()))?;
-        Ok(value.to_string())
+        Ok(ToolOutput::text(value.to_string()).into())
     }
 }
 

@@ -14,7 +14,10 @@ use criterion::{Criterion, criterion_group, criterion_main};
 use molo::message::Message;
 use molo::provider::{FakeProvider, FakeReply};
 use molo::tool::{SharedState, ToolRegistry};
-use molo::{Agent, Memory, ReActAgent, Tool, ToolError, ToolSchema, WindowMemory};
+use molo::{
+    Agent, Memory, ReActAgent, Tool, ToolContext, ToolError, ToolOutput, ToolResult, ToolSchema,
+    WindowMemory,
+};
 
 fn rt() -> tokio::runtime::Runtime {
     tokio::runtime::Builder::new_current_thread()
@@ -59,18 +62,14 @@ fn bench_tool_call(c: &mut Criterion) {
     #[molo::async_trait]
     impl Tool for Noop {
         fn schema(&self) -> ToolSchema {
-            ToolSchema {
-                name: "noop".into(),
-                description: "noop".into(),
-                parameters: serde_json::json!({}),
-            }
+            ToolSchema::new("noop", "noop", serde_json::json!({}))
         }
         async fn call(
             &self,
             _arguments: serde_json::Value,
-            _state: &SharedState,
-        ) -> Result<String, ToolError> {
-            Ok("ok".into())
+            _context: ToolContext<'_>,
+        ) -> Result<ToolResult, ToolError> {
+            Ok(ToolOutput::text("ok").into())
         }
     }
 
@@ -82,7 +81,10 @@ fn bench_tool_call(c: &mut Criterion) {
                 let mut registry = ToolRegistry::new();
                 registry.register(Noop);
                 let state = SharedState::new();
-                registry.call("noop", "{}", &state).await.unwrap();
+                registry
+                    .call_named("noop", "{}", &molo::RunContext::new("bench"), &state)
+                    .await
+                    .unwrap();
             })
         })
     });

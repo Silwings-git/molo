@@ -20,7 +20,7 @@
 
 use molo::agent::{Agent, MessageChunk};
 use molo::provider::{FakeProvider, FakeReply};
-use molo::tool::{SharedState, Tool, ToolError, ToolSchema};
+use molo::tool::{SharedState, Tool, ToolContext, ToolError, ToolOutput, ToolResult, ToolSchema};
 use molo::{ToolCall, ToolRegistry, react_agent};
 
 use futures::StreamExt;
@@ -37,20 +37,21 @@ struct Counter;
 #[async_trait::async_trait]
 impl Tool for Counter {
     fn schema(&self) -> ToolSchema {
-        ToolSchema {
-            name: "counter".into(),
-            description: "Accumulates the call count and returns the current counter.".into(),
-            parameters: serde_json::json!({}),
-        }
+        ToolSchema::new(
+            "counter",
+            "Accumulates the call count and returns the current counter.",
+            serde_json::json!({}),
+        )
     }
 
     async fn call(
         &self,
         _arguments: serde_json::Value,
-        state: &SharedState,
-    ) -> Result<String, ToolError> {
+        context: ToolContext<'_>,
+    ) -> Result<ToolResult, ToolError> {
+        let state = context.state;
         state.with_mut::<usize>(|n| *n += 1);
-        Ok(format!("count={}", state.get::<usize>().unwrap_or(0)))
+        Ok(ToolOutput::text(format!("count={}", state.get::<usize>().unwrap_or(0))).into())
     }
 }
 
@@ -60,22 +61,24 @@ struct SessionTool;
 #[async_trait::async_trait]
 impl Tool for SessionTool {
     fn schema(&self) -> ToolSchema {
-        ToolSchema {
-            name: "session".into(),
-            description: "Returns the current session user.".into(),
-            parameters: serde_json::json!({}),
-        }
+        ToolSchema::new(
+            "session",
+            "Returns the current session user.",
+            serde_json::json!({}),
+        )
     }
 
     async fn call(
         &self,
         _arguments: serde_json::Value,
-        state: &SharedState,
-    ) -> Result<String, ToolError> {
-        Ok(match state.get::<Session>() {
+        context: ToolContext<'_>,
+    ) -> Result<ToolResult, ToolError> {
+        let state = context.state;
+        Ok(ToolOutput::text(match state.get::<Session>() {
             Some(s) => format!("user={}", s.user),
             None => "user=unknown".into(),
         })
+        .into())
     }
 }
 

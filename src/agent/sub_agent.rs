@@ -27,7 +27,7 @@
 
 use crate::agent::{Agent, ReActAgent};
 use crate::provider::Provider;
-use crate::tool::{SharedState, Tool, ToolError, ToolRegistry, ToolSchema};
+use crate::tool::{Tool, ToolContext, ToolError, ToolOutput, ToolRegistry, ToolResult, ToolSchema};
 use std::collections::HashMap;
 use std::fmt;
 use std::sync::Arc;
@@ -98,7 +98,7 @@ enum SubAgentSource {
 ///
 /// ```
 /// use molo::agent::{Agent, AgentError, SubAgentTool};
-/// use molo::tool::{SharedState, Tool};
+/// use molo::tool::{SharedState, Tool, ToolContext};
 /// use molo::{Message, RunContext, RunMetadata, RunOutput, RunRequest, RunSummary};
 /// use serde_json::json;
 ///
@@ -140,8 +140,13 @@ enum SubAgentSource {
 ///     Box::new(Echo),
 /// );
 ///
+/// let run = RunContext::new("sub-agent-doc");
+/// let state = SharedState::default();
 /// let result = tool
-///     .call(json!({ "message": "Hello" }), &SharedState::default())
+///     .call(
+///         json!({ "message": "Hello" }),
+///         ToolContext::new(&run, &state, "call-sub-agent", "echo"),
+///     )
 ///     .await?;
 /// assert_eq!(result, "echo: {\"message\":\"Hello\"}");
 /// # Ok(())
@@ -171,11 +176,7 @@ impl SubAgentTool {
         agent: Box<dyn Agent + Send>,
     ) -> Self {
         Self {
-            schema: ToolSchema {
-                name: name.into(),
-                description: description.into(),
-                parameters,
-            },
+            schema: ToolSchema::new(name, description, parameters),
             source: SubAgentSource::Instance(Mutex::new(agent)),
         }
     }
@@ -206,11 +207,7 @@ impl SubAgentTool {
         + 'static,
     ) -> Self {
         Self {
-            schema: ToolSchema {
-                name: name.into(),
-                description: description.into(),
-                parameters,
-            },
+            schema: ToolSchema::new(name, description, parameters),
             source: SubAgentSource::Factory(Box::new(factory)),
         }
     }
@@ -241,7 +238,8 @@ impl SubAgentTool {
     /// ```
     /// use molo::agent::SubAgentTool;
     /// use molo::provider::{FakeProvider, FakeReply};
-    /// use molo::tool::{SharedState, Tool, ToolRegistry};
+    /// use molo::RunContext;
+    /// use molo::tool::{SharedState, Tool, ToolContext, ToolRegistry};
     /// use serde_json::json;
     ///
     /// # #[tokio::main]
@@ -260,10 +258,12 @@ impl SubAgentTool {
     ///
     /// // The model defines the system prompt and task → a new sub-agent is
     /// // created and run
+    /// let run = RunContext::new("sub-agent-doc");
+    /// let state = SharedState::default();
     /// let result = tool
     ///     .call(
     ///         json!({ "system_prompt": "You are a reviewer", "task": "Review this code" }),
-    ///         &SharedState::default(),
+    ///         ToolContext::new(&run, &state, "call-sub-agent", "delegate"),
     ///     )
     ///     .await?;
     /// assert_eq!(result, "sub answer");
@@ -280,11 +280,7 @@ impl SubAgentTool {
         let make_provider: ProviderFactory =
             Box::new(move || Box::new(provider.clone()) as Box<dyn Provider>);
         Self {
-            schema: ToolSchema {
-                name: name.into(),
-                description: description.into(),
-                parameters,
-            },
+            schema: ToolSchema::new(name, description, parameters),
             source: SubAgentSource::React {
                 make_provider,
                 tools,
@@ -310,9 +306,9 @@ impl Tool for SubAgentTool {
     async fn call(
         &self,
         arguments: serde_json::Value,
-        _state: &SharedState,
-    ) -> Result<String, ToolError> {
-        match &self.source {
+        _context: ToolContext<'_>,
+    ) -> Result<ToolResult, ToolError> {
+        let output = match &self.source {
             SubAgentSource::Instance(agent) => {
                 let mut guard = agent.lock().await;
                 run_sub_agent(&mut **guard, &arguments).await
@@ -338,7 +334,8 @@ impl Tool for SubAgentTool {
                     .await
                     .map_err(|e| ToolError::Execution(e.to_string()))
             }
-        }
+        }?;
+        Ok(ToolOutput::text(output).into())
     }
 }
 
@@ -613,7 +610,7 @@ mod tests {
     use crate::message::{ContentBlock, Message, ToolCall};
     use crate::provider::{FakeProvider, FakeReply, ProviderError};
     use crate::run::{RunContext, RunMetadata, RunOutput, RunRequest, RunSummary};
-    use crate::tool::ToolRegistry;
+    use crate::tool::{SharedState, ToolContext, ToolRegistry};
     use serde_json::json;
 
     /// Whether a User message contains the given text (message content is
@@ -697,6 +694,21 @@ mod tests {
         }
     }
 
+    async fn call_tool(
+        tool: &SubAgentTool,
+        arguments: serde_json::Value,
+    ) -> Result<String, ToolError> {
+        let run = RunContext::new("sub-agent-tool-test");
+        let state = SharedState::new();
+        let output = tool
+            .call(
+                arguments,
+                ToolContext::new(&run, &state, "call-sub-agent", "sub_agent"),
+            )
+            .await?;
+        Ok(output.to_string())
+    }
+
     #[test]
     fn schema_passthrough() {
         let tool = SubAgentTool::from_agent(
@@ -721,12 +733,8 @@ mod tests {
             Box::new(RecordingAgent { seen: seen.clone() }),
         );
 
-        tool.call(json!({ "q": 1 }), &SharedState::default())
-            .await
-            .unwrap();
-        tool.call(json!({ "q": 2 }), &SharedState::default())
-            .await
-            .unwrap();
+        call_tool(&tool, json!({ "q": 1 })).await.unwrap();
+        call_tool(&tool, json!({ "q": 2 })).await.unwrap();
 
         // Same instance continues: both inputs are recorded, and the second
         // input is the second call's arguments.
@@ -750,12 +758,8 @@ mod tests {
             },
         );
 
-        tool.call(json!({ "q": 1 }), &SharedState::default())
-            .await
-            .unwrap();
-        tool.call(json!({ "q": 2 }), &SharedState::default())
-            .await
-            .unwrap();
+        call_tool(&tool, json!({ "q": 1 })).await.unwrap();
+        call_tool(&tool, json!({ "q": 2 })).await.unwrap();
 
         // Every call creates a new instance through the factory (the old
         // instance is discarded when the call ends — no state to continue).
@@ -767,10 +771,7 @@ mod tests {
         let tool = SubAgentTool::from_factory("delegate", "One-shot delegation", json!({}), |_| {
             Err(ToolError::InvalidArguments("bad kind".into()))
         });
-        let err = tool
-            .call(json!({}), &SharedState::default())
-            .await
-            .unwrap_err();
+        let err = call_tool(&tool, json!({})).await.unwrap_err();
         assert_eq!(err, ToolError::InvalidArguments("bad kind".into()));
     }
 
@@ -782,10 +783,7 @@ mod tests {
             json!({}),
             Box::new(FlakyAgent { failed_once: false }),
         );
-        let err = tool
-            .call(json!({}), &SharedState::default())
-            .await
-            .unwrap_err();
+        let err = call_tool(&tool, json!({})).await.unwrap_err();
         match err {
             ToolError::Execution(msg) => assert!(msg.contains("boom")),
             other => panic!("expected Execution, got {other:?}"),
@@ -969,13 +967,12 @@ mod tests {
             json!({}),
         );
 
-        let result = tool
-            .call(
-                json!({ "system_prompt": "You are a reviewer", "task": "Review this code" }),
-                &SharedState::default(),
-            )
-            .await
-            .unwrap();
+        let result = call_tool(
+            &tool,
+            json!({ "system_prompt": "You are a reviewer", "task": "Review this code" }),
+        )
+        .await
+        .unwrap();
         assert_eq!(result, "sub answer");
 
         // The system prompt enters the sub-agent's request (System message);
@@ -1009,7 +1006,7 @@ mod tests {
 
         // No system_prompt / task fields: empty system prompt (no System
         // message assembled), empty input.
-        tool.call(json!({}), &SharedState::default()).await.unwrap();
+        call_tool(&tool, json!({})).await.unwrap();
         let reqs = fake.requests();
         assert!(
             reqs[0]

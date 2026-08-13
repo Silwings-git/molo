@@ -22,8 +22,8 @@
 //! `cargo run --example message_channel`
 
 use molo::{
-    BroadcastChannel, CliMessageChannel, MessageChannel, MpscChannel, SharedState, Tool, ToolError,
-    ToolSchema, WatchChannel,
+    BroadcastChannel, CliMessageChannel, MessageChannel, MpscChannel, RunContext, SharedState,
+    Tool, ToolContext, ToolError, ToolOutput, ToolResult, ToolSchema, WatchChannel,
 };
 use schemars::JsonSchema;
 use serde::Deserialize;
@@ -49,19 +49,19 @@ struct ConfirmTool {
 #[async_trait::async_trait]
 impl Tool for ConfirmTool {
     fn schema(&self) -> ToolSchema {
-        ToolSchema {
-            name: "confirm".into(),
-            description: "Confirms with the user before executing a dangerous operation; only continue if the user replies yes.".into(),
-            parameters: serde_json::to_value(schemars::schema_for!(ConfirmArgs))
+        ToolSchema::new(
+            "confirm",
+            "Confirms with the user before executing a dangerous operation; only continue if the user replies yes.",
+            serde_json::to_value(schemars::schema_for!(ConfirmArgs))
                 .expect("tool schema must serialize"),
-        }
+        )
     }
 
     async fn call(
         &self,
         arguments: serde_json::Value,
-        _state: &SharedState,
-    ) -> Result<String, ToolError> {
+        _context: ToolContext<'_>,
+    ) -> Result<ToolResult, ToolError> {
         let args: ConfirmArgs = serde_json::from_value(arguments)?;
         let answer = self
             .channel
@@ -72,9 +72,9 @@ impl Tool for ConfirmTool {
             .await
             .map_err(|e| ToolError::Execution(e.to_string()))?;
         if answer == "yes" {
-            Ok("Confirmed, continue executing.".into())
+            Ok(ToolOutput::text("Confirmed, continue executing.").into())
         } else {
-            Ok("The user declined; the operation was cancelled.".into())
+            Ok(ToolOutput::text("The user declined; the operation was cancelled.").into())
         }
     }
 }
@@ -97,10 +97,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let confirm = ConfirmTool {
         channel: channel.clone(),
     };
+    let run = RunContext::new("message-channel-example");
+    let state = SharedState::new();
     let result = confirm
         .call(
             serde_json::json!({ "operation": "delete the entire project directory" }),
-            &SharedState::new(),
+            ToolContext::new(&run, &state, "manual-call", "confirm"),
         )
         .await?;
     println!("tool result: {result}");

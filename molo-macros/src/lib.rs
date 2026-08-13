@@ -23,9 +23,11 @@
 //!   reference recognized by the type name `SharedState`, injected automatically; must be the last parameter);
 //! - The business parameter type must implement `schemars::JsonSchema`: primitive types come with an
 //!   implementation out of the box, and custom structs just need `#[derive(JsonSchema)]`;
-//! - Return: `Result<String, ToolError>` (a type mismatch is caught by the compiler on the generated code);
+//! - Return: `Result<String, ToolError>`, `Result<ToolOutput, ToolError>`, or
+//!   `Result<ToolResult, ToolError>` (a type mismatch is caught by the compiler on the generated code);
 //! - Attributes: `description` (required), `name` (optional, defaults to the function name), `protected`
-//!   (optional, defaults to `false`; when `true` the result is protected and exempt from window trimming).
+//!   (optional, defaults to `false`; when `true` the result is protected and exempt from window trimming),
+//!   plus optional policy hints: `side_effects`, `risk`, `requires_confirmation`, and `timeout_secs`.
 //!
 //! # Dependency prerequisites
 //!
@@ -39,15 +41,23 @@ use proc_macro2::Span;
 use quote::{format_ident, quote};
 use syn::parse::{Parse, ParseStream};
 use syn::spanned::Spanned;
-use syn::{FnArg, Ident, ItemFn, LitStr, Pat, Type, parse_macro_input};
+use syn::{FnArg, Ident, ItemFn, LitInt, LitStr, Pat, Type, parse_macro_input};
 
-/// Macro attributes: `description` (required) + `name` / `protected` (optional).
+/// Macro attributes: `description` (required) + optional schema policy hints.
 struct ToolArgs {
     description: String,
     name: Option<String>,
-    /// Whether the result is protected (`Tool::protected_output`): protected results are
-    /// recorded via `record_protected` and are exempt from window trimming.
+    /// Whether output is protected: protected results are recorded via
+    /// protected memory when the memory implementation supports it.
     protected: bool,
+    /// Declared side-effect level.
+    side_effects: SideEffectAttr,
+    /// Declared default risk.
+    risk: RiskAttr,
+    /// Whether the tool author recommends confirmation.
+    requires_confirmation: bool,
+    /// Suggested timeout in seconds.
+    timeout_secs: Option<u64>,
 }
 
 impl Parse for ToolArgs {
@@ -55,6 +65,10 @@ impl Parse for ToolArgs {
         let mut description = None;
         let mut name = None;
         let mut protected = false;
+        let mut side_effects = SideEffectAttr::Pure;
+        let mut risk = RiskAttr::Low;
+        let mut requires_confirmation = false;
+        let mut timeout_secs = None;
         while !input.is_empty() {
             let key: Ident = input.parse()?;
             input.parse::<syn::Token![=]>()?;
@@ -71,11 +85,27 @@ impl Parse for ToolArgs {
                     let value: syn::LitBool = input.parse()?;
                     protected = value.value;
                 }
+                "side_effects" => {
+                    let value: LitStr = input.parse()?;
+                    side_effects = SideEffectAttr::parse(value)?;
+                }
+                "risk" => {
+                    let value: LitStr = input.parse()?;
+                    risk = RiskAttr::parse(value)?;
+                }
+                "requires_confirmation" => {
+                    let value: syn::LitBool = input.parse()?;
+                    requires_confirmation = value.value;
+                }
+                "timeout_secs" => {
+                    let value: LitInt = input.parse()?;
+                    timeout_secs = Some(value.base10_parse()?);
+                }
                 other => {
                     return Err(syn::Error::new(
                         key.span(),
                         format!(
-                            "unknown attribute {other}: only description / name / protected are supported"
+                            "unknown attribute {other}: only description / name / protected / side_effects / risk / requires_confirmation / timeout_secs are supported"
                         ),
                     ));
                 }
@@ -90,7 +120,77 @@ impl Parse for ToolArgs {
             })?,
             name,
             protected,
+            side_effects,
+            risk,
+            requires_confirmation,
+            timeout_secs,
         })
+    }
+}
+
+#[derive(Clone, Copy)]
+enum SideEffectAttr {
+    Pure,
+    ReadOnly,
+    Write,
+    External,
+}
+
+impl SideEffectAttr {
+    fn parse(lit: LitStr) -> syn::Result<Self> {
+        match lit.value().as_str() {
+            "pure" => Ok(Self::Pure),
+            "read_only" => Ok(Self::ReadOnly),
+            "write" => Ok(Self::Write),
+            "external" => Ok(Self::External),
+            other => Err(syn::Error::new(
+                lit.span(),
+                format!(
+                    "invalid side_effects value {other:?}: expected pure / read_only / write / external"
+                ),
+            )),
+        }
+    }
+
+    fn tokens(self) -> proc_macro2::TokenStream {
+        match self {
+            Self::Pure => quote! { ::molo::tool::SideEffectLevel::Pure },
+            Self::ReadOnly => quote! { ::molo::tool::SideEffectLevel::ReadOnly },
+            Self::Write => quote! { ::molo::tool::SideEffectLevel::Write },
+            Self::External => quote! { ::molo::tool::SideEffectLevel::External },
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum RiskAttr {
+    Low,
+    Medium,
+    High,
+    Critical,
+}
+
+impl RiskAttr {
+    fn parse(lit: LitStr) -> syn::Result<Self> {
+        match lit.value().as_str() {
+            "low" => Ok(Self::Low),
+            "medium" => Ok(Self::Medium),
+            "high" => Ok(Self::High),
+            "critical" => Ok(Self::Critical),
+            other => Err(syn::Error::new(
+                lit.span(),
+                format!("invalid risk value {other:?}: expected low / medium / high / critical"),
+            )),
+        }
+    }
+
+    fn tokens(self) -> proc_macro2::TokenStream {
+        match self {
+            Self::Low => quote! { ::molo::RiskLevel::Low },
+            Self::Medium => quote! { ::molo::RiskLevel::Medium },
+            Self::High => quote! { ::molo::RiskLevel::High },
+            Self::Critical => quote! { ::molo::RiskLevel::Critical },
+        }
     }
 }
 
@@ -192,8 +292,9 @@ impl Parse for ToolArgs {
 /// - A `&mut SharedState` is present (state injection uses an immutable reference);
 /// - The parameter pattern is not a simple identifier (e.g. destructuring);
 /// - An unknown attribute, or a missing required `description`.
+/// - An invalid `risk` or `side_effects` string.
 ///
-/// The macro does not explicitly check that the return type is `Result<String, ToolError>` — a type mismatch
+/// The macro does not explicitly check the return type — a type mismatch
 /// surfaces as a compile error on the generated `call` method.
 ///
 /// # Choosing between the macro and a hand-written `impl Tool`
@@ -313,6 +414,15 @@ fn expand_tool(args: ToolArgs, item: ItemFn) -> syn::Result<proc_macro2::TokenSt
     let name = args.name.unwrap_or_else(|| sig.ident.to_string());
     let description = args.description;
     let protected = args.protected;
+    let side_effects = args.side_effects.tokens();
+    let risk = args.risk.tokens();
+    let requires_confirmation = args.requires_confirmation;
+    let timeout = match args.timeout_secs {
+        Some(seconds) => {
+            quote! { ::std::option::Option::Some(::std::time::Duration::from_secs(#seconds)) }
+        }
+        None => quote! { ::std::option::Option::None },
+    };
     // The generated struct carries a rustdoc line (naming which function it wraps): doc comments in generated
     // code are `#[doc = "..."]` string literals, so they must be formatted before being put into quote!;
     // the function name is interpolated via sig.ident (Display yields the real name), not stringify! —
@@ -407,12 +517,6 @@ fn expand_tool(args: ToolArgs, item: ItemFn) -> syn::Result<proc_macro2::TokenSt
         (None, true) => quote! { #impl_fn(state).await },
         (None, false) => quote! { #impl_fn().await },
     };
-    let state_sig = if state_param {
-        quote! { state: &::molo::tool::SharedState }
-    } else {
-        quote! { _state: &::molo::tool::SharedState }
-    };
-
     Ok(quote! {
         #original_fn
 
@@ -425,24 +529,39 @@ fn expand_tool(args: ToolArgs, item: ItemFn) -> syn::Result<proc_macro2::TokenSt
         #[::molo::async_trait]
         impl ::molo::tool::Tool for #struct_name {
             fn schema(&self) -> ::molo::tool::ToolSchema {
-                ::molo::tool::ToolSchema {
-                    name: #name.into(),
-                    description: #description.into(),
-                    parameters: #parameters,
-                }
-            }
-
-            fn protected_output(&self) -> bool {
-                #protected
+                ::molo::tool::ToolSchema::new(
+                    #name,
+                    #description,
+                    #parameters,
+                )
+                .with_policy(::molo::tool::ToolPolicy {
+                    side_effects: #side_effects,
+                    risk: #risk,
+                    requires_confirmation: #requires_confirmation,
+                    timeout: #timeout,
+                    memory_policy: if #protected {
+                        ::molo::tool::ToolMemoryPolicy::Protected
+                    } else {
+                        ::molo::tool::ToolMemoryPolicy::Normal
+                    }
+                })
             }
 
             async fn call(
                 &self,
                 arguments: ::serde_json::Value,
-                #state_sig,
-            ) -> ::std::result::Result<String, ::molo::tool::ToolError> {
+                context: ::molo::tool::ToolContext<'_>,
+            ) -> ::std::result::Result<::molo::tool::ToolResult, ::molo::tool::ToolError> {
+                let state = context.state;
                 #arg_parse
-                #call_expr
+                let __molo_output = #call_expr?;
+                let mut __molo_result: ::molo::tool::ToolResult = __molo_output.into();
+                if #protected {
+                    if let ::molo::tool::ToolResult::Output(__molo_tool_output) = &mut __molo_result {
+                        __molo_tool_output.memory_policy = ::molo::tool::ToolMemoryPolicy::Protected;
+                    }
+                }
+                ::std::result::Result::Ok(__molo_result)
             }
         }
     })
@@ -511,6 +630,10 @@ mod tests {
             description: "test tool".into(),
             name: None,
             protected: false,
+            side_effects: SideEffectAttr::Pure,
+            risk: RiskAttr::Low,
+            requires_confirmation: false,
+            timeout_secs: None,
         }
     }
 
@@ -574,6 +697,26 @@ mod tests {
     }
 
     #[test]
+    fn rejects_invalid_side_effects() {
+        let err = match syn::parse_str::<ToolArgs>(
+            r#"description = "x", side_effects = "destructive""#,
+        ) {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("expected attribute parsing to fail"),
+        };
+        assert!(err.contains("invalid side_effects value"));
+    }
+
+    #[test]
+    fn rejects_invalid_risk() {
+        let err = match syn::parse_str::<ToolArgs>(r#"description = "x", risk = "severe""#) {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("expected attribute parsing to fail"),
+        };
+        assert!(err.contains("invalid risk value"));
+    }
+
+    #[test]
     fn requires_description() {
         let err = match syn::parse_str::<ToolArgs>("name = \"calc\"") {
             Err(e) => e.to_string(),
@@ -618,7 +761,7 @@ mod tests {
     }
 
     #[test]
-    fn protected_attribute_generates_protected_output() {
+    fn protected_attribute_generates_memory_policy() {
         let tool_args = match syn::parse_str::<ToolArgs>("description = \"x\", protected = true") {
             Ok(a) => a,
             Err(e) => panic!("attribute parsing failed: {e}"),
@@ -627,10 +770,25 @@ mod tests {
             async fn calculator(x: String) -> Result<String, ()> { Ok(x) }
         };
         let tokens = expand_tool(tool_args, item).unwrap().to_string();
-        assert!(tokens.contains("fn protected_output (& self) -> bool { true }"));
+        assert!(tokens.contains("ToolMemoryPolicy :: Protected"));
         // Defaults to false when protected is not declared.
         let tokens = expand_tool(args(), item_plain()).unwrap().to_string();
-        assert!(tokens.contains("fn protected_output (& self) -> bool { false }"));
+        assert!(tokens.contains("ToolMemoryPolicy :: Normal"));
+    }
+
+    #[test]
+    fn policy_attributes_generate_tool_policy() {
+        let tool_args = match syn::parse_str::<ToolArgs>(
+            "description = \"x\", side_effects = \"read_only\", risk = \"medium\", requires_confirmation = true, timeout_secs = 10",
+        ) {
+            Ok(a) => a,
+            Err(e) => panic!("attribute parsing failed: {e}"),
+        };
+        let tokens = expand_tool(tool_args, item_plain()).unwrap().to_string();
+        assert!(tokens.contains("SideEffectLevel :: ReadOnly"));
+        assert!(tokens.contains("RiskLevel :: Medium"));
+        assert!(tokens.contains("requires_confirmation : true"));
+        assert!(tokens.contains("Duration :: from_secs (10"));
     }
 
     fn item_plain() -> ItemFn {

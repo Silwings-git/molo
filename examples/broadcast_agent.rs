@@ -25,7 +25,7 @@
 
 use futures::stream::StreamExt;
 use molo::provider::OpenAiProvider;
-use molo::tool::{SharedState, Tool, ToolError, ToolSchema};
+use molo::tool::{SharedState, Tool, ToolContext, ToolError, ToolOutput, ToolResult, ToolSchema};
 use molo::{
     BroadcastChannel, BroadcastReceiver, ChatRequest, Message, MessageChannel, Provider,
     StreamEvent, ToolCall, ToolRegistry,
@@ -50,25 +50,26 @@ struct NotifyWorkersTool {
 #[async_trait::async_trait]
 impl Tool for NotifyWorkersTool {
     fn schema(&self) -> ToolSchema {
-        ToolSchema {
-            name: "notify_workers".into(),
-            description: "Broadcasts a message to all workers; returns success when broadcast."
-                .into(),
-            parameters: serde_json::to_value(schemars::schema_for!(NotifyArgs))
+        ToolSchema::new(
+            "notify_workers",
+            "Broadcasts a message to all workers; returns success when broadcast.",
+            serde_json::to_value(schemars::schema_for!(NotifyArgs))
                 .expect("tool schema must serialize"),
-        }
+        )
     }
 
     async fn call(
         &self,
         arguments: serde_json::Value,
-        _state: &SharedState,
-    ) -> Result<String, ToolError> {
+        _context: ToolContext<'_>,
+    ) -> Result<ToolResult, ToolError> {
         let args: NotifyArgs = serde_json::from_value(arguments)?;
         self.channel
             .notify(&args.message)
             .await
-            .map(|_| "Broadcast successful, all workers received the message.".to_string())
+            .map(|_| {
+                ToolOutput::text("Broadcast successful, all workers received the message.").into()
+            })
             .map_err(|e| ToolError::Execution(e.to_string()))
     }
 }
@@ -124,6 +125,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .register(Calculator)
         .register(NotifyWorkersTool { channel: broadcast });
     let tool_schemas = registry.schemas();
+    let run_context = molo::RunContext::new("broadcast-agent-example");
+    let state = SharedState::new();
 
     let mut messages = vec![Message::system(
         "You are a release-coordination assistant. Use the calculator tool when \
@@ -182,8 +185,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 println!("  → calling {}, arguments: {}", call.name, call.arguments);
                 // Err's Display is "error as text"; still record it and feed it back as usual.
                 let content = registry
-                    .call(&call.name, &call.arguments, &SharedState::new())
+                    .call(&call, &run_context, &state)
                     .await
+                    .map(|result| result.to_string())
                     .unwrap_or_else(|e| e.to_string());
                 println!("  → {} returned: {content}", call.name);
                 messages.push(Message::ToolResult {
@@ -211,23 +215,23 @@ struct Calculator;
 #[async_trait::async_trait]
 impl Tool for Calculator {
     fn schema(&self) -> ToolSchema {
-        ToolSchema {
-            name: "calculator".into(),
-            description: "Evaluates a math expression; supports basic arithmetic and parentheses, e.g. \"(1 + 2) * 3\".".into(),
-            parameters: serde_json::to_value(schemars::schema_for!(CalcArgs))
+        ToolSchema::new(
+            "calculator",
+            "Evaluates a math expression; supports basic arithmetic and parentheses, e.g. \"(1 + 2) * 3\".",
+            serde_json::to_value(schemars::schema_for!(CalcArgs))
                 .expect("tool schema must serialize"),
-        }
+        )
     }
 
     async fn call(
         &self,
         arguments: serde_json::Value,
-        _state: &SharedState,
-    ) -> Result<String, ToolError> {
+        _context: ToolContext<'_>,
+    ) -> Result<ToolResult, ToolError> {
         let args: CalcArgs = serde_json::from_value(arguments)?;
         let value =
             evalexpr::eval(&args.expression).map_err(|e| ToolError::Execution(e.to_string()))?;
-        Ok(value.to_string())
+        Ok(ToolOutput::text(value.to_string()).into())
     }
 }
 

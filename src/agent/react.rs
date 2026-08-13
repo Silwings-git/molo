@@ -22,8 +22,10 @@ use super::structured::{StructuredOutcome, StructuredValidator};
 use crate::CancellationToken;
 use crate::agent::events::ReActEvent;
 use crate::agent::{
-    Agent, AgentError, AgentEvent, CancellableAgent, MessageChunk, RunSummary, TypedAgent,
+    Agent, AgentAction, AgentError, AgentEvent, AgentKernel, CancellableAgent, MessageChunk,
+    ModelObservation, ModelRequest, Observation, RunSummary, TypedAgent,
 };
+use crate::effect::{EffectObservation, EffectRequest};
 use crate::event_channel::EventChannel;
 use crate::memory::{Memory, WindowMemory};
 use crate::message::{Message, ToolCall};
@@ -32,12 +34,14 @@ use crate::provider::{
 };
 use crate::run::{Artifact, RunContext, RunMetadata, RunOutput, RunRequest, TypedRunOutput};
 use crate::skill::{LoadSkillTool, SkillRegistry};
-use crate::tool::{SharedState, ToolRegistry};
+use crate::tool::{SharedState, ToolMemoryPolicy, ToolOutput, ToolRegistry, ToolResult};
 use futures::StreamExt;
 use futures::stream::BoxStream;
 use schemars::JsonSchema;
 use serde::de::DeserializeOwned;
+use std::collections::HashMap;
 use std::collections::HashSet;
+use std::collections::VecDeque;
 use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
@@ -237,6 +241,8 @@ pub struct ReActAgent {
     /// Skill assembly mode (none / dynamic progressive disclosure / static
     /// inlining).
     skill_mode: SkillMode,
+    /// Step-wise kernel state. `None` means no `AgentKernel` run is active.
+    kernel_state: Option<ReActKernelState>,
 }
 
 /// Skill assembly mode: how skills enter the system prompt.
@@ -311,6 +317,7 @@ impl ReActAgent {
             enabled_skills: None,
             activated_skills: Vec::new(),
             skill_mode: SkillMode::None,
+            kernel_state: None,
         }
     }
 
@@ -871,7 +878,7 @@ impl ReActAgent {
                 // is injected via the ToolRoundExecutor; each outcome is
                 // recorded as it arrives.
                 let ctx = ToolRoundCtx {
-                    run_id,
+                    context,
                     round: counters.rounds,
                     registry: &self.registry,
                     state: &self.state,
@@ -879,6 +886,12 @@ impl ReActAgent {
                 };
                 let mut outcomes = self.executor.execute_round(ctx, tool_calls).await;
                 while let Some(outcome) = outcomes.next().await {
+                    if let Some(effect) = outcome.effect_request() {
+                        return Err(AgentError::EffectRequiresHarness(format!(
+                            "{} ({})",
+                            effect.description, effect.id
+                        )));
+                    }
                     // Protected results (skill bodies, etc.) are recorded
                     // via record_protected, exempt from window trimming;
                     // when recording fails, the error text is recorded as a
@@ -973,8 +986,9 @@ impl ReActAgent {
 /// reimplementing any of that. See [`ToolRoundExecutor`] for a working
 /// example.
 pub struct ToolRoundCtx<'a> {
-    /// The run id (the correlation key carried by spans and events).
-    pub run_id: &'a str,
+    /// Run context (the run id is the correlation key carried by spans and
+    /// events).
+    pub context: &'a RunContext,
     /// The current round number (carried into the tool span).
     pub round: usize,
     /// The tool registry (call dispatch + protected declarations).
@@ -990,7 +1004,7 @@ impl fmt::Debug for ToolRoundCtx<'_> {
         // The observation channel is opaque (no Debug on the trait
         // object); finish_non_exhaustive marks the omission.
         f.debug_struct("ToolRoundCtx")
-            .field("run_id", &self.run_id)
+            .field("run_id", &self.context.run_id)
             .field("round", &self.round)
             .field("registry", &self.registry)
             .field("state", &self.state)
@@ -999,16 +1013,15 @@ impl fmt::Debug for ToolRoundCtx<'_> {
 }
 
 impl ToolRoundCtx<'_> {
-    /// Execute one tool call with the framework's standard mechanics and
+    /// Dispatch one tool call with the framework's standard mechanics and
     /// return its outcome.
     ///
     /// Call this for each call your policy decides to run: the call is
     /// dispatched to the registry (tool span + ToolStarted / ToolCompleted
-    /// events included), and the outcome carries the result text — a
-    /// tool's failure is **not** an error here, it rides along in
-    /// [`content`](ToolCallOutcome::content) — plus the protected flag the
-    /// agent needs for recording. What you yield is what the agent records
-    /// (and, on the streaming path, dispatches).
+    /// events included), and the outcome carries immediate output text, a
+    /// registry error text, or an effect request. Tool failures are **not**
+    /// errors here; they ride along in [`content`](ToolCallOutcome::content)
+    /// and are fed back to the model.
     ///
     /// Takes `&self` rather than `&mut self`: the mechanics are all shared
     /// borrows, so a policy can hold multiple `run` futures concurrently
@@ -1019,7 +1032,7 @@ impl ToolRoundCtx<'_> {
         // span is created while the run is on the stack (ambient parent on
         // both paths, see the span-construction comments), so the hierarchy
         // is correct automatically.
-        let tool_span = span_tool(self.run_id, self.round, &call.name);
+        let tool_span = span_tool(&self.context.run_id, self.round, &call.name);
         // Tool-started event (carries id / arguments; subscribers pair it
         // with ToolCompleted by id).
         self.publish(|| {
@@ -1034,35 +1047,26 @@ impl ToolRoundCtx<'_> {
         // Display) is recorded and fed back to the model.
         let result = self
             .registry
-            .call(&call.name, &call.arguments, self.state)
+            .call(&call, self.context, self.state)
             .instrument(tool_span.clone())
             .await;
         if let Err(e) = &result {
             tool_span.record("error", e.to_string());
         }
-        let content = match &result {
-            Ok(text) => text.clone(),
-            Err(e) => e.to_string(),
+        let outcome = match &result {
+            Ok(ToolResult::Output(output)) => ToolCallOutcome::output(call.clone(), output.clone()),
+            Ok(ToolResult::Effect(request)) => {
+                ToolCallOutcome::effect(call.clone(), request.clone())
+            }
+            Err(e) => ToolCallOutcome::text(call.clone(), e.to_string()),
         };
-        // The protected declaration is owned by the tool (skill bodies,
-        // etc.); the recorder uses it to choose between
-        // record / record_protected.
-        let protected = self
-            .registry
-            .get(&call.name)
-            .map(|tool| tool.protected_output())
-            .unwrap_or(false);
         let publish_tool_completed = {
             let id = call.id.clone();
             let name = call.name.clone();
             move || Arc::new(ReActEvent::ToolCompleted { id, name, result })
         };
         self.publish(publish_tool_completed);
-        ToolCallOutcome {
-            call,
-            content,
-            protected,
-        }
+        outcome
     }
 
     /// Publish an event (no-op when no channel is attached). Takes a
@@ -1135,11 +1139,7 @@ impl ToolRoundCtx<'_> {
 ///         Box::pin(async_stream::stream! {
 ///             for call in calls {
 ///                 if call.name == "dangerous" {
-///                     yield ToolCallOutcome {
-///                         call,
-///                         content: "denied by approval gate".into(),
-///                         protected: false,
-///                     };
+///                     yield ToolCallOutcome::text(call, "denied by approval gate");
 ///                 } else {
 ///                     yield ctx.run(call).await;
 ///                 }
@@ -1214,8 +1214,9 @@ impl ToolRoundExecutor for SerialToolRoundExecutor {
     }
 }
 
-/// The execution outcome of one tool call: the call info, the text fed
-/// back to the model, and the recording metadata.
+/// The outcome of one tool call dispatch: the call info, the text fed back
+/// to the model when immediately available, recording metadata, and an
+/// optional effect request.
 ///
 /// `run` produces outcomes; policies can also construct **synthetic**
 /// outcomes to feed a decision back to the model without running the tool
@@ -1233,20 +1234,54 @@ impl ToolRoundExecutor for SerialToolRoundExecutor {
 ///         arguments: "{}".into(),
 ///     },
 ///     content: "denied by approval gate".into(),
-///     protected: false,
+///     memory_policy: molo::ToolMemoryPolicy::Normal,
+///     effect: None,
 /// };
 /// ```
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ToolCallOutcome {
     /// The call as-is (with id / name / arguments, used for event pairing
     /// and locating the record).
     pub call: ToolCall,
     /// The text fed back (Ok result / Err's Display, visible to the model).
     pub content: String,
-    /// Whether the result is protected (declared by the tool via
-    /// [`Tool::protected_output`](crate::Tool::protected_output); protected
-    /// results are exempt from window trimming when recorded).
-    pub protected: bool,
+    /// Memory policy for the model-visible content.
+    pub memory_policy: ToolMemoryPolicy,
+    /// Effect request produced by the tool, when the tool requested a
+    /// governed side effect instead of immediate output.
+    pub effect: Option<EffectRequest>,
+}
+
+impl ToolCallOutcome {
+    /// Constructs an immediate text outcome.
+    pub fn text(call: ToolCall, content: impl Into<String>) -> Self {
+        Self::output(call, ToolOutput::text(content))
+    }
+
+    /// Constructs an immediate output outcome.
+    pub fn output(call: ToolCall, output: ToolOutput) -> Self {
+        Self {
+            call,
+            content: output.content,
+            memory_policy: output.memory_policy,
+            effect: None,
+        }
+    }
+
+    /// Constructs an effect outcome.
+    pub fn effect(call: ToolCall, request: EffectRequest) -> Self {
+        Self {
+            call,
+            content: String::new(),
+            memory_policy: ToolMemoryPolicy::Normal,
+            effect: Some(request),
+        }
+    }
+
+    /// Whether this outcome requests a governed effect.
+    pub fn effect_request(&self) -> Option<&EffectRequest> {
+        self.effect.as_ref()
+    }
 }
 
 impl ReActAgent {
@@ -1364,6 +1399,64 @@ struct RunExecution {
     metadata: RunMetadata,
 }
 
+struct ReActKernelState {
+    run_id: String,
+    started_at: Instant,
+    provider_model: Option<String>,
+    counters: RunCounters,
+    options: ModelOptions,
+    schemas: Vec<crate::tool::ToolSchema>,
+    validator: Option<StructuredValidator>,
+    tool_rounds: usize,
+    pending_tools: VecDeque<ToolCall>,
+    pending_tool_results: VecDeque<PendingToolResult>,
+    next_model_request: u64,
+}
+
+#[derive(Debug)]
+enum PendingToolResult {
+    Outcome(ToolCallOutcome),
+    Effect {
+        effect_id: String,
+        call: ToolCall,
+        observation: Option<EffectObservation>,
+    },
+}
+
+impl PendingToolResult {
+    fn effect_id(&self) -> Option<&str> {
+        match self {
+            Self::Outcome(_) => None,
+            Self::Effect { effect_id, .. } => Some(effect_id),
+        }
+    }
+}
+
+impl ReActKernelState {
+    fn next_model_request(&mut self, messages: Vec<Message>) -> AgentAction {
+        self.next_model_request += 1;
+        AgentAction::RequestModel {
+            request: ModelRequest::new(
+                format!("{}-model-{}", self.run_id, self.next_model_request),
+                ChatRequest {
+                    messages,
+                    tools: self.schemas.clone(),
+                    options: self.options.clone(),
+                },
+            ),
+        }
+    }
+
+    fn summary(&self, finish_reason: Option<FinishReason>) -> RunSummary {
+        run_summary(
+            &self.counters,
+            finish_reason,
+            self.started_at,
+            self.provider_model.clone(),
+        )
+    }
+}
+
 impl fmt::Debug for ReActAgent {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         // Provider / Memory are trait objects and can't be Debug'd; print
@@ -1421,6 +1514,432 @@ impl Agent for ReActAgent {
         context: RunContext,
     ) -> Result<BoxStream<'a, Result<MessageChunk, AgentError>>, AgentError> {
         self.run_stream_request_inner(request, context).await
+    }
+}
+
+#[async_trait::async_trait]
+impl AgentKernel for ReActAgent {
+    async fn start(
+        &mut self,
+        request: RunRequest,
+        context: &RunContext,
+    ) -> Result<AgentAction, AgentError> {
+        check_run_context(context)?;
+        let run_id = context.run_id.clone();
+        let input = request.input;
+        self.memory.record(input.clone().into_message()).await?;
+        self.publish(|| {
+            Arc::new(ReActEvent::RunStarted {
+                run_id: run_id.clone(),
+                input,
+            })
+        });
+
+        let options = request
+            .options
+            .clone()
+            .unwrap_or_else(|| self.config.options.clone());
+        let validator = options.structured.as_ref().map(|schema| {
+            StructuredValidator::new(schema.clone(), self.config.max_structured_retries)
+        });
+        let mut state = ReActKernelState {
+            run_id,
+            started_at: Instant::now(),
+            provider_model: self.provider.model().map(str::to_string),
+            counters: RunCounters::default(),
+            options,
+            schemas: self.registry.schemas(),
+            validator,
+            tool_rounds: 0,
+            pending_tools: VecDeque::new(),
+            pending_tool_results: VecDeque::new(),
+            next_model_request: 0,
+        };
+        state.counters.rounds += 1;
+        let messages = self.assemble_messages(self.memory.context().await?);
+        let action = state.next_model_request(messages);
+        self.kernel_state = Some(state);
+        Ok(action)
+    }
+
+    async fn observe(
+        &mut self,
+        observation: Observation,
+        context: &RunContext,
+    ) -> Result<AgentAction, AgentError> {
+        check_run_context(context)?;
+        match observation {
+            Observation::Model(observation) => self.observe_model(observation, context).await,
+            Observation::Effect(observation) => self.observe_effect(observation, context).await,
+            Observation::Effects(observations) => self.observe_effects(observations, context).await,
+        }
+    }
+}
+
+impl ReActAgent {
+    async fn observe_model(
+        &mut self,
+        observation: ModelObservation,
+        context: &RunContext,
+    ) -> Result<AgentAction, AgentError> {
+        let mut state = self.kernel_state.take().ok_or_else(|| {
+            AgentError::InvalidStep("model observation without active run".into())
+        })?;
+        if !state.pending_tool_results.is_empty() || !state.pending_tools.is_empty() {
+            self.kernel_state = Some(state);
+            return Err(AgentError::InvalidStep(
+                "model observation received while tool calls are pending".into(),
+            ));
+        }
+
+        let response = observation.response;
+        state.counters.usage_total += response.usage;
+        let finish_reason = response.finish_reason.clone();
+        let Message::Assistant {
+            content,
+            reasoning,
+            tool_calls,
+        } = response.message
+        else {
+            self.kernel_state = Some(state);
+            return Err(AgentError::Provider(ProviderError::Api {
+                status: 0,
+                message: "provider returned a non-assistant message".into(),
+            }));
+        };
+        if content.len() + reasoning.as_deref().map_or(0, str::len) > MAX_ROUND_TEXT {
+            self.kernel_state = Some(state);
+            return Err(AgentError::Provider(ProviderError::Api {
+                status: 0,
+                message: format!("round text exceeds size limit ({MAX_ROUND_TEXT} bytes)"),
+            }));
+        }
+
+        let final_message = Message::Assistant {
+            content: content.clone(),
+            reasoning: reasoning.clone(),
+            tool_calls: Vec::new(),
+        };
+        if !content.is_empty() || reasoning.is_some() || !tool_calls.is_empty() {
+            self.memory
+                .record(Message::Assistant {
+                    content: content.clone(),
+                    reasoning,
+                    tool_calls: tool_calls.clone(),
+                })
+                .await?;
+        }
+
+        if tool_calls.is_empty() {
+            if let Some(validator) = &mut state.validator {
+                match validator.validate(&content) {
+                    StructuredOutcome::Passed => {}
+                    StructuredOutcome::Retry { message } => {
+                        self.memory.record(message).await?;
+                        state.counters.rounds += 1;
+                        let messages = self.assemble_messages(self.memory.context().await?);
+                        let action = state.next_model_request(messages);
+                        self.kernel_state = Some(state);
+                        return Ok(action);
+                    }
+                    StructuredOutcome::Exhausted { max_retries } => {
+                        self.kernel_state = None;
+                        return Err(AgentError::StructuredRetriesExhausted(max_retries));
+                    }
+                }
+            }
+            let summary = state.summary(Some(finish_reason));
+            let output = RunOutput {
+                run_id: state.run_id.clone(),
+                answer: content,
+                summary: summary.clone(),
+                final_message,
+                artifacts: Vec::new(),
+                metadata: RunMetadata::new(),
+            };
+            publish_ended(&self.events, summary, None);
+            self.kernel_state = None;
+            return Ok(AgentAction::Respond { output });
+        }
+
+        if state.tool_rounds >= self.config.max_tool_rounds {
+            self.kernel_state = None;
+            return Err(AgentError::TooManyToolRounds(self.config.max_tool_rounds));
+        }
+        state.tool_rounds += 1;
+        state.counters.tool_calls_total += tool_calls.len();
+        state.pending_tools = VecDeque::from(tool_calls);
+        let action = self.process_kernel_pending_tools(state, context).await?;
+        Ok(action)
+    }
+
+    async fn observe_effect(
+        &mut self,
+        observation: EffectObservation,
+        context: &RunContext,
+    ) -> Result<AgentAction, AgentError> {
+        let mut state = self.kernel_state.take().ok_or_else(|| {
+            AgentError::InvalidStep("effect observation without active run".into())
+        })?;
+        let pending_effect_count = state
+            .pending_tool_results
+            .iter()
+            .filter(|result| result.effect_id().is_some())
+            .count();
+        if pending_effect_count > 1 {
+            self.kernel_state = Some(state);
+            return Err(AgentError::InvalidStep(
+                "single effect observation received while a batch is pending".into(),
+            ));
+        }
+        let Some(expected_effect_id) = state
+            .pending_tool_results
+            .iter()
+            .find_map(PendingToolResult::effect_id)
+            .map(str::to_string)
+        else {
+            self.kernel_state = Some(state);
+            return Err(AgentError::InvalidStep(
+                "effect observation received with no pending effect".into(),
+            ));
+        };
+        if observation.effect_id != expected_effect_id {
+            self.kernel_state = Some(state);
+            return Err(AgentError::InvalidStep(format!(
+                "effect observation id mismatch: expected {expected_effect_id}, got {}",
+                observation.effect_id
+            )));
+        }
+
+        if observation.output.observation_for_model.len() > MAX_ROUND_TEXT {
+            self.kernel_state = Some(state);
+            return Err(AgentError::Provider(ProviderError::Api {
+                status: 0,
+                message: format!("effect observation exceeds size limit ({MAX_ROUND_TEXT} bytes)"),
+            }));
+        }
+        let recorded = Self::mark_pending_effect_observed(
+            &mut state.pending_tool_results,
+            &expected_effect_id,
+            observation,
+        );
+        debug_assert!(recorded);
+        if let Err(error) = self.record_pending_tool_results(&mut state).await {
+            self.kernel_state = Some(state);
+            return Err(error);
+        }
+        self.process_kernel_pending_tools(state, context).await
+    }
+
+    async fn observe_effects(
+        &mut self,
+        observations: Vec<EffectObservation>,
+        context: &RunContext,
+    ) -> Result<AgentAction, AgentError> {
+        let mut state = self.kernel_state.take().ok_or_else(|| {
+            AgentError::InvalidStep("effect observations without active run".into())
+        })?;
+        let pending_effect_ids = state
+            .pending_tool_results
+            .iter()
+            .filter_map(PendingToolResult::effect_id)
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        if pending_effect_ids.is_empty() {
+            self.kernel_state = Some(state);
+            return Err(AgentError::InvalidStep(
+                "effect observations received with no pending effects".into(),
+            ));
+        }
+        if observations.len() != pending_effect_ids.len() {
+            let expected = pending_effect_ids.len();
+            self.kernel_state = Some(state);
+            return Err(AgentError::InvalidStep(format!(
+                "effect observation count mismatch: expected {expected}, got {}",
+                observations.len()
+            )));
+        }
+
+        let expected_ids = pending_effect_ids.iter().cloned().collect::<HashSet<_>>();
+        let mut observations_by_id = HashMap::with_capacity(observations.len());
+        for observation in observations {
+            if observation.output.observation_for_model.len() > MAX_ROUND_TEXT {
+                self.kernel_state = Some(state);
+                return Err(AgentError::Provider(ProviderError::Api {
+                    status: 0,
+                    message: format!(
+                        "effect observation exceeds size limit ({MAX_ROUND_TEXT} bytes)"
+                    ),
+                }));
+            }
+            if !expected_ids.contains(&observation.effect_id) {
+                let effect_id = observation.effect_id;
+                self.kernel_state = Some(state);
+                return Err(AgentError::InvalidStep(format!(
+                    "unexpected effect observation for {effect_id}"
+                )));
+            }
+
+            let effect_id = observation.effect_id.clone();
+            if observations_by_id
+                .insert(effect_id.clone(), observation)
+                .is_some()
+            {
+                self.kernel_state = Some(state);
+                return Err(AgentError::InvalidStep(format!(
+                    "duplicate effect observation for {effect_id}"
+                )));
+            }
+        }
+        for effect_id in &pending_effect_ids {
+            if !observations_by_id.contains_key(effect_id) {
+                self.kernel_state = Some(state);
+                return Err(AgentError::InvalidStep(format!(
+                    "missing effect observation for {effect_id}"
+                )));
+            }
+        }
+
+        for effect_id in pending_effect_ids {
+            let observation = observations_by_id
+                .remove(&effect_id)
+                .expect("effect observation was prevalidated");
+            let recorded = Self::mark_pending_effect_observed(
+                &mut state.pending_tool_results,
+                &effect_id,
+                observation,
+            );
+            debug_assert!(recorded);
+        }
+        if let Err(error) = self.record_pending_tool_results(&mut state).await {
+            self.kernel_state = Some(state);
+            return Err(error);
+        }
+        self.process_kernel_pending_tools(state, context).await
+    }
+
+    fn mark_pending_effect_observed(
+        pending_tool_results: &mut VecDeque<PendingToolResult>,
+        expected_effect_id: &str,
+        observation: EffectObservation,
+    ) -> bool {
+        for result in pending_tool_results {
+            let PendingToolResult::Effect {
+                effect_id,
+                observation: pending_observation,
+                ..
+            } = result
+            else {
+                continue;
+            };
+            if effect_id == expected_effect_id {
+                *pending_observation = Some(observation);
+                return true;
+            }
+        }
+        false
+    }
+
+    async fn record_pending_tool_results(
+        &mut self,
+        state: &mut ReActKernelState,
+    ) -> Result<(), AgentError> {
+        while let Some(outcome) =
+            state
+                .pending_tool_results
+                .front()
+                .and_then(|pending| match pending {
+                    PendingToolResult::Outcome(outcome) => Some(outcome.clone()),
+                    PendingToolResult::Effect {
+                        call,
+                        observation: Some(observation),
+                        ..
+                    } => Some(Self::effect_observation_outcome(
+                        call.clone(),
+                        observation.clone(),
+                    )),
+                    PendingToolResult::Effect {
+                        observation: None, ..
+                    } => None,
+                })
+        {
+            record_tool_result(&mut self.memory, &outcome).await?;
+            state.pending_tool_results.pop_front();
+        }
+        Ok(())
+    }
+
+    fn effect_observation_outcome(
+        call: ToolCall,
+        observation: EffectObservation,
+    ) -> ToolCallOutcome {
+        ToolCallOutcome {
+            call,
+            content: observation.output.observation_for_model,
+            memory_policy: observation.output.memory_policy,
+            effect: None,
+        }
+    }
+
+    async fn process_kernel_pending_tools(
+        &mut self,
+        mut state: ReActKernelState,
+        context: &RunContext,
+    ) -> Result<AgentAction, AgentError> {
+        let mut effects = Vec::new();
+        let mut effect_ids = HashSet::new();
+        while let Some(call) = state.pending_tools.pop_front() {
+            let ctx = ToolRoundCtx {
+                context,
+                round: state.counters.rounds,
+                registry: &self.registry,
+                state: &self.state,
+                events: &self.events,
+            };
+            let outcome = ctx.run(call).await;
+            if let Some(effect) = outcome.effect_request().cloned() {
+                if !effect_ids.insert(effect.id.clone()) {
+                    return Err(AgentError::InvalidStep(format!(
+                        "duplicate effect request id: {}",
+                        effect.id
+                    )));
+                }
+                state
+                    .pending_tool_results
+                    .push_back(PendingToolResult::Effect {
+                        effect_id: effect.id.clone(),
+                        call: outcome.call.clone(),
+                        observation: None,
+                    });
+                effects.push(effect);
+                continue;
+            }
+            state
+                .pending_tool_results
+                .push_back(PendingToolResult::Outcome(outcome));
+        }
+        if let Err(error) = self.record_pending_tool_results(&mut state).await {
+            self.kernel_state = Some(state);
+            return Err(error);
+        }
+        if !effects.is_empty() {
+            self.kernel_state = Some(state);
+            return if effects.len() == 1 {
+                let request = effects
+                    .pop()
+                    .expect("single effect request must be present");
+                Ok(AgentAction::RequestEffect { request })
+            } else {
+                Ok(AgentAction::RequestEffects { requests: effects })
+            };
+        }
+
+        check_run_context(context)?;
+        state.counters.rounds += 1;
+        let messages = self.assemble_messages(self.memory.context().await?);
+        let action = state.next_model_request(messages);
+        self.kernel_state = Some(state);
+        Ok(action)
     }
 }
 
@@ -1601,7 +2120,7 @@ async fn record_tool_result(
     outcome: &ToolCallOutcome,
 ) -> Result<(), AgentError> {
     let message = Message::tool_result(outcome.call.id.clone(), outcome.content.clone());
-    let record_result = if outcome.protected {
+    let record_result = if outcome.memory_policy.is_protected() {
         memory.record_protected(message).await
     } else {
         memory.record(message).await
@@ -1613,7 +2132,7 @@ async fn record_tool_result(
                 outcome.call.id.clone(),
                 format!("memory record failed: {e}"),
             );
-            let _ = if outcome.protected {
+            let _ = if outcome.memory_policy.is_protected() {
                 memory.record_protected(fallback).await
             } else {
                 memory.record(fallback).await
@@ -2129,7 +2648,7 @@ impl ReActAgent {
                 tool_calls_total += calls.len();
                 tool_rounds += 1;
                 let ctx = ToolRoundCtx {
-                    run_id: &run_id,
+                    context: &context,
                     round: rounds,
                     registry: &self.registry,
                     state: &self.state,
@@ -2137,6 +2656,26 @@ impl ReActAgent {
                 };
                 let mut outcomes = self.executor.execute_round(ctx, calls).await;
                 while let Some(outcome) = outcomes.next().await {
+                    if let Some(effect) = outcome.effect_request() {
+                        let summary = run_summary_from_parts(
+                            rounds,
+                            tool_calls_total,
+                            usage_total,
+                            None,
+                            started_at,
+                            provider_model.clone(),
+                        );
+                        yield stream_end(
+                            &self.events,
+                            &run_span,
+                            summary,
+                            AgentError::EffectRequiresHarness(format!(
+                                "{} ({})",
+                                effect.description, effect.id
+                            )),
+                        );
+                        break 'rounds;
+                    }
                     yield Ok(MessageChunk::ToolResult {
                         id: outcome.call.id.clone(),
                         name: outcome.call.name.clone(),
@@ -2246,13 +2785,14 @@ impl<S: futures::Stream> futures::Stream for SpanStream<S> {
 mod tests {
     use super::*;
     use crate::CancellationToken;
+    use crate::effect::{EffectKind, EffectObservation, EffectRequest};
     use crate::memory::MemoryError;
     use crate::message::ContentBlock;
     use crate::provider::{
         ChatResponse, FakeProvider, FakeReply, FinishReason, ModelOptions, ProviderError,
         StreamEvent, TimeoutStage,
     };
-    use crate::tool::{Tool, ToolError, ToolSchema};
+    use crate::tool::{Tool, ToolContext, ToolError, ToolOutput, ToolResult, ToolSchema};
     use futures::StreamExt;
     use serde::Deserialize;
     use std::sync::Arc;
@@ -2319,20 +2859,55 @@ mod tests {
     #[async_trait::async_trait]
     impl Tool for FakeTool {
         fn schema(&self) -> ToolSchema {
-            ToolSchema {
-                name: self.name.into(),
-                description: "Test tool".into(),
-                parameters: serde_json::json!({}),
-            }
+            ToolSchema::new(self.name, "Test tool", serde_json::json!({}))
         }
 
         async fn call(
             &self,
             _arguments: serde_json::Value,
-            _state: &SharedState,
-        ) -> Result<String, ToolError> {
+            _context: ToolContext<'_>,
+        ) -> Result<ToolResult, ToolError> {
             self.calls.fetch_add(1, Ordering::Relaxed);
-            Ok(self.result.to_string())
+            Ok(ToolOutput::text(self.result).into())
+        }
+    }
+
+    #[derive(Debug, Clone)]
+    struct EffectTool {
+        name: &'static str,
+        effect_id: &'static str,
+        description: &'static str,
+    }
+
+    impl EffectTool {
+        fn new(name: &'static str, effect_id: &'static str, description: &'static str) -> Self {
+            Self {
+                name,
+                effect_id,
+                description,
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Tool for EffectTool {
+        fn schema(&self) -> ToolSchema {
+            ToolSchema::new(self.name, "Effect tool", serde_json::json!({}))
+        }
+
+        async fn call(
+            &self,
+            _arguments: serde_json::Value,
+            _context: ToolContext<'_>,
+        ) -> Result<ToolResult, ToolError> {
+            Ok(ToolResult::Effect(
+                EffectRequest::new(
+                    EffectKind::Custom("test.effect".into()),
+                    self.description,
+                    serde_json::json!({}),
+                )
+                .with_id(self.effect_id),
+            ))
         }
     }
 
@@ -2742,18 +3317,14 @@ mod tests {
         #[async_trait::async_trait]
         impl Tool for Echo {
             fn schema(&self) -> ToolSchema {
-                ToolSchema {
-                    name: "echo".into(),
-                    description: "Echo".into(),
-                    parameters: serde_json::json!({}),
-                }
+                ToolSchema::new("echo", "Echo", serde_json::json!({}))
             }
             async fn call(
                 &self,
                 _arguments: serde_json::Value,
-                _state: &SharedState,
-            ) -> Result<String, ToolError> {
-                Ok("echo".into())
+                _context: ToolContext<'_>,
+            ) -> Result<ToolResult, ToolError> {
+                Ok(ToolOutput::text("echo").into())
             }
         }
 
@@ -2794,17 +3365,13 @@ mod tests {
         #[async_trait::async_trait]
         impl Tool for FailingTool {
             fn schema(&self) -> ToolSchema {
-                ToolSchema {
-                    name: "boom".into(),
-                    description: "Tool that always fails".into(),
-                    parameters: serde_json::json!({}),
-                }
+                ToolSchema::new("boom", "Tool that always fails", serde_json::json!({}))
             }
             async fn call(
                 &self,
                 _arguments: serde_json::Value,
-                _state: &SharedState,
-            ) -> Result<String, ToolError> {
+                _context: ToolContext<'_>,
+            ) -> Result<ToolResult, ToolError> {
                 Err(ToolError::Execution("internal error".into()))
             }
         }
@@ -2962,17 +3529,13 @@ mod tests {
         #[async_trait::async_trait]
         impl Tool for FailingTool {
             fn schema(&self) -> ToolSchema {
-                ToolSchema {
-                    name: "boom".into(),
-                    description: "Tool that always fails".into(),
-                    parameters: serde_json::json!({}),
-                }
+                ToolSchema::new("boom", "Tool that always fails", serde_json::json!({}))
             }
             async fn call(
                 &self,
                 _arguments: serde_json::Value,
-                _state: &SharedState,
-            ) -> Result<String, ToolError> {
+                _context: ToolContext<'_>,
+            ) -> Result<ToolResult, ToolError> {
                 Err(ToolError::Execution("internal error".into()))
             }
         }
@@ -3403,19 +3966,16 @@ mod tests {
         #[async_trait::async_trait]
         impl Tool for CounterTool {
             fn schema(&self) -> ToolSchema {
-                ToolSchema {
-                    name: "counter".into(),
-                    description: "Count".into(),
-                    parameters: serde_json::json!({}),
-                }
+                ToolSchema::new("counter", "Count", serde_json::json!({}))
             }
             async fn call(
                 &self,
                 _arguments: serde_json::Value,
-                state: &SharedState,
-            ) -> Result<String, ToolError> {
+                context: ToolContext<'_>,
+            ) -> Result<ToolResult, ToolError> {
+                let state = context.state;
                 state.with_mut::<usize>(|n| *n += 1);
-                Ok(format!("count={}", state.get::<usize>().unwrap_or(0)))
+                Ok(ToolOutput::text(format!("count={}", state.get::<usize>().unwrap_or(0))).into())
             }
         }
 
@@ -4051,20 +4611,16 @@ mod tests {
         #[async_trait::async_trait]
         impl Tool for SlowTool {
             fn schema(&self) -> ToolSchema {
-                ToolSchema {
-                    name: "slow".into(),
-                    description: "Slow tool".into(),
-                    parameters: serde_json::json!({}),
-                }
+                ToolSchema::new("slow", "Slow tool", serde_json::json!({}))
             }
             async fn call(
                 &self,
                 _arguments: serde_json::Value,
-                _state: &SharedState,
-            ) -> Result<String, ToolError> {
+                _context: ToolContext<'_>,
+            ) -> Result<ToolResult, ToolError> {
                 self.calls.fetch_add(1, Ordering::Relaxed);
                 tokio::time::sleep(Duration::from_millis(100)).await;
-                Ok("42".into())
+                Ok(ToolOutput::text("42").into())
             }
         }
 
@@ -4137,7 +4693,8 @@ mod tests {
                         outcomes.push(ToolCallOutcome {
                             call,
                             content: "denied by policy".into(),
-                            protected: false,
+                            memory_policy: ToolMemoryPolicy::Normal,
+                            effect: None,
                         });
                     } else {
                         outcomes.push(ctx.run(call).await);
@@ -4236,6 +4793,280 @@ mod tests {
                 ("c1".to_string(), "A".to_string())
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn kernel_batches_effect_requests_from_same_round() {
+        let mut registry = ToolRegistry::new();
+        registry
+            .register(EffectTool::new("read_a", "effect-a", "read A"))
+            .register(EffectTool::new("read_b", "effect-b", "read B"));
+        let fake = SharedFake::new([
+            FakeReply::ToolCalls {
+                content: "".into(),
+                calls: vec![call("c1", "read_a", "{}"), call("c2", "read_b", "{}")],
+            },
+            FakeReply::Text("done".into()),
+        ]);
+        let mut agent = agent_with_registry(fake.clone(), registry, AgentConfig::default());
+        let context = RunContext::new("kernel-batch-effects");
+
+        let action = agent
+            .start(RunRequest::text("read both"), &context)
+            .await
+            .unwrap();
+        let AgentAction::RequestModel { request } = action else {
+            panic!("expected initial model request");
+        };
+        let action = agent
+            .observe(
+                Observation::Model(ModelObservation::new(
+                    request.id,
+                    fake.chat(request.chat).await.unwrap(),
+                )),
+                &context,
+            )
+            .await
+            .unwrap();
+        let AgentAction::RequestEffects { requests } = action else {
+            panic!("expected batch effect request");
+        };
+        assert_eq!(
+            requests
+                .iter()
+                .map(|request| request.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["effect-a", "effect-b"]
+        );
+        assert_eq!(
+            requests
+                .iter()
+                .map(|request| request.source.tool_call_id.as_deref())
+                .collect::<Vec<_>>(),
+            vec![Some("c1"), Some("c2")]
+        );
+
+        // Harnesses may execute in parallel; observations are matched by id
+        // and recorded back in the model's tool-call order.
+        let action = agent
+            .observe(
+                Observation::Effects(vec![
+                    EffectObservation::succeeded("effect-b", "observed B"),
+                    EffectObservation::succeeded("effect-a", "observed A"),
+                ]),
+                &context,
+            )
+            .await
+            .unwrap();
+        let AgentAction::RequestModel { request } = action else {
+            panic!("expected next model request");
+        };
+        assert!(matches!(
+            &request.chat.messages[2],
+            Message::ToolResult { id, content } if id == "c1" && content == "observed A"
+        ));
+        assert!(matches!(
+            &request.chat.messages[3],
+            Message::ToolResult { id, content } if id == "c2" && content == "observed B"
+        ));
+
+        let action = agent
+            .observe(
+                Observation::Model(ModelObservation::new(
+                    request.id,
+                    fake.chat(request.chat).await.unwrap(),
+                )),
+                &context,
+            )
+            .await
+            .unwrap();
+        let AgentAction::Respond { output } = action else {
+            panic!("expected final response");
+        };
+        assert_eq!(output.answer, "done");
+    }
+
+    #[tokio::test]
+    async fn kernel_records_mixed_outputs_and_effects_in_tool_call_order() {
+        let mut registry = ToolRegistry::new();
+        registry
+            .register(FakeTool::new("before", "plain before").0)
+            .register(EffectTool::new("read", "effect-read", "read"))
+            .register(FakeTool::new("after", "plain after").0);
+        let fake = SharedFake::new([
+            FakeReply::ToolCalls {
+                content: "".into(),
+                calls: vec![
+                    call("c1", "before", "{}"),
+                    call("c2", "read", "{}"),
+                    call("c3", "after", "{}"),
+                ],
+            },
+            FakeReply::Text("done".into()),
+        ]);
+        let mut agent = agent_with_registry(fake.clone(), registry, AgentConfig::default());
+        let context = RunContext::new("kernel-mixed-effects");
+
+        let AgentAction::RequestModel { request } = agent
+            .start(RunRequest::text("read with context"), &context)
+            .await
+            .unwrap()
+        else {
+            panic!("expected initial model request");
+        };
+        let AgentAction::RequestEffect { request } = agent
+            .observe(
+                Observation::Model(ModelObservation::new(
+                    request.id,
+                    fake.chat(request.chat).await.unwrap(),
+                )),
+                &context,
+            )
+            .await
+            .unwrap()
+        else {
+            panic!("expected single effect request");
+        };
+        assert_eq!(request.id, "effect-read");
+
+        let action = agent
+            .observe(
+                Observation::Effect(EffectObservation::succeeded("effect-read", "observed read")),
+                &context,
+            )
+            .await
+            .unwrap();
+        let AgentAction::RequestModel { request } = action else {
+            panic!("expected next model request");
+        };
+        assert!(matches!(
+            &request.chat.messages[2],
+            Message::ToolResult { id, content } if id == "c1" && content == "plain before"
+        ));
+        assert!(matches!(
+            &request.chat.messages[3],
+            Message::ToolResult { id, content } if id == "c2" && content == "observed read"
+        ));
+        assert!(matches!(
+            &request.chat.messages[4],
+            Message::ToolResult { id, content } if id == "c3" && content == "plain after"
+        ));
+    }
+
+    #[tokio::test]
+    async fn kernel_rejects_partial_effect_batch_observation() {
+        let mut registry = ToolRegistry::new();
+        registry
+            .register(EffectTool::new("read_a", "effect-a", "read A"))
+            .register(EffectTool::new("read_b", "effect-b", "read B"));
+        let fake = SharedFake::new([FakeReply::ToolCalls {
+            content: "".into(),
+            calls: vec![call("c1", "read_a", "{}"), call("c2", "read_b", "{}")],
+        }]);
+        let mut agent = agent_with_registry(fake.clone(), registry, AgentConfig::default());
+        let context = RunContext::new("kernel-batch-effects-partial");
+
+        let AgentAction::RequestModel { request } = agent
+            .start(RunRequest::text("read both"), &context)
+            .await
+            .unwrap()
+        else {
+            panic!("expected initial model request");
+        };
+        let AgentAction::RequestEffects { .. } = agent
+            .observe(
+                Observation::Model(ModelObservation::new(
+                    request.id,
+                    fake.chat(request.chat).await.unwrap(),
+                )),
+                &context,
+            )
+            .await
+            .unwrap()
+        else {
+            panic!("expected batch effect request");
+        };
+        let err = agent
+            .observe(
+                Observation::Effects(vec![EffectObservation::succeeded("effect-a", "observed A")]),
+                &context,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, AgentError::InvalidStep(message) if message.contains("count mismatch"))
+        );
+    }
+
+    #[tokio::test]
+    async fn kernel_rejects_duplicate_effect_batch_observation_and_can_retry() {
+        let mut registry = ToolRegistry::new();
+        registry
+            .register(EffectTool::new("read_a", "effect-a", "read A"))
+            .register(EffectTool::new("read_b", "effect-b", "read B"));
+        let fake = SharedFake::new([
+            FakeReply::ToolCalls {
+                content: "".into(),
+                calls: vec![call("c1", "read_a", "{}"), call("c2", "read_b", "{}")],
+            },
+            FakeReply::Text("done".into()),
+        ]);
+        let mut agent = agent_with_registry(fake.clone(), registry, AgentConfig::default());
+        let context = RunContext::new("kernel-batch-effects-duplicate");
+
+        let AgentAction::RequestModel { request } = agent
+            .start(RunRequest::text("read both"), &context)
+            .await
+            .unwrap()
+        else {
+            panic!("expected initial model request");
+        };
+        let AgentAction::RequestEffects { .. } = agent
+            .observe(
+                Observation::Model(ModelObservation::new(
+                    request.id,
+                    fake.chat(request.chat).await.unwrap(),
+                )),
+                &context,
+            )
+            .await
+            .unwrap()
+        else {
+            panic!("expected batch effect request");
+        };
+        let err = agent
+            .observe(
+                Observation::Effects(vec![
+                    EffectObservation::succeeded("effect-a", "observed A"),
+                    EffectObservation::succeeded("effect-a", "observed A again"),
+                ]),
+                &context,
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, AgentError::InvalidStep(message) if message.contains("duplicate")));
+
+        let action = agent
+            .observe(
+                Observation::Effects(vec![
+                    EffectObservation::succeeded("effect-b", "observed B"),
+                    EffectObservation::succeeded("effect-a", "observed A"),
+                ]),
+                &context,
+            )
+            .await
+            .unwrap();
+        let AgentAction::RequestModel { request } = action else {
+            panic!("expected next model request");
+        };
+        assert!(matches!(
+            &request.chat.messages[2],
+            Message::ToolResult { id, content } if id == "c1" && content == "observed A"
+        ));
+        assert!(matches!(
+            &request.chat.messages[3],
+            Message::ToolResult { id, content } if id == "c2" && content == "observed B"
+        ));
     }
 
     /// Mid-stream cancellation: already-dispatched Deltas are kept, a
@@ -4402,7 +5233,7 @@ mod tests {
         match react_event(&*events[2]) {
             // ToolCompleted: Ok carries the result text.
             ReActEvent::ToolCompleted { result, .. } => {
-                assert_eq!(result, &Ok("42".to_string()));
+                assert_eq!(result, &Ok(ToolOutput::text("42").into()));
             }
             _ => panic!("expected ToolCompleted"),
         }
@@ -5044,17 +5875,13 @@ mod tests {
         #[async_trait::async_trait]
         impl Tool for FailingTool {
             fn schema(&self) -> ToolSchema {
-                ToolSchema {
-                    name: "boom".into(),
-                    description: "Tool that always fails".into(),
-                    parameters: serde_json::json!({}),
-                }
+                ToolSchema::new("boom", "Tool that always fails", serde_json::json!({}))
             }
             async fn call(
                 &self,
                 _arguments: serde_json::Value,
-                _state: &SharedState,
-            ) -> Result<String, ToolError> {
+                _context: ToolContext<'_>,
+            ) -> Result<ToolResult, ToolError> {
                 Err(ToolError::Execution("internal error".into()))
             }
         }

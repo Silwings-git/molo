@@ -122,6 +122,7 @@
 //!   text is passed back to the model, which decides what to do next.
 
 pub mod agent;
+pub mod effect;
 pub mod event_channel;
 pub mod mcp;
 pub mod memory;
@@ -144,8 +145,13 @@ pub use async_trait::async_trait;
 pub use molo_macros::tool;
 
 pub use agent::{
-    Agent, AgentConfig, AgentError, AgentEvent, CancellableAgent, MessageChunk, ReActAgent,
-    ReActEvent, StructuredOutcome, StructuredValidator, TypedAgent,
+    Agent, AgentAction, AgentConfig, AgentError, AgentEvent, AgentKernel, CancellableAgent,
+    MessageChunk, ModelObservation, ModelRequest, Observation, ReActAgent, ReActEvent,
+    StructuredOutcome, StructuredValidator, TypedAgent,
+};
+pub use effect::{
+    DisplayFormat, DisplayOutput, EffectKind, EffectObservation, EffectOutput, EffectRequest,
+    EffectSource, EffectStatus, RiskLevel,
 };
 pub use event_channel::{BroadcastEventChannel, EventChannel, EventReceiver, MpscEventChannel};
 pub use mcp::{McpClient, McpError, McpTool};
@@ -168,7 +174,8 @@ pub use run::{
 };
 pub use skill::{AllowedTool, LoadSkillTool, Skill, SkillError, SkillRegistry};
 pub use tool::{
-    MissingTools, RegistryError, SharedState, Tool, ToolError, ToolRegistry, ToolSchema,
+    MissingTools, RegistryError, SharedState, SideEffectLevel, Tool, ToolContext, ToolError,
+    ToolMemoryPolicy, ToolOutput, ToolPolicy, ToolRegistry, ToolResult, ToolSchema,
 };
 
 // Cooperative cancellation primitive (a standard tokio-util component):

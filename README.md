@@ -140,10 +140,11 @@ root re-exports each module's core items, so `use molo::...` covers most cases:
 
 | Concept | What it does | Key types |
 | --- | --- | --- |
-| Agent | the reasoning loop | `Agent`, `ReActAgent`, `react_agent!`, `TypedAgent`, `CancellableAgent` |
+| Agent | the reasoning loop | `Agent`, `AgentKernel`, `AgentAction`, `ReActAgent`, `react_agent!`, `TypedAgent`, `CancellableAgent` |
 | Provider | LLM communication | `Provider`, `OpenAiProvider`, `RetryProvider`, `FakeProvider` |
 | Memory | context management | `Memory`, `InMemoryMemory`, `WindowMemory`, `SummarizeStrategy` |
-| Tool | external capabilities | `Tool`, `ToolRegistry`, `SharedState`, `#[molo::tool]` |
+| Tool | model-visible capabilities | `Tool`, `ToolSchema`, `ToolPolicy`, `ToolOutput`, `ToolResult`, `ToolRegistry`, `SharedState`, `#[molo::tool]` |
+| Effect | side-effect boundary | `EffectRequest`, `EffectObservation`, `EffectKind`, `RiskLevel` |
 | Skill | capability packs (Agent Skills protocol) | `Skill`, `SkillRegistry`, `LoadSkillTool` |
 | MCP | external tool servers | `McpClient`, `McpTool` |
 | Message | conversation model | `Message`, `ContentBlock`, `ToolCall` |
@@ -170,7 +171,8 @@ root re-exports each module's core items, so `use molo::...` covers most cases:
 ### Tools: one-shot definition with `#[molo::tool]`
 
 Writing a tool by hand takes ~25 lines of boilerplate; the macro generates the
-struct, schema, argument parsing, and error conversion from an async function:
+struct, schema, argument parsing, output wrapping, and error conversion from an
+async function:
 
 ```rust
 use molo::tool::{SharedState, ToolError};
@@ -186,6 +188,15 @@ async fn calculator(args: CalcArgs) -> Result<String, ToolError> {
 A failed tool call does **not** abort the loop — the error text is fed back to
 the model, which decides what to do next. `SharedState` lets tools share typed
 state; it is injected at call time.
+
+Hand-written tools return `ToolResult`: pure tools produce
+`ToolOutput::text(...).into()`, while side-effecting tools return an
+`EffectRequest` for an outer harness to govern and execute. The high-level
+`Agent` helpers do not execute effects; use the step-wise `AgentKernel`
+boundary when an application needs to drive model requests and effect
+observations itself. Multiple effect requests from one step are surfaced as
+`AgentAction::RequestEffects` and completed with `Observation::Effects`, so a
+harness can choose sequential or parallel execution.
 
 ### Typed (structured) output
 

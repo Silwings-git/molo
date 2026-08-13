@@ -1718,11 +1718,11 @@ mod tests {
 
     #[test]
     fn serializes_tool_defs() {
-        let schema = ToolSchema {
-            name: "calculator".into(),
-            description: "Evaluate expressions".into(),
-            parameters: json!({"type": "object"}),
-        };
+        let schema = ToolSchema::new(
+            "calculator",
+            "Evaluate expressions",
+            json!({"type": "object"}),
+        );
         let def = OpenAiToolDef::from_schema(&schema);
         assert_eq!(
             serde_json::to_value(&def).unwrap(),
