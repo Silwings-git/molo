@@ -43,7 +43,10 @@ use molo::agent::{Agent, AgentError};
 use molo::memory::InMemoryMemory;
 use molo::provider::OpenAiProvider;
 use molo::tool::{SharedState, Tool, ToolError, ToolSchema};
-use molo::{ChatRequest, Memory, Message, MessageChunk, Provider, StreamEvent, ToolCall};
+use molo::{
+    ChatRequest, Memory, Message, MessageChunk, Provider, RunContext, RunMetadata, RunOutput,
+    RunRequest, RunSummary, StreamEvent, ToolCall,
+};
 
 use schemars::JsonSchema;
 use serde::Deserialize;
@@ -97,8 +100,12 @@ struct CalculatorAgent {
 
 #[async_trait::async_trait]
 impl Agent for CalculatorAgent {
-    async fn run(&mut self, input: &str) -> Result<String, AgentError> {
-        self.memory.record(Message::user(input)).await?;
+    async fn run_request_with_context(
+        &mut self,
+        request: RunRequest,
+        context: RunContext,
+    ) -> Result<RunOutput, AgentError> {
+        self.memory.record(request.input.into_message()).await?;
 
         // Tool definitions are the same every round, so compute them once; the model decides whether to call a tool based on them.
         let schemas: Vec<ToolSchema> = self.tools.iter().map(|t| t.schema()).collect();
@@ -136,7 +143,7 @@ impl Agent for CalculatorAgent {
             }
 
             if tool_calls.is_empty() {
-                return Ok(content); // the model answered directly
+                return Ok(run_output(context.run_id, content)); // the model answered directly
             }
 
             // Tool round: execute every requested call, then feed each result back right after.
@@ -304,6 +311,17 @@ impl Agent for CalculatorAgent {
             },
         );
         Ok(Box::pin(stream))
+    }
+}
+
+fn run_output(run_id: String, answer: String) -> RunOutput {
+    RunOutput {
+        run_id,
+        answer: answer.clone(),
+        summary: RunSummary::default(),
+        final_message: Message::assistant(answer),
+        artifacts: Vec::new(),
+        metadata: RunMetadata::new(),
     }
 }
 

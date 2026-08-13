@@ -144,7 +144,9 @@ mod tests {
 
     fn input_of(ev: &dyn AgentEvent) -> &str {
         match ev.as_any().downcast_ref::<ReActEvent>() {
-            Some(ReActEvent::RunStarted { input, .. }) => input.as_str(),
+            Some(ReActEvent::RunStarted { input, .. }) => {
+                input.as_text().expect("test event uses text input")
+            }
             _ => panic!("test event must be RunStarted"),
         }
     }

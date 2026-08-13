@@ -32,11 +32,17 @@
 //! use molo::{react_agent, Agent, FakeProvider, FakeReply};
 //!
 //! let mut agent = react_agent!(
-//!     FakeProvider::new([FakeReply::Text("Hello".into())]),
+//!     FakeProvider::new([
+//!         FakeReply::Text("Hello".into()),
+//!         FakeReply::Text("Hello again".into()),
+//!     ]),
 //!     "You are a helpful assistant",
 //! );
 //! let answer = agent.run("hi").await?;
 //! assert_eq!(answer, "Hello");
+//!
+//! let output = agent.run_request(molo::RunRequest::text("hi again")).await?;
+//! assert_eq!(output.answer, "Hello again");
 //! # Ok(())
 //! # }
 //! ```
@@ -58,10 +64,13 @@ pub use structured::{
 pub use sub_agent::{PoolError, SubAgentPool, SubAgentTool};
 
 use crate::memory::MemoryError;
-use crate::provider::{ProviderError, Usage};
+use crate::provider::ProviderError;
+use crate::run::{RunContext, RunOutput, RunRequest, TypedRunOutput};
 use futures::stream::BoxStream;
 use std::fmt;
 use tokio_util::sync::CancellationToken;
+
+pub use crate::run::RunSummary;
 
 /// Reasoning-loop interface: one `run` takes the user input, drives the
 /// reasoning loop, and returns the final answer.
@@ -76,8 +85,7 @@ use tokio_util::sync::CancellationToken;
 /// [`MessageChunk::Done`]).
 #[async_trait::async_trait]
 pub trait Agent {
-    /// One run: record the user input, drive the reasoning loop, and return
-    /// the model's final answer as text.
+    /// One structured run with caller-provided execution context.
     ///
     /// # Errors
     ///
@@ -86,31 +94,63 @@ pub trait Agent {
     /// [`AgentError::TooManyToolRounds`] when the model keeps requesting
     /// tools beyond [`AgentConfig::max_tool_rounds`] without a final answer;
     /// [`AgentError::Cancelled`] when the run is cooperatively cancelled
-    /// (the passed [`CancellationToken`] is requested).
-    async fn run(&mut self, input: &str) -> Result<String, AgentError>;
+    /// (the passed [`CancellationToken`] is requested);
+    /// [`AgentError::DeadlineExceeded`] when the run-level deadline elapses.
+    async fn run_request_with_context(
+        &mut self,
+        request: RunRequest,
+        context: RunContext,
+    ) -> Result<RunOutput, AgentError>;
+
+    /// One structured run with a generated [`RunContext`].
+    async fn run_request(&mut self, request: RunRequest) -> Result<RunOutput, AgentError> {
+        self.run_request_with_context(request, RunContext::generated())
+            .await
+    }
+
+    /// One run: record the user input, drive the reasoning loop, and return
+    /// the model's final answer as text.
+    async fn run(&mut self, input: &str) -> Result<String, AgentError> {
+        Ok(self.run_request(RunRequest::text(input)).await?.answer)
+    }
+
+    /// Streaming structured run with caller-provided execution context.
+    async fn run_stream_request_with_context<'a>(
+        &'a mut self,
+        request: RunRequest,
+        context: RunContext,
+    ) -> Result<BoxStream<'a, Result<MessageChunk, AgentError>>, AgentError> {
+        let output = self.run_request_with_context(request, context).await?;
+        Ok(Box::pin(futures::stream::iter([
+            Ok(MessageChunk::Delta(output.answer)),
+            Ok(MessageChunk::Done(output.summary)),
+        ])))
+    }
+
+    /// Streaming structured run with a generated [`RunContext`].
+    async fn run_stream_request<'a>(
+        &'a mut self,
+        request: RunRequest,
+    ) -> Result<BoxStream<'a, Result<MessageChunk, AgentError>>, AgentError> {
+        self.run_stream_request_with_context(request, RunContext::generated())
+            .await
+    }
 
     /// Streaming run: same semantics as [`run`](Agent::run), with the reply
     /// returned as a stream of message chunks (see [`MessageChunk`]), ending
     /// with [`MessageChunk::Done`]; errors are produced as `Err` items and
     /// terminate the stream (no Done afterwards).
     ///
-    /// The default implementation is not truly streaming — the whole answer
-    /// is given as a single [`MessageChunk::Delta`] chunk; implementations
-    /// that need per-character streaming (including tool progress) should
-    /// override this method.
-    /// The default implementation calls [`run`](Agent::run) and only gets
-    /// text, so it can't count rounds / usage, and `Done` carries a
-    /// zero-valued summary; implementations that need a real summary should
-    /// override it.
+    /// The default implementation is not truly streaming — it completes the
+    /// structured run first, then emits a single [`MessageChunk::Delta`] with
+    /// the final answer and a [`MessageChunk::Done`] carrying the run
+    /// summary. Implementations that need per-token streaming or tool
+    /// progress should override this method.
     async fn run_stream<'a>(
         &'a mut self,
         input: &'a str,
     ) -> Result<BoxStream<'a, Result<MessageChunk, AgentError>>, AgentError> {
-        let answer = self.run(input).await?;
-        Ok(Box::pin(futures::stream::iter([
-            Ok(MessageChunk::Delta(answer)),
-            Ok(MessageChunk::Done(RunSummary::default())),
-        ])))
+        self.run_stream_request(RunRequest::text(input)).await
     }
 }
 
@@ -170,7 +210,13 @@ pub trait CancellableAgent: Agent {
         &mut self,
         input: &str,
         token: &CancellationToken,
-    ) -> Result<String, AgentError>;
+    ) -> Result<String, AgentError> {
+        let context = RunContext::generated().with_cancellation(token.clone());
+        Ok(self
+            .run_request_with_context(RunRequest::text(input), context)
+            .await?
+            .answer)
+    }
 
     /// Streaming run with a cancellation source: same semantics as
     /// [`run_cancellable`](CancellableAgent::run_cancellable); when
@@ -185,22 +231,17 @@ pub trait CancellableAgent: Agent {
         input: &'a str,
         token: &CancellationToken,
     ) -> Result<BoxStream<'a, Result<MessageChunk, AgentError>>, AgentError> {
-        // Cancellation (before or during the run) always terminates with an
-        // in-stream Cancelled terminal chunk — no Done, no Err — distinct
-        // from run_cancellable's Err(Cancelled) shape.
-        let answer = match self.run_cancellable(input, token).await {
-            Ok(answer) => answer,
-            Err(AgentError::Cancelled) => {
-                return Ok(Box::pin(futures::stream::iter([Ok(
-                    MessageChunk::Cancelled,
-                )])));
-            }
-            Err(e) => return Err(e),
-        };
-        Ok(Box::pin(futures::stream::iter([
-            Ok(MessageChunk::Delta(answer)),
-            Ok(MessageChunk::Done(RunSummary::default())),
-        ])))
+        let context = RunContext::generated().with_cancellation(token.clone());
+        match self
+            .run_stream_request_with_context(RunRequest::text(input), context)
+            .await
+        {
+            Ok(stream) => Ok(stream),
+            Err(AgentError::Cancelled) => Ok(Box::pin(futures::stream::iter([Ok(
+                MessageChunk::Cancelled,
+            )]))),
+            Err(e) => Err(e),
+        }
     }
 }
 
@@ -232,6 +273,27 @@ pub trait CancellableAgent: Agent {
 /// [`ReActAgent`] assembly is exactly this shape).
 #[async_trait::async_trait]
 pub trait TypedAgent: Agent {
+    /// Typed structured run with caller-provided execution context.
+    async fn run_typed_request_with_context<U>(
+        &mut self,
+        request: RunRequest,
+        context: RunContext,
+    ) -> Result<TypedRunOutput<U>, AgentError>
+    where
+        U: serde::de::DeserializeOwned + schemars::JsonSchema + Send + Sync;
+
+    /// Typed structured run with a generated [`RunContext`].
+    async fn run_typed_request<U>(
+        &mut self,
+        request: RunRequest,
+    ) -> Result<TypedRunOutput<U>, AgentError>
+    where
+        U: serde::de::DeserializeOwned + schemars::JsonSchema + Send + Sync,
+    {
+        self.run_typed_request_with_context(request, RunContext::generated())
+            .await
+    }
+
     /// Typed run: the final answer is deserialized into `U` once validation
     /// passes.
     ///
@@ -248,44 +310,13 @@ pub trait TypedAgent: Agent {
     /// - otherwise the same as [`Agent::run`](Agent::run).
     async fn run_typed<U>(&mut self, input: &str) -> Result<U, AgentError>
     where
-        U: serde::de::DeserializeOwned + schemars::JsonSchema + Send + Sync;
-}
-
-/// Execution summary for one run (business-facing data; carried with the
-/// streaming [`MessageChunk::Done`] chunk).
-///
-/// - `rounds`: number of conversation rounds. One conversation plus the
-///   tool executions that follow counts as one round, matching the
-///   tool-round limit
-///   ([`AgentConfig::max_tool_rounds`](crate::agent::AgentConfig));
-///   error paths (cancellation, exceeding the round limit, etc.) don't
-///   produce a `Done`, so there is no summary;
-/// - `tool_calls`: total number of tool executions;
-/// - `usage`: sum of token usage across rounds; rounds where the streaming
-///   endpoint didn't return usage count as zero.
-///
-/// The summary is for business display ("how many rounds / how many
-/// tokens"); observability metrics like latency and call hierarchy don't
-/// enter the message-chunk stream. The non-streaming [`run`](Agent::run)
-/// returns plain text without a summary — use the streaming entry point
-/// when you need one.
-///
-/// # Examples
-///
-/// ```
-/// use molo::agent::RunSummary;
-///
-/// let summary = RunSummary { rounds: 3, tool_calls: 2, ..Default::default() };
-/// assert_eq!(summary.rounds, 3);
-/// ```
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct RunSummary {
-    /// Number of conversation rounds.
-    pub rounds: usize,
-    /// Total number of tool executions.
-    pub tool_calls: usize,
-    /// Sum of token usage across rounds.
-    pub usage: Usage,
+        U: serde::de::DeserializeOwned + schemars::JsonSchema + Send + Sync,
+    {
+        Ok(self
+            .run_typed_request::<U>(RunRequest::text(input))
+            .await?
+            .value)
+    }
 }
 
 /// Message chunks for a streaming run — the streaming output of one run,
@@ -440,4 +471,7 @@ pub enum AgentError {
         "structured output failed validation for more than {0} attempts; increase AgentConfig::max_structured_retries (via with_config) if intended"
     )]
     StructuredRetriesExhausted(usize),
+    /// The run-level deadline elapsed before the run completed.
+    #[error("run deadline exceeded")]
+    DeadlineExceeded,
 }

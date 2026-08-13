@@ -89,7 +89,7 @@ fn render(event: &dyn AgentEvent) {
     match event.as_any().downcast_ref::<ReActEvent>() {
         // run_id is the correlation key aligning the event stream with observed data: trace spans carry a run.id attribute with the same value.
         Some(ReActEvent::RunStarted { run_id, input }) => {
-            println!("▶ run started [{run_id}]: {input}")
+            println!("▶ run started [{run_id}]: {input:?}")
         }
         Some(ReActEvent::Delta { text }) => print!("{text}"), // text delta, printed as it arrives
         Some(ReActEvent::Reasoning { text }) => println!("\n  [reasoning] {text}"),

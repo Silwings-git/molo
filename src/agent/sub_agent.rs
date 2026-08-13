@@ -99,14 +99,35 @@ enum SubAgentSource {
 /// ```
 /// use molo::agent::{Agent, AgentError, SubAgentTool};
 /// use molo::tool::{SharedState, Tool};
+/// use molo::{Message, RunContext, RunMetadata, RunOutput, RunRequest, RunSummary};
 /// use serde_json::json;
 ///
 /// /// Demo sub-agent: echoes the input back verbatim.
 /// struct Echo;
 /// #[molo::async_trait]
 /// impl Agent for Echo {
-///     async fn run(&mut self, input: &str) -> Result<String, AgentError> {
-///         Ok(format!("echo: {input}"))
+///     async fn run_request_with_context(
+///         &mut self,
+///         request: RunRequest,
+///         context: RunContext,
+///     ) -> Result<RunOutput, AgentError> {
+///         let answer = format!("echo: {}", input_text(request));
+///         Ok(run_output(context.run_id, answer))
+///     }
+/// }
+///
+/// fn input_text(request: RunRequest) -> String {
+///     request.input.as_text().unwrap_or("").to_string()
+/// }
+///
+/// fn run_output(run_id: String, answer: String) -> RunOutput {
+///     RunOutput {
+///         run_id,
+///         answer: answer.clone(),
+///         summary: RunSummary::default(),
+///         final_message: Message::assistant(answer),
+///         artifacts: Vec::new(),
+///         metadata: RunMetadata::new(),
 ///     }
 /// }
 ///
@@ -399,13 +420,26 @@ type AgentSlot = Arc<Mutex<Box<dyn Agent + Send>>>;
 ///
 /// ```
 /// use molo::agent::{Agent, AgentError, SubAgentPool};
+/// use molo::{Message, RunContext, RunMetadata, RunOutput, RunRequest, RunSummary};
 ///
 /// /// Demo sub-agent: echoes the input back verbatim.
 /// struct Echo;
 /// #[molo::async_trait]
 /// impl Agent for Echo {
-///     async fn run(&mut self, input: &str) -> Result<String, AgentError> {
-///         Ok(format!("echo: {input}"))
+///     async fn run_request_with_context(
+///         &mut self,
+///         request: RunRequest,
+///         context: RunContext,
+///     ) -> Result<RunOutput, AgentError> {
+///         let answer = format!("echo: {}", request.input.as_text().unwrap_or(""));
+///         Ok(RunOutput {
+///             run_id: context.run_id,
+///             answer: answer.clone(),
+///             summary: RunSummary::default(),
+///             final_message: Message::assistant(answer),
+///             artifacts: Vec::new(),
+///             metadata: RunMetadata::new(),
+///         })
 ///     }
 /// }
 ///
@@ -578,6 +612,7 @@ mod tests {
     use crate::agent::{AgentError, ReActAgent};
     use crate::message::{ContentBlock, Message, ToolCall};
     use crate::provider::{FakeProvider, FakeReply, ProviderError};
+    use crate::run::{RunContext, RunMetadata, RunOutput, RunRequest, RunSummary};
     use crate::tool::ToolRegistry;
     use serde_json::json;
 
@@ -600,9 +635,15 @@ mod tests {
 
     #[async_trait::async_trait]
     impl Agent for RecordingAgent {
-        async fn run(&mut self, input: &str) -> Result<String, AgentError> {
+        async fn run_request_with_context(
+            &mut self,
+            request: RunRequest,
+            context: RunContext,
+        ) -> Result<RunOutput, AgentError> {
+            let input = input_text(request);
             self.seen.lock().await.push(input.to_string());
-            Ok(format!("processed: {input}"))
+            let answer = format!("processed: {input}");
+            Ok(test_run_output(context.run_id, answer))
         }
     }
 
@@ -614,7 +655,11 @@ mod tests {
 
     #[async_trait::async_trait]
     impl Agent for FlakyAgent {
-        async fn run(&mut self, _input: &str) -> Result<String, AgentError> {
+        async fn run_request_with_context(
+            &mut self,
+            _request: RunRequest,
+            context: RunContext,
+        ) -> Result<RunOutput, AgentError> {
             if !self.failed_once {
                 self.failed_once = true;
                 return Err(AgentError::Provider(ProviderError::Api {
@@ -622,7 +667,33 @@ mod tests {
                     message: "boom".into(),
                 }));
             }
-            Ok("recovered".into())
+            Ok(test_run_output(context.run_id, "recovered"))
+        }
+    }
+
+    fn input_text(request: RunRequest) -> String {
+        match request.input.into_message() {
+            Message::User(blocks) => blocks
+                .into_iter()
+                .filter_map(|block| match block {
+                    ContentBlock::Text(text) => Some(text),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join(""),
+            _ => String::new(),
+        }
+    }
+
+    fn test_run_output(run_id: String, answer: impl Into<String>) -> RunOutput {
+        let answer = answer.into();
+        RunOutput {
+            run_id,
+            answer: answer.clone(),
+            summary: RunSummary::default(),
+            final_message: Message::assistant(answer),
+            artifacts: Vec::new(),
+            metadata: RunMetadata::new(),
         }
     }
 

@@ -53,6 +53,14 @@ use std::time::Duration;
 /// ```
 #[async_trait::async_trait]
 pub trait Provider: Send + Sync {
+    /// Model identifier exposed by this provider, when known.
+    ///
+    /// Agents copy this value into run summaries for observability. Providers
+    /// that are not bound to one model can keep the default `None`.
+    fn model(&self) -> Option<&str> {
+        None
+    }
+
     /// Sends one turn of conversation and returns the model's reply (text, or
     /// a request to call tools).
     ///
@@ -90,6 +98,10 @@ pub trait Provider: Send + Sync {
 /// constructs a fresh loop for each invocation).
 #[async_trait::async_trait]
 impl Provider for Box<dyn Provider> {
+    fn model(&self) -> Option<&str> {
+        self.as_ref().model()
+    }
+
     async fn chat(&self, request: ChatRequest) -> Result<ChatResponse, ProviderError> {
         self.as_ref().chat(request).await
     }

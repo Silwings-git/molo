@@ -33,7 +33,10 @@ use molo::agent::{Agent, AgentError};
 use molo::memory::InMemoryMemory;
 use molo::provider::{ChatRequest, FakeProvider, FakeReply, Provider, ProviderError};
 use molo::tool::{SharedState, Tool, ToolError, ToolSchema};
-use molo::{Memory, Message, ToolCall, ToolRegistry};
+use molo::{
+    Memory, Message, RunContext, RunMetadata, RunOutput, RunRequest, RunSummary, ToolCall,
+    ToolRegistry,
+};
 
 /// Demo tool: returns the input as-is, simulating any programmable tool.
 struct Echo;
@@ -88,8 +91,12 @@ impl SimpleAgent {
 impl Agent for SimpleAgent {
     /// Reasoning loop: run a chat turn → execute tool calls the model requests and feed results back → until the model answers directly.
     /// A failed tool call does not abort the loop; the error is returned as text so the model can decide what to do next.
-    async fn run(&mut self, input: &str) -> Result<String, AgentError> {
-        self.memory.record(Message::user(input)).await?;
+    async fn run_request_with_context(
+        &mut self,
+        request: RunRequest,
+        context: RunContext,
+    ) -> Result<RunOutput, AgentError> {
+        self.memory.record(request.input.into_message()).await?;
 
         // Tool definitions are the same every round, so compute them once; the model decides whether to call a tool based on them.
         let schemas = self.tools.schemas();
@@ -125,7 +132,7 @@ impl Agent for SimpleAgent {
             }
 
             if tool_calls.is_empty() {
-                return Ok(content); // the model answered directly
+                return Ok(run_output(context.run_id, content)); // the model answered directly
             }
 
             // Tool round: execute every requested call, then feed each result back right after;
@@ -147,6 +154,17 @@ impl Agent for SimpleAgent {
         }
 
         Err(AgentError::TooManyToolRounds(self.max_tool_rounds))
+    }
+}
+
+fn run_output(run_id: String, answer: String) -> RunOutput {
+    RunOutput {
+        run_id,
+        answer: answer.clone(),
+        summary: RunSummary::default(),
+        final_message: Message::assistant(answer),
+        artifacts: Vec::new(),
+        metadata: RunMetadata::new(),
     }
 }
 

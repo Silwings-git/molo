@@ -147,7 +147,7 @@ mod tests {
             .as_any()
             .downcast_ref::<ReActEvent>()
         {
-            Some(ReActEvent::RunStarted { input, .. }) => assert_eq!(input, "1"),
+            Some(ReActEvent::RunStarted { input, .. }) => assert_eq!(input.as_text(), Some("1")),
             _ => panic!("test event must be RunStarted"),
         }
     }

@@ -244,6 +244,10 @@ fn build_client(connect_timeout: Duration) -> reqwest::Client {
 
 #[async_trait]
 impl Provider for OpenAiProvider {
+    fn model(&self) -> Option<&str> {
+        Some(&self.model)
+    }
+
     async fn chat(&self, request: ChatRequest) -> Result<ChatResponse, ProviderError> {
         let wire = OpenAiChatRequest {
             model: self.model.clone(),

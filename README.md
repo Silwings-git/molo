@@ -109,6 +109,30 @@ That is a complete, streaming-capable, tool-calling agent. `run` returns the
 final answer; `run_stream` yields token-by-token `MessageChunk` events
 (text deltas, tool calls, tool results, `Done`).
 
+### Structured runs
+
+Use `run` when you only need the answer text. Use `run_request` or
+`run_request_with_context` when you need run metadata, a caller-provided run
+id, request-scoped model options, deadlines, or multi-block input:
+
+```rust
+use molo::{Agent, RunContext, RunRequest};
+use std::time::Duration;
+
+let output = agent
+    .run_request_with_context(
+        RunRequest::text("Summarize this session"),
+        RunContext::new("request-42").with_timeout(Duration::from_secs(30)),
+    )
+    .await?;
+
+println!("{}", output.answer);
+println!("{} tokens", output.summary.usage.total_tokens);
+```
+
+Typed output has the same structured path via `run_typed_request`, returning
+both the deserialized value and the raw `RunOutput`.
+
 ## 🧩 Core Concepts
 
 molo is organized into domain modules — one concept per module. The crate

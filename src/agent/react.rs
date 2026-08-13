@@ -27,7 +27,10 @@ use crate::agent::{
 use crate::event_channel::EventChannel;
 use crate::memory::{Memory, WindowMemory};
 use crate::message::{Message, ToolCall};
-use crate::provider::{ChatRequest, Provider, ProviderError, StreamEvent, Usage};
+use crate::provider::{
+    ChatRequest, FinishReason, ModelOptions, Provider, ProviderError, StreamEvent, Usage,
+};
+use crate::run::{Artifact, RunContext, RunMetadata, RunOutput, RunRequest, TypedRunOutput};
 use crate::skill::{LoadSkillTool, SkillRegistry};
 use crate::tool::{SharedState, ToolRegistry};
 use futures::StreamExt;
@@ -36,10 +39,10 @@ use schemars::JsonSchema;
 use serde::de::DeserializeOwned;
 use std::collections::HashSet;
 use std::fmt;
+use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::Instant;
 use tracing::Instrument;
 
 /// Convenience assembly macro: registers a list of tools (possibly
@@ -234,11 +237,6 @@ pub struct ReActAgent {
     /// Skill assembly mode (none / dynamic progressive disclosure / static
     /// inlining).
     skill_mode: SkillMode,
-    /// Source of run ids: the instance's construction time (nanoseconds)
-    /// combined with a process-wide global sequence number, producing
-    /// `run-{ts}-{n}` — no collisions across runs / instances in the same
-    /// process.
-    created_nanos: u128,
 }
 
 /// Skill assembly mode: how skills enter the system prompt.
@@ -259,12 +257,6 @@ enum SkillMode {
     /// deterministic scenarios).
     Inline,
 }
-
-/// Process-wide global run sequence number: the source of run-id
-/// uniqueness. Back-to-back instances may share the same construction
-/// timestamp (coarse clock granularity), and per-instance counters would
-/// collide; the global sequence naturally distinguishes any two instances.
-static PROCESS_RUN_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// Per-round reply text accumulation limit (4 MiB, shared by streaming and
 /// non-streaming): exceeding it is treated as a malicious / abnormal
@@ -319,20 +311,7 @@ impl ReActAgent {
             enabled_skills: None,
             activated_skills: Vec::new(),
             skill_mode: SkillMode::None,
-            created_nanos: SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos(),
         }
-    }
-
-    /// Observability identifier for this run: construction time + a
-    /// process-wide global sequence number, unique across runs / instances
-    /// in the same process; trace spans and the event stream's `RunStarted`
-    /// carry the same id — the correlation key between the two channels.
-    fn next_run_id(&self) -> String {
-        let n = PROCESS_RUN_COUNTER.fetch_add(1, Ordering::Relaxed);
-        format!("run-{}-{n}", self.created_nanos)
     }
 
     /// Replace the default Memory (default
@@ -719,16 +698,15 @@ impl ReActAgent {
         }
     }
 
-    /// Non-streaming round loop (same semantics as the streaming path);
-    /// rounds / tools / structured retries / usage are accumulated in
-    /// [`RunCounters`] for the `RunEnded` summary at run wrap-up.
-    async fn run_rounds_cancellable(
+    /// Non-streaming round loop (same semantics as the streaming path).
+    async fn run_rounds_with_context(
         &mut self,
-        token: &CancellationToken,
+        context: &RunContext,
         run_id: &str,
         counters: &mut RunCounters,
+        options: &ModelOptions,
         schema: Option<&serde_json::Value>,
-    ) -> Result<String, AgentError> {
+    ) -> Result<FinalAnswer, AgentError> {
         let schemas = self.registry.schemas();
         // Structured validator: built when this run has a schema; the retry
         // budget lives in the component (the count accumulates across
@@ -751,9 +729,7 @@ impl ReActAgent {
             // Between-round check: cancellation takes effect immediately —
             // this round hasn't started a conversation, so the memory is
             // clean (nothing from this round beyond the user message).
-            if token.is_cancelled() {
-                return Err(AgentError::Cancelled);
-            }
+            check_run_context(context)?;
 
             // Provider-call span for this round: duration comes from span
             // timing automatically; usage goes out through both channels
@@ -767,7 +743,7 @@ impl ReActAgent {
             // answered directly; internal errors propagate via `?` (the two
             // Ok arms pin the error type with turbofish — inference would
             // otherwise fail under multiple From impls).
-            let answer: Option<String> = async {
+            let answer: Option<FinalAnswer> = async {
                 let llm_span = span_llm(run_id, counters.rounds);
                 // Cancelled mid-conversation: run_until_cancelled drops the
                 // in-flight request and returns immediately (nothing is
@@ -782,32 +758,29 @@ impl ReActAgent {
                 // hand-written schema in the config — endpoint-side
                 // constraint and framework-side validation use the same
                 // one.
-                let mut options = self.config.options.clone();
-                if options.structured.is_none() {
-                    options.structured = schema.cloned();
-                }
-                let response = match token
-                    .run_until_cancelled(
-                        self.provider
-                            .chat(ChatRequest {
-                                messages: self.assemble_messages(self.memory.context().await?),
-                                tools: schemas.clone(),
-                                options,
-                            })
-                            .instrument(llm_span.clone()),
-                    )
-                    .await
+                let response = match run_until_context(
+                    context,
+                    self.provider
+                        .chat(ChatRequest {
+                            messages: self.assemble_messages(self.memory.context().await?),
+                            tools: schemas.clone(),
+                            options: options.clone(),
+                        })
+                        .instrument(llm_span.clone()),
+                )
+                .await
                 {
-                    Some(Ok(response)) => response,
-                    Some(Err(e)) => {
+                    Ok(Ok(response)) => response,
+                    Ok(Err(e)) => {
                         llm_span.record("error", e.to_string());
                         return Err(AgentError::Provider(e));
                     }
-                    None => return Err(AgentError::Cancelled),
+                    Err(e) => return Err(e),
                 };
                 llm_span.record("usage.prompt_tokens", response.usage.prompt_tokens);
                 llm_span.record("usage.completion_tokens", response.usage.completion_tokens);
                 counters.usage_total += response.usage;
+                let finish_reason = response.finish_reason.clone();
 
                 // Per the Provider contract, this round's reply is exactly
                 // one Assistant message; text, reasoning, and tool requests
@@ -844,6 +817,12 @@ impl ReActAgent {
                 // content, no reasoning, and no tool requests don't go into
                 // Memory; reasoning and tool requests are saved along with
                 // the content.
+                let final_message = Message::Assistant {
+                    content: content.clone(),
+                    reasoning: reasoning.clone(),
+                    tool_calls: Vec::new(),
+                };
+
                 if !content.is_empty() || reasoning.is_some() || !tool_calls.is_empty() {
                     self.memory
                         .record(Message::Assistant {
@@ -865,14 +844,18 @@ impl ReActAgent {
                             StructuredOutcome::Passed => {}
                             StructuredOutcome::Retry { message } => {
                                 self.memory.record(message).await?;
-                                return Ok::<Option<String>, AgentError>(None);
+                                return Ok::<Option<FinalAnswer>, AgentError>(None);
                             }
                             StructuredOutcome::Exhausted { max_retries } => {
                                 return Err(AgentError::StructuredRetriesExhausted(max_retries));
                             }
                         }
                     }
-                    return Ok::<Option<String>, AgentError>(Some(content));
+                    return Ok::<Option<FinalAnswer>, AgentError>(Some(FinalAnswer {
+                        answer: content,
+                        final_message,
+                        finish_reason: Some(finish_reason),
+                    }));
                 }
 
                 counters.tool_calls_total += tool_calls.len();
@@ -902,7 +885,7 @@ impl ReActAgent {
                     // fallback (memory integrity, see record_tool_result).
                     record_tool_result(&mut self.memory, &outcome).await?;
                 }
-                Ok::<Option<String>, AgentError>(None)
+                Ok::<Option<FinalAnswer>, AgentError>(None)
             }
             .await?;
             if let Some(answer) = answer {
@@ -1331,16 +1314,22 @@ impl ReActAgent {
 
 #[async_trait::async_trait]
 impl TypedAgent for ReActAgent {
-    async fn run_typed<U>(&mut self, input: &str) -> Result<U, AgentError>
+    async fn run_typed_request_with_context<U>(
+        &mut self,
+        request: RunRequest,
+        context: RunContext,
+    ) -> Result<TypedRunOutput<U>, AgentError>
     where
         U: DeserializeOwned + JsonSchema + Send + Sync,
     {
         let schema = serde_json::to_value(schemars::schema_for!(U))
             .expect("schemars-generated schema always serializes (pure JSON value structure)");
-        let text = self
-            .run_cancellable_inner(input, &CancellationToken::new(), Some(&schema))
+        let output = self
+            .run_request_inner(request, context, Some(&schema))
             .await?;
-        serde_json::from_str(&text).map_err(|e| AgentError::StructuredParse(e.to_string()))
+        let value = serde_json::from_str(&output.answer)
+            .map_err(|e| AgentError::StructuredParse(e.to_string()))?;
+        Ok(TypedRunOutput { value, output })
     }
 }
 
@@ -1359,6 +1348,20 @@ struct RunCounters {
     tool_calls_total: usize,
     /// Sum of token usage across rounds.
     usage_total: Usage,
+}
+
+struct FinalAnswer {
+    answer: String,
+    final_message: Message,
+    finish_reason: Option<FinishReason>,
+}
+
+struct RunExecution {
+    answer: String,
+    final_message: Message,
+    summary: RunSummary,
+    artifacts: Vec<Artifact>,
+    metadata: RunMetadata,
 }
 
 impl fmt::Debug for ReActAgent {
@@ -1404,20 +1407,20 @@ fn append_sections(out: &mut String, sections: &[String]) {
 
 #[async_trait::async_trait]
 impl Agent for ReActAgent {
-    async fn run(&mut self, input: &str) -> Result<String, AgentError> {
-        // Convenience no-cancellation form: create a token that is never
-        // cancelled and delegate to the main implementation — the loop
-        // logic exists in only one place (see CancellableAgent's
-        // run_cancellable).
-        self.run_cancellable(input, &CancellationToken::new()).await
+    async fn run_request_with_context(
+        &mut self,
+        request: RunRequest,
+        context: RunContext,
+    ) -> Result<RunOutput, AgentError> {
+        self.run_request_inner(request, context, None).await
     }
 
-    async fn run_stream<'a>(
+    async fn run_stream_request_with_context<'a>(
         &'a mut self,
-        input: &'a str,
+        request: RunRequest,
+        context: RunContext,
     ) -> Result<BoxStream<'a, Result<MessageChunk, AgentError>>, AgentError> {
-        let token = CancellationToken::new();
-        self.run_stream_cancellable(input, &token).await
+        self.run_stream_request_inner(request, context).await
     }
 }
 
@@ -1473,20 +1476,11 @@ fn span_tool(run_id: &str, round: usize, name: &str) -> tracing::Span {
 /// borrow tangles.
 fn publish_ended(
     events: &Option<Arc<dyn EventChannel>>,
-    rounds: usize,
-    tool_calls_total: usize,
-    usage_total: Usage,
+    summary: RunSummary,
     error: Option<AgentError>,
 ) {
     if let Some(pipe) = events {
-        pipe.publish(Arc::new(ReActEvent::RunEnded {
-            summary: RunSummary {
-                rounds,
-                tool_calls: tool_calls_total,
-                usage: usage_total,
-            },
-            error,
-        }));
+        pipe.publish(Arc::new(ReActEvent::RunEnded { summary, error }));
     }
 }
 
@@ -1503,9 +1497,7 @@ fn publish_ended(
 fn stream_end(
     events: &Option<Arc<dyn EventChannel>>,
     run_span: &tracing::Span,
-    rounds: usize,
-    tool_calls_total: usize,
-    usage_total: Usage,
+    summary: RunSummary,
     error: AgentError,
 ) -> Result<MessageChunk, AgentError> {
     // Cancellation is a normal outcome (terminating with the Cancelled
@@ -1515,16 +1507,76 @@ fn stream_end(
     if !matches!(error, AgentError::Cancelled) {
         run_span.record("error", error.to_string());
     }
-    publish_ended(
-        events,
-        rounds,
-        tool_calls_total,
-        usage_total,
-        Some(error.clone()),
-    );
+    publish_ended(events, summary, Some(error.clone()));
     match error {
         AgentError::Cancelled => Ok(MessageChunk::Cancelled),
         e => Err(e),
+    }
+}
+
+fn run_summary(
+    counters: &RunCounters,
+    finish_reason: Option<FinishReason>,
+    started_at: Instant,
+    provider_model: Option<String>,
+) -> RunSummary {
+    run_summary_from_parts(
+        counters.rounds,
+        counters.tool_calls_total,
+        counters.usage_total,
+        finish_reason,
+        started_at,
+        provider_model,
+    )
+}
+
+fn run_summary_from_parts(
+    rounds: usize,
+    tool_calls: usize,
+    usage: Usage,
+    finish_reason: Option<FinishReason>,
+    started_at: Instant,
+    provider_model: Option<String>,
+) -> RunSummary {
+    RunSummary {
+        rounds,
+        tool_calls,
+        usage,
+        finish_reason,
+        latency: started_at.elapsed(),
+        provider_model,
+    }
+}
+
+fn check_run_context(context: &RunContext) -> Result<(), AgentError> {
+    if context.is_cancelled() {
+        Err(AgentError::Cancelled)
+    } else if context.is_expired() {
+        Err(AgentError::DeadlineExceeded)
+    } else {
+        Ok(())
+    }
+}
+
+async fn run_until_context<F>(context: &RunContext, future: F) -> Result<F::Output, AgentError>
+where
+    F: Future,
+{
+    check_run_context(context)?;
+    match context.remaining() {
+        Some(remaining) if remaining.is_zero() => Err(AgentError::DeadlineExceeded),
+        Some(remaining) => {
+            tokio::select! {
+                _ = context.cancellation.cancelled() => Err(AgentError::Cancelled),
+                _ = tokio::time::sleep(remaining) => Err(AgentError::DeadlineExceeded),
+                output = future => Ok(output),
+            }
+        }
+        None => context
+            .cancellation
+            .run_until_cancelled(future)
+            .await
+            .ok_or(AgentError::Cancelled),
     }
 }
 
@@ -1572,38 +1624,33 @@ async fn record_tool_result(
 }
 
 impl ReActAgent {
-    /// The non-streaming main implementation for cooperative cancellation
-    /// (returns the model's answer text); public entry points:
-    /// `Agent::run` / `CancellableAgent::run_cancellable` (text, carrying
-    /// the hand-written Schema) and [`run_typed`](ReActAgent::run_typed)
-    /// (typed, carrying this run's generated Schema).
-    ///
-    /// `schema` = the JSON Schema used for this run's structured
-    /// validation; `None` = free text (no structured constraint).
-    async fn run_cancellable_inner(
+    async fn run_request_inner(
         &mut self,
-        input: &str,
-        token: &CancellationToken,
+        request: RunRequest,
+        context: RunContext,
         schema: Option<&serde_json::Value>,
-    ) -> Result<String, AgentError> {
+    ) -> Result<RunOutput, AgentError> {
         // Run id and root span — one agent.run span for the whole run (from
         // recording the input to the wrap-up event), sharing the same
         // run.id as the event stream's RunStarted (the correlation key
         // between the two channels); on Err, the error is recorded at
         // wrap-up (observability spots the failed run at a glance).
-        let run_id = self.next_run_id();
+        let run_id = context.run_id.clone();
         let run_span = span_run(&run_id);
+        let provider_model = self.provider.model().map(str::to_string);
+        let started_at = Instant::now();
         let result = async {
             // Record first, publish after (consistent with the streaming
             // path): RunStarted's claim that "the user input is recorded"
             // holds; when recording fails, neither RunStarted nor RunEnded
             // is published, leaving no dangling segment in the event
             // stream.
-            self.memory.record(Message::user(input)).await?;
+            let input = request.input;
+            self.memory.record(input.clone().into_message()).await?;
             self.publish(|| {
                 Arc::new(ReActEvent::RunStarted {
                     run_id: run_id.clone(),
-                    input: input.to_string(),
+                    input,
                 })
             });
 
@@ -1611,38 +1658,68 @@ impl ReActAgent {
             // RunEnded summary at wrap-up (also accumulated on the
             // non-streaming path).
             let mut counters = RunCounters::default();
-            let result = self
-                .run_rounds_cancellable(token, &run_id, &mut counters, schema)
+            let mut options = request
+                .options
+                .clone()
+                .unwrap_or_else(|| self.config.options.clone());
+            if let Some(schema) = schema {
+                options.structured = Some(schema.clone());
+            }
+            let validation_schema = options.structured.as_ref();
+            let result: Result<FinalAnswer, AgentError> = self
+                .run_rounds_with_context(
+                    &context,
+                    &run_id,
+                    &mut counters,
+                    &options,
+                    validation_schema,
+                )
                 .await;
+            let output_result = result.map(|final_answer| {
+                let summary = run_summary(
+                    &counters,
+                    final_answer.finish_reason.clone(),
+                    started_at,
+                    provider_model.clone(),
+                );
+                RunExecution {
+                    answer: final_answer.answer,
+                    final_message: final_answer.final_message,
+                    summary,
+                    artifacts: Vec::new(),
+                    metadata: RunMetadata::new(),
+                }
+            });
+            let summary = match &output_result {
+                Ok(execution) => execution.summary.clone(),
+                Err(_) => run_summary(&counters, None, started_at, provider_model.clone()),
+            };
             // Wrap-up event: error=None on success; error set on
             // cancellation / failure (bystanders can observe the outcome of
             // a non-streaming run); built with publish_ended, shared with
             // the streaming path.
-            publish_ended(
-                &self.events,
-                counters.rounds,
-                counters.tool_calls_total,
-                counters.usage_total,
-                result.as_ref().err().cloned(),
-            );
-            result
+            publish_ended(&self.events, summary, output_result.as_ref().err().cloned());
+            output_result
         }
         .instrument(run_span.clone())
         .await;
         if let Err(e) = &result {
             run_span.record("error", e.to_string());
         }
-        result
+        result.map(|execution| RunOutput {
+            run_id,
+            answer: execution.answer,
+            summary: execution.summary,
+            final_message: execution.final_message,
+            artifacts: execution.artifacts,
+            metadata: execution.metadata,
+        })
     }
 
-    /// The streaming main implementation for cooperative cancellation
-    /// (returns text-delta chunks; structured output is assembled and
-    /// parsed by the caller); public entry points: `Agent::run_stream` /
-    /// `CancellableAgent::run_stream_cancellable`.
-    async fn run_stream_cancellable_inner<'a>(
+    async fn run_stream_request_inner<'a>(
         &'a mut self,
-        input: &'a str,
-        token: &CancellationToken,
+        request: RunRequest,
+        context: RunContext,
     ) -> Result<BoxStream<'a, Result<MessageChunk, AgentError>>, AgentError> {
         // Run id and root span — the run span covers the consumption period
         // from "stream returned" to "stream dropped" (SpanStream enters on
@@ -1656,38 +1733,41 @@ impl ReActAgent {
         // polling, the event stream is left with a dangling segment without
         // RunEnded — event consumers pair by run.id and wrap up such cases
         // themselves.
-        let run_id = self.next_run_id();
+        let run_id = context.run_id.clone();
         let run_span = span_run(&run_id);
         let stream_span = run_span.clone();
-        self.memory.record(Message::user(input)).await?;
+        let input = request.input;
+        self.memory.record(input.clone().into_message()).await?;
         self.publish(|| {
             Arc::new(ReActEvent::RunStarted {
                 run_id: run_id.clone(),
-                input: input.to_string(),
+                input,
             })
         });
         let schemas = self.registry.schemas();
         let max_rounds = self.config.max_tool_rounds;
+        let provider_model = self.provider.model().map(str::to_string);
+        let started_at = Instant::now();
+        let options = request
+            .options
+            .clone()
+            .unwrap_or_else(|| self.config.options.clone());
+        let validation_schema = options.structured.clone();
 
         // Streaming state machine: an async_stream generator — sequential
         // awaits in the loop body, syntax isomorphic to a synchronous loop
         // (replacing a hand-written unfold state machine).
-        // The token is cloned into the generator (move-captured; the stream
-        // holds a copy — sharing the same cancellation state with the
-        // caller; the returned stream doesn't borrow the caller's token, so
-        // lifetimes are decoupled).
-        let token = token.clone();
+        let context = context.clone();
         let stream = async_stream::stream! {
             let mut rounds = 0usize;
             // Execution summary (carried with Done): rounds is the `rounds`
             // above; tool counts and usage accumulate per round.
             let mut tool_calls_total = 0usize;
             let mut usage_total = Usage::default();
-            // Structured validator: built when the config has a hand-written
-            // schema; the retry budget lives in the component (the streaming
-            // path only reads the config, so it doesn't interfere with
-            // run_typed's per-run schema).
-            let mut validator = self.config.options.structured.as_ref().map(|schema| {
+            // Structured validator: built when this run has a hand-written
+            // schema from the request or config; the retry budget lives in
+            // the component.
+            let mut validator = validation_schema.as_ref().map(|schema| {
                 StructuredValidator::new(schema.clone(), self.config.max_structured_retries)
             });
             // Tool-round counter (same semantics as the non-streaming
@@ -1702,8 +1782,16 @@ impl ReActAgent {
                 // Same semantics as run: the model still requests tools
                 // past the limit → error event.
                 if tool_rounds >= max_rounds {
-                    yield stream_end(&self.events, &run_span, rounds, tool_calls_total,
-                        usage_total, AgentError::TooManyToolRounds(max_rounds));
+                    let summary = run_summary_from_parts(
+                        rounds,
+                        tool_calls_total,
+                        usage_total,
+                        None,
+                        started_at,
+                        provider_model.clone(),
+                    );
+                    yield stream_end(&self.events, &run_span, summary,
+                        AgentError::TooManyToolRounds(max_rounds));
                     break;
                 }
 
@@ -1716,20 +1804,35 @@ impl ReActAgent {
                 // Between-round check: cancellation takes effect
                 // immediately — this round hasn't started a conversation,
                 // so the memory is clean.
-                if token.is_cancelled() {
-                    yield stream_end(&self.events, &run_span, rounds, tool_calls_total,
-                        usage_total, AgentError::Cancelled);
+                if let Err(e) = check_run_context(&context) {
+                    let summary = run_summary_from_parts(
+                        rounds,
+                        tool_calls_total,
+                        usage_total,
+                        None,
+                        started_at,
+                        provider_model.clone(),
+                    );
+                    yield stream_end(&self.events, &run_span, summary, e);
                     break;
                 }
 
                 // Start a streaming conversation round (cancelled during
                 // establishment → nothing recorded for this round, memory
                 // clean).
-                let context = match self.memory.context().await {
+                let messages = match self.memory.context().await {
                     Ok(messages) => messages,
                     Err(e) => {
-                        yield stream_end(&self.events, &run_span, rounds, tool_calls_total,
-                            usage_total, AgentError::Memory(e));
+                        let summary = run_summary_from_parts(
+                            rounds,
+                            tool_calls_total,
+                            usage_total,
+                            None,
+                            started_at,
+                            provider_model.clone(),
+                        );
+                        yield stream_end(&self.events, &run_span, summary,
+                            AgentError::Memory(e));
                         break;
                     }
                 };
@@ -1741,32 +1844,45 @@ impl ReActAgent {
                 // while the run is on the stack (SpanStream enters on every
                 // poll), so the hierarchy is correct automatically.
                 let llm_span = span_llm(&run_id, rounds);
-                let mut provider_stream = match token
-                    .run_until_cancelled(
-                        self.provider
-                            .stream_chat(ChatRequest {
-                                messages: self.assemble_messages(context),
-                                tools: schemas.clone(),
-                                options: self.config.options.clone(),
-                            })
-                            .instrument(llm_span.clone()),
-                    )
-                    .await
+                let mut provider_stream = match run_until_context(
+                    &context,
+                    self.provider
+                    .stream_chat(ChatRequest {
+                            messages: self.assemble_messages(messages),
+                            tools: schemas.clone(),
+                            options: options.clone(),
+                        })
+                        .instrument(llm_span.clone()),
+                )
+                .await
                 {
-                    Some(Ok(stream)) => stream,
-                    Some(Err(e)) => {
+                    Ok(Ok(stream)) => stream,
+                    Ok(Err(e)) => {
                         // Provider errors are recorded on the llm span
                         // (observability pinpoints the failed call).
                         llm_span.record("error", e.to_string());
-                        yield stream_end(&self.events, &run_span, rounds, tool_calls_total,
-                            usage_total, AgentError::Provider(e));
+                        let summary = run_summary_from_parts(
+                            rounds,
+                            tool_calls_total,
+                            usage_total,
+                            None,
+                            started_at,
+                            provider_model.clone(),
+                        );
+                        yield stream_end(&self.events, &run_span, summary,
+                            AgentError::Provider(e));
                         break;
                     }
-                    None => {
-                        // Cancelled before the conversation was
-                        // established.
-                        yield stream_end(&self.events, &run_span, rounds, tool_calls_total,
-                            usage_total, AgentError::Cancelled);
+                    Err(e) => {
+                        let summary = run_summary_from_parts(
+                            rounds,
+                            tool_calls_total,
+                            usage_total,
+                            None,
+                            started_at,
+                            provider_model.clone(),
+                        );
+                        yield stream_end(&self.events, &run_span, summary, e);
                         break;
                     }
                 };
@@ -1785,23 +1901,33 @@ impl ReActAgent {
                 let mut text = String::new();
                 let mut reasoning = String::new();
                 let mut calls = Vec::new();
+                let mut round_finish_reason = None::<FinishReason>;
                 loop {
                     // next()'s Output is itself an Option, and
                     // run_until_cancelled wraps it in another (returns None
                     // on cancellation): Some(Some(event)) / Some(None) =
                     // stream ended naturally / None = cancelled during next
                     // (this round is voided).
-                    let next = token
-                        .run_until_cancelled(provider_stream.next().instrument(llm_span.clone()))
-                        .await;
-                    let Some(Some(event)) = next else {
-                        if next.is_none() {
-                            // Cancelled during next: this round wasn't fully
-                            // consumed; void it with Cancelled.
-                            yield stream_end(&self.events, &run_span, rounds, tool_calls_total,
-                                usage_total, AgentError::Cancelled);
+                    let next = run_until_context(
+                        &context,
+                        provider_stream.next().instrument(llm_span.clone()),
+                    )
+                    .await;
+                    let Some(event) = (match next {
+                        Ok(event) => event,
+                        Err(e) => {
+                            let summary = run_summary_from_parts(
+                                rounds,
+                                tool_calls_total,
+                                usage_total,
+                                None,
+                                started_at,
+                                provider_model.clone(),
+                            );
+                            yield stream_end(&self.events, &run_span, summary, e);
                             break 'rounds;
                         }
+                    }) else {
                         // The event stream ended naturally; move to
                         // end-of-round wrap-up.
                         break;
@@ -1813,8 +1939,15 @@ impl ReActAgent {
                             // bound (the Provider layer only limits single
                             // lines; this is the per-round backstop).
                             if text.len() + delta.len() > MAX_ROUND_TEXT {
-                                yield stream_end(&self.events, &run_span, rounds,
-                                    tool_calls_total, usage_total,
+                                let summary = run_summary_from_parts(
+                                    rounds,
+                                    tool_calls_total,
+                                    usage_total,
+                                    None,
+                                    started_at,
+                                    provider_model.clone(),
+                                );
+                                yield stream_end(&self.events, &run_span, summary,
                                     AgentError::Provider(ProviderError::Api {
                                         status: 0,
                                         message: format!(
@@ -1831,8 +1964,15 @@ impl ReActAgent {
                             // Same limit as text: a custom Provider may
                             // send reasoning deltas without bound.
                             if reasoning.len() + chunk.len() > MAX_ROUND_TEXT {
-                                yield stream_end(&self.events, &run_span, rounds,
-                                    tool_calls_total, usage_total,
+                                let summary = run_summary_from_parts(
+                                    rounds,
+                                    tool_calls_total,
+                                    usage_total,
+                                    None,
+                                    started_at,
+                                    provider_model.clone(),
+                                );
+                                yield stream_end(&self.events, &run_span, summary,
                                     AgentError::Provider(ProviderError::Api {
                                         status: 0,
                                         message: format!(
@@ -1852,7 +1992,7 @@ impl ReActAgent {
                             });
                             yield Ok(MessageChunk::ToolCall { id, name, arguments });
                         }
-                        Ok(StreamEvent::Done { usage, .. }) => {
+                        Ok(StreamEvent::Done { reason, usage }) => {
                             // Streaming usage may be absent (the endpoint
                             // didn't return it); missing rounds count as
                             // zero.
@@ -1865,6 +2005,7 @@ impl ReActAgent {
                                 llm_span.record("usage.completion_tokens", usage.completion_tokens);
                                 usage_total += usage;
                             }
+                            round_finish_reason = Some(reason);
                             // Done = this round is complete: move to
                             // end-of-round wrap-up immediately, consuming no
                             // further events — the Provider's Done is always
@@ -1879,8 +2020,16 @@ impl ReActAgent {
                             // recorded on the llm span (observability
                             // pinpoints the failed call).
                             llm_span.record("error", e.to_string());
-                            yield stream_end(&self.events, &run_span, rounds, tool_calls_total,
-                                usage_total, AgentError::Provider(e));
+                            let summary = run_summary_from_parts(
+                                rounds,
+                                tool_calls_total,
+                                usage_total,
+                                None,
+                                started_at,
+                                provider_model.clone(),
+                            );
+                            yield stream_end(&self.events, &run_span, summary,
+                                AgentError::Provider(e));
                             break 'rounds;
                         }
                     }
@@ -1897,8 +2046,16 @@ impl ReActAgent {
                     match self.memory.record(message).await {
                         Ok(()) => {}
                         Err(e) => {
-                            yield stream_end(&self.events, &run_span, rounds, tool_calls_total,
-                                usage_total, AgentError::Memory(e));
+                            let summary = run_summary_from_parts(
+                                rounds,
+                                tool_calls_total,
+                                usage_total,
+                                None,
+                                started_at,
+                                provider_model.clone(),
+                            );
+                            yield stream_end(&self.events, &run_span, summary,
+                                AgentError::Memory(e));
                             break;
                         }
                     }
@@ -1921,16 +2078,30 @@ impl ReActAgent {
                                 match self.memory.record(message).await {
                                     Ok(()) => continue 'rounds,
                                     Err(e) => {
-                                        yield stream_end(&self.events, &run_span, rounds,
-                                            tool_calls_total, usage_total,
+                                        let summary = run_summary_from_parts(
+                                            rounds,
+                                            tool_calls_total,
+                                            usage_total,
+                                            None,
+                                            started_at,
+                                            provider_model.clone(),
+                                        );
+                                        yield stream_end(&self.events, &run_span, summary,
                                             AgentError::Memory(e));
                                         break;
                                     }
                                 }
                             }
                             StructuredOutcome::Exhausted { max_retries } => {
-                                yield stream_end(&self.events, &run_span, rounds,
-                                    tool_calls_total, usage_total,
+                                let summary = run_summary_from_parts(
+                                    rounds,
+                                    tool_calls_total,
+                                    usage_total,
+                                    None,
+                                    started_at,
+                                    provider_model.clone(),
+                                );
+                                yield stream_end(&self.events, &run_span, summary,
                                     AgentError::StructuredRetriesExhausted(max_retries));
                                 break 'rounds;
                             }
@@ -1938,18 +2109,16 @@ impl ReActAgent {
                     }
                     // Validation passed (or no structured constraint): this
                     // round ran to completion; wrap up directly.
-                    publish_ended(
-                        &self.events,
+                    let summary = run_summary_from_parts(
                         rounds,
                         tool_calls_total,
                         usage_total,
-                        None,
+                        round_finish_reason,
+                        started_at,
+                        provider_model.clone(),
                     );
-                    yield Ok(MessageChunk::Done(RunSummary {
-                        rounds,
-                        tool_calls: tool_calls_total,
-                        usage: usage_total,
-                    }));
+                    publish_ended(&self.events, summary.clone(), None);
+                    yield Ok(MessageChunk::Done(summary));
                     break;
                 }
 
@@ -1978,8 +2147,15 @@ impl ReActAgent {
                     // when recording fails, the error text is recorded as a
                     // fallback (memory integrity, see record_tool_result).
                     if let Err(e) = record_tool_result(&mut self.memory, &outcome).await {
-                        yield stream_end(&self.events, &run_span, rounds, tool_calls_total,
-                            usage_total, e);
+                        let summary = run_summary_from_parts(
+                            rounds,
+                            tool_calls_total,
+                            usage_total,
+                            None,
+                            started_at,
+                            provider_model.clone(),
+                        );
+                        yield stream_end(&self.events, &run_span, summary, e);
                         // Errors are produced as Err items and terminate
                         // the stream — the break must exit the whole round
                         // loop, not just the outcome loop (otherwise the
@@ -2004,14 +2180,11 @@ impl CancellableAgent for ReActAgent {
         input: &str,
         token: &CancellationToken,
     ) -> Result<String, AgentError> {
-        // The text form carries the hand-written Schema (if any); the typed
-        // path passes this run's generated Schema directly via
-        // [`run_typed`](ReActAgent::run_typed).
-        // Clone first: avoids conflicting mutable borrows of self with
-        // immutable borrows of config.
-        let schema = self.config.options.structured.clone();
-        self.run_cancellable_inner(input, token, schema.as_ref())
-            .await
+        let context = RunContext::generated().with_cancellation(token.clone());
+        Ok(self
+            .run_request_with_context(RunRequest::text(input), context)
+            .await?
+            .answer)
     }
 
     async fn run_stream_cancellable<'a>(
@@ -2019,7 +2192,17 @@ impl CancellableAgent for ReActAgent {
         input: &'a str,
         token: &CancellationToken,
     ) -> Result<BoxStream<'a, Result<MessageChunk, AgentError>>, AgentError> {
-        self.run_stream_cancellable_inner(input, token).await
+        let context = RunContext::generated().with_cancellation(token.clone());
+        match self
+            .run_stream_request_with_context(RunRequest::text(input), context)
+            .await
+        {
+            Ok(stream) => Ok(stream),
+            Err(AgentError::Cancelled) => Ok(Box::pin(futures::stream::iter([Ok(
+                MessageChunk::Cancelled,
+            )]))),
+            Err(e) => Err(e),
+        }
     }
 }
 
@@ -2066,8 +2249,8 @@ mod tests {
     use crate::memory::MemoryError;
     use crate::message::ContentBlock;
     use crate::provider::{
-        ChatResponse, FakeProvider, FakeReply, FinishReason, ProviderError, StreamEvent,
-        TimeoutStage,
+        ChatResponse, FakeProvider, FakeReply, FinishReason, ModelOptions, ProviderError,
+        StreamEvent, TimeoutStage,
     };
     use crate::tool::{Tool, ToolError, ToolSchema};
     use futures::StreamExt;
@@ -2095,6 +2278,10 @@ mod tests {
 
     #[async_trait::async_trait]
     impl Provider for SharedFake {
+        fn model(&self) -> Option<&str> {
+            self.0.model()
+        }
+
         async fn chat(&self, request: ChatRequest) -> Result<ChatResponse, ProviderError> {
             self.0.chat(request).await
         }
@@ -2157,6 +2344,32 @@ mod tests {
         }
     }
 
+    fn done_summary(chunk: &MessageChunk) -> Option<&RunSummary> {
+        match chunk {
+            MessageChunk::Done(summary) => Some(summary),
+            _ => None,
+        }
+    }
+
+    fn assert_done_summary(chunk: &MessageChunk, rounds: usize, tool_calls: usize, usage: Usage) {
+        assert_done_summary_with_finish(chunk, rounds, tool_calls, usage, Some(FinishReason::Stop));
+    }
+
+    fn assert_done_summary_with_finish(
+        chunk: &MessageChunk,
+        rounds: usize,
+        tool_calls: usize,
+        usage: Usage,
+        finish_reason: Option<FinishReason>,
+    ) {
+        let summary = done_summary(chunk).expect("expected Done chunk");
+        assert_eq!(summary.rounds, rounds);
+        assert_eq!(summary.tool_calls, tool_calls);
+        assert_eq!(summary.usage, usage);
+        assert_eq!(summary.finish_reason, finish_reason);
+        assert_eq!(summary.provider_model, None);
+    }
+
     /// Simple assembly: default Memory + optional system prompt (empty
     /// string = none).
     fn agent(fake: SharedFake, system_prompt: &str) -> ReActAgent {
@@ -2184,6 +2397,75 @@ mod tests {
         assert_eq!(requests.len(), 1);
         assert_eq!(requests[0].messages.len(), 1);
         assert_eq!(requests[0].messages[0], Message::user("Are you there"));
+    }
+
+    #[tokio::test]
+    async fn run_request_returns_structured_output() {
+        let fake = SharedFake::new([FakeReply::text_with_usage("Hello", Usage::new(5, 2))]);
+        let mut agent = agent(fake.clone(), "");
+        let output = agent
+            .run_request_with_context(RunRequest::text("Are you there"), RunContext::new("r1"))
+            .await
+            .unwrap();
+
+        assert_eq!(output.run_id, "r1");
+        assert_eq!(output.answer, "Hello");
+        assert_eq!(output.final_message, Message::assistant("Hello"));
+        assert!(output.artifacts.is_empty());
+        assert!(output.metadata.is_empty());
+        assert_eq!(output.summary.rounds, 1);
+        assert_eq!(output.summary.tool_calls, 0);
+        assert_eq!(output.summary.usage, Usage::new(5, 2));
+        assert_eq!(output.summary.finish_reason, Some(FinishReason::Stop));
+        assert_eq!(output.summary.provider_model, None);
+    }
+
+    #[tokio::test]
+    async fn run_request_blocks_are_recorded_as_user_blocks() {
+        let blocks = vec![ContentBlock::Text("What is this?".into())];
+        let fake = SharedFake::new([FakeReply::Text("A block".into())]);
+        let mut agent = agent(fake.clone(), "");
+
+        agent
+            .run_request(RunRequest::blocks(blocks.clone()))
+            .await
+            .unwrap();
+
+        let requests = fake.requests();
+        assert_eq!(requests[0].messages[0], Message::user_blocks(blocks));
+    }
+
+    #[tokio::test]
+    async fn run_summary_carries_provider_model_when_available() {
+        #[derive(Clone)]
+        struct NamedProvider(SharedFake);
+
+        #[async_trait::async_trait]
+        impl Provider for NamedProvider {
+            fn model(&self) -> Option<&str> {
+                Some("named-model")
+            }
+
+            async fn chat(&self, request: ChatRequest) -> Result<ChatResponse, ProviderError> {
+                self.0.chat(request).await
+            }
+
+            async fn stream_chat(
+                &self,
+                request: ChatRequest,
+            ) -> Result<BoxStream<'static, Result<StreamEvent, ProviderError>>, ProviderError>
+            {
+                self.0.stream_chat(request).await
+            }
+        }
+
+        let mut agent = ReActAgent::new(
+            NamedProvider(SharedFake::new([FakeReply::Text("hi".into())])),
+            ToolRegistry::new(),
+            "",
+        );
+        let output = agent.run_request(RunRequest::text("hi")).await.unwrap();
+        assert_eq!(output.summary.provider_model, Some("named-model".into()));
     }
 
     #[tokio::test]
@@ -2714,14 +2996,7 @@ mod tests {
         ));
         // The stream continues: the model answers directly in the second
         // round and Done follows.
-        assert_eq!(
-            chunks.last(),
-            Some(&MessageChunk::Done(RunSummary {
-                rounds: 2,
-                tool_calls: 1,
-                usage: Usage::default(),
-            }))
-        );
+        assert_done_summary(chunks.last().unwrap(), 2, 1, Usage::default());
     }
 
     /// Streaming: multiple tools in one round, chunks produced strictly in
@@ -2743,9 +3018,10 @@ mod tests {
 
         let mut stream = agent.run_stream("Compute").await.unwrap();
         let chunks: Vec<MessageChunk> = stream.by_ref().map(|e| e.unwrap()).collect().await;
+        assert_eq!(chunks.len(), 6);
         assert_eq!(
-            chunks,
-            vec![
+            &chunks[..5],
+            &[
                 MessageChunk::ToolCall {
                     id: "c1".into(),
                     name: "calc_a".into(),
@@ -2767,13 +3043,9 @@ mod tests {
                     content: "B".into()
                 },
                 MessageChunk::Delta("Done".into()),
-                MessageChunk::Done(RunSummary {
-                    rounds: 2,
-                    tool_calls: 2,
-                    usage: Usage::default(),
-                }),
             ]
         );
+        assert_done_summary(&chunks[5], 2, 2, Usage::default());
     }
 
     /// Error semantics are equivalent across paths: with the same failure
@@ -2835,13 +3107,8 @@ mod tests {
     /// different ids on their first run.
     #[tokio::test]
     async fn run_id_differs_across_instances() {
-        let fake_a = SharedFake::new([FakeReply::Text("hi".into())]);
-        let fake_b = SharedFake::new([FakeReply::Text("hi".into())]);
-        let agent_a = agent(fake_a.clone(), "");
-        let agent_b = agent(fake_b.clone(), "");
-
-        let id_a = agent_a.next_run_id();
-        let id_b = agent_b.next_run_id();
+        let id_a = RunContext::generated().run_id;
+        let id_b = RunContext::generated().run_id;
         assert_ne!(
             id_a, id_b,
             "back-to-back instances must not collide on run_id"
@@ -2902,14 +3169,9 @@ mod tests {
             stream.by_ref().collect().await
         };
         // Empty answer: not recorded + normal Done (rounds counts 1).
-        assert_eq!(
-            chunks,
-            vec![Ok(MessageChunk::Done(RunSummary {
-                rounds: 1,
-                tool_calls: 0,
-                usage: Usage::default(),
-            }))]
-        );
+        assert_eq!(chunks.len(), 1);
+        let chunk = chunks[0].as_ref().unwrap();
+        assert_done_summary_with_finish(chunk, 1, 0, Usage::default(), None);
         // The memory only holds the user input; no empty Assistant was
         // recorded.
         assert_eq!(
@@ -2940,9 +3202,10 @@ mod tests {
 
         let mut stream = agent.run_stream("Compute").await.unwrap();
         let events: Vec<MessageChunk> = stream.by_ref().map(|e| e.unwrap()).collect().await;
+        assert_eq!(events.len(), 5);
         assert_eq!(
-            events,
-            vec![
+            &events[..4],
+            &[
                 MessageChunk::Delta("Thinking: ".into()),
                 MessageChunk::ToolCall {
                     id: "c1".into(),
@@ -2955,16 +3218,9 @@ mod tests {
                     content: "42".into()
                 },
                 MessageChunk::Delta("The answer is 42".into()),
-                // Two conversation rounds (tool round + direct-answer
-                // round), one tool execution; the fake injects no usage, so
-                // it's always zero.
-                MessageChunk::Done(RunSummary {
-                    rounds: 2,
-                    tool_calls: 1,
-                    usage: Usage::default(),
-                }),
             ]
         );
+        assert_done_summary(&events[4], 2, 1, Usage::default());
     }
 
     /// Pure tool round: no text, no Delta dispatched; the tool call still
@@ -2985,9 +3241,10 @@ mod tests {
 
         let mut stream = agent.run_stream("Compute").await.unwrap();
         let events: Vec<MessageChunk> = stream.by_ref().map(|e| e.unwrap()).collect().await;
+        assert_eq!(events.len(), 4);
         assert_eq!(
-            events,
-            vec![
+            &events[..3],
+            &[
                 MessageChunk::ToolCall {
                     id: "c1".into(),
                     name: "calc".into(),
@@ -2999,13 +3256,9 @@ mod tests {
                     content: "42".into()
                 },
                 MessageChunk::Delta("42".into()),
-                MessageChunk::Done(RunSummary {
-                    rounds: 2,
-                    tool_calls: 1,
-                    usage: Usage::default(),
-                }),
             ]
         );
+        assert_done_summary(&events[3], 2, 1, Usage::default());
     }
 
     /// The Done summary carries real token usage (injected via
@@ -3033,14 +3286,7 @@ mod tests {
 
         // Two conversation rounds (tool round + direct-answer round), one
         // tool execution; usage accumulates per round.
-        assert_eq!(
-            events.last(),
-            Some(&MessageChunk::Done(RunSummary {
-                rounds: 2,
-                tool_calls: 1,
-                usage: Usage::new(30, 7), // prompt 10+20,completion 2+5
-            }))
-        );
+        assert_done_summary(events.last().unwrap(), 2, 1, Usage::new(30, 7));
     }
 
     /// run and run_stream with the same script share semantics: identical
@@ -3270,8 +3516,6 @@ mod tests {
     /// carries the configured model parameters.
     #[tokio::test]
     async fn config_options_forwarded_to_chat_request() {
-        use crate::provider::ModelOptions;
-
         let fake = SharedFake::new([FakeReply::Text("hi".into())]);
         let mut agent = agent(fake.clone(), "").with_config(AgentConfig {
             max_tool_rounds: 10,
@@ -3288,6 +3532,30 @@ mod tests {
         let req = &fake.requests()[0];
         assert_eq!(req.options.temperature, Some(0.2));
         assert_eq!(req.options.max_tokens, Some(128));
+    }
+
+    #[tokio::test]
+    async fn request_options_replace_config_options() {
+        let fake = SharedFake::new([FakeReply::Text("hi".into())]);
+        let mut agent = agent(fake.clone(), "").with_config(AgentConfig {
+            options: ModelOptions {
+                temperature: Some(0.2),
+                max_tokens: Some(128),
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        agent
+            .run_request(RunRequest::text("hi").with_options(ModelOptions {
+                max_tokens: Some(64),
+                ..Default::default()
+            }))
+            .await
+            .unwrap();
+
+        let req = &fake.requests()[0];
+        assert_eq!(req.options.temperature, None);
+        assert_eq!(req.options.max_tokens, Some(64));
     }
 
     // ---- Cancellation: run_cancellable / run_stream_cancellable ----
@@ -3434,6 +3702,68 @@ mod tests {
         assert_eq!(agent.memory.context().await.unwrap().len(), 1);
     }
 
+    #[tokio::test]
+    async fn deadline_exceeded_during_chat_is_distinct_from_provider_timeout() {
+        struct PendingProvider;
+        #[async_trait::async_trait]
+        impl Provider for PendingProvider {
+            async fn chat(&self, _request: ChatRequest) -> Result<ChatResponse, ProviderError> {
+                std::future::pending().await
+            }
+
+            async fn stream_chat(
+                &self,
+                _request: ChatRequest,
+            ) -> Result<BoxStream<'static, Result<StreamEvent, ProviderError>>, ProviderError>
+            {
+                std::future::pending().await
+            }
+        }
+
+        let mut agent = ReActAgent::new(PendingProvider, ToolRegistry::new(), "");
+        let err = agent
+            .run_request_with_context(
+                RunRequest::text("hi"),
+                RunContext::new("deadline").with_timeout(Duration::from_millis(10)),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(err, AgentError::DeadlineExceeded);
+        assert_eq!(agent.memory.context().await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn streaming_deadline_exceeded_terminates_with_error_item() {
+        struct PendingStreamProvider;
+        #[async_trait::async_trait]
+        impl Provider for PendingStreamProvider {
+            async fn chat(&self, _request: ChatRequest) -> Result<ChatResponse, ProviderError> {
+                unreachable!("this test uses streaming only")
+            }
+
+            async fn stream_chat(
+                &self,
+                _request: ChatRequest,
+            ) -> Result<BoxStream<'static, Result<StreamEvent, ProviderError>>, ProviderError>
+            {
+                Ok(Box::pin(futures::stream::pending()))
+            }
+        }
+
+        let mut agent = ReActAgent::new(PendingStreamProvider, ToolRegistry::new(), "");
+        let mut stream = agent
+            .run_stream_request_with_context(
+                RunRequest::text("hi"),
+                RunContext::new("stream-deadline").with_timeout(Duration::from_millis(10)),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            stream.next().await.unwrap().unwrap_err(),
+            AgentError::DeadlineExceeded
+        );
+    }
+
     /// Structured output: an answer conforming to the schema is returned
     /// directly (validation passes in a single round).
     #[tokio::test]
@@ -3522,6 +3852,78 @@ mod tests {
         assert!(agent.config.options.structured.is_none());
     }
 
+    #[tokio::test]
+    async fn typed_run_request_returns_value_and_output() {
+        #[derive(Debug, Deserialize, JsonSchema, PartialEq)]
+        struct Weather {
+            city: String,
+        }
+        let fake = SharedFake::new([FakeReply::Text(r#"{"city":"Beijing"}"#.into())]);
+        let mut agent = agent(fake.clone(), "");
+        let typed = agent
+            .run_typed_request_with_context::<Weather>(
+                RunRequest::text("Beijing weather"),
+                RunContext::new("typed-1"),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            typed.value,
+            Weather {
+                city: "Beijing".into()
+            }
+        );
+        assert_eq!(typed.output.run_id, "typed-1");
+        assert_eq!(typed.output.answer, r#"{"city":"Beijing"}"#);
+        assert_eq!(
+            typed.output.final_message,
+            Message::assistant(r#"{"city":"Beijing"}"#)
+        );
+    }
+
+    #[tokio::test]
+    async fn typed_schema_overrides_request_and_config_schema() {
+        #[derive(Debug, Deserialize, JsonSchema)]
+        struct Weather {
+            city: String,
+        }
+        let config_schema = serde_json::json!({
+            "type": "object",
+            "properties": { "config_only": { "type": "string" } },
+            "required": ["config_only"],
+        });
+        let request_schema = serde_json::json!({
+            "type": "object",
+            "properties": { "request_only": { "type": "string" } },
+            "required": ["request_only"],
+        });
+        let fake = SharedFake::new([FakeReply::Text(r#"{"city":"Beijing"}"#.into())]);
+        let mut agent = agent(fake.clone(), "").with_structured_output(config_schema);
+        let options = ModelOptions {
+            structured: Some(request_schema),
+            ..Default::default()
+        };
+
+        let weather: Weather = agent
+            .run_typed_request(RunRequest::text("Beijing weather").with_options(options))
+            .await
+            .unwrap()
+            .value;
+
+        assert_eq!(weather.city, "Beijing");
+        let requests = fake.requests();
+        let structured = requests[0]
+            .options
+            .structured
+            .as_ref()
+            .expect("typed schema should be sent");
+        let props = &structured["properties"];
+        assert!(props.get("city").is_some());
+        assert!(props.get("request_only").is_none());
+        assert!(props.get("config_only").is_none());
+    }
+
     /// Typed run: an invalid answer is fed back for retry first; the
     /// corrected second round deserializes successfully.
     #[tokio::test]
@@ -3574,7 +3976,7 @@ mod tests {
         struct Weather {
             city: String,
         }
-        async fn typed_run<A: TypedAgent>(
+        async fn typed_run<A: TypedAgent + Send>(
             agent: &mut A,
             input: &str,
         ) -> Result<Weather, AgentError> {
@@ -4013,6 +4415,26 @@ mod tests {
                 assert_eq!(summary.tool_calls, 1);
             }
             _ => panic!("expected RunEnded"),
+        }
+    }
+
+    #[tokio::test]
+    async fn run_started_event_preserves_block_input() {
+        let blocks = vec![ContentBlock::Text("look".into())];
+        let fake = SharedFake::new([FakeReply::Text("done".into())]);
+        let (mut agent, mut rx) = attach_channel(agent(fake, ""));
+        agent
+            .run_request(RunRequest::blocks(blocks.clone()))
+            .await
+            .unwrap();
+        drop(agent);
+        let events = drain(&mut rx).await;
+
+        match react_event(&*events[0]) {
+            ReActEvent::RunStarted { input, .. } => {
+                assert_eq!(input, &crate::UserInput::Blocks(blocks));
+            }
+            _ => panic!("expected RunStarted"),
         }
     }
 

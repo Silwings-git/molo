@@ -40,8 +40,8 @@
 //! ```
 
 use super::{AgentEvent, RunSummary};
-use crate::AgentError;
 use crate::tool::RegistryError;
+use crate::{AgentError, UserInput};
 
 /// A single event from ReActAgent (application level; the event name is
 /// provided per variant via [`AgentEvent::name`]).
@@ -56,7 +56,7 @@ pub enum ReActEvent {
         /// segment implicitly belong to this run.
         run_id: String,
         /// The user input for this run.
-        input: String,
+        input: UserInput,
     },
     /// An increment of the model's reply text (same content as
     /// [`MessageChunk::Delta`](super::MessageChunk::Delta) — pushed to

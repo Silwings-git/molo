@@ -128,6 +128,7 @@ pub mod memory;
 pub mod message;
 pub mod message_channel;
 pub mod provider;
+pub mod run;
 pub mod skill;
 pub mod tool;
 
@@ -144,7 +145,7 @@ pub use molo_macros::tool;
 
 pub use agent::{
     Agent, AgentConfig, AgentError, AgentEvent, CancellableAgent, MessageChunk, ReActAgent,
-    ReActEvent, RunSummary, StructuredOutcome, StructuredValidator, TypedAgent,
+    ReActEvent, StructuredOutcome, StructuredValidator, TypedAgent,
 };
 pub use event_channel::{BroadcastEventChannel, EventChannel, EventReceiver, MpscEventChannel};
 pub use mcp::{McpClient, McpError, McpTool};
@@ -161,6 +162,9 @@ pub use provider::{
     Backoff, ChatRequest, ChatResponse, FakeProvider, FakeReply, FinishReason, ModelOptions,
     OpenAiProvider, Provider, ProviderError, RetryPolicy, RetryProvider, Retryable, StreamEvent,
     StructuredOutputMode, Usage,
+};
+pub use run::{
+    Artifact, RunContext, RunMetadata, RunOutput, RunRequest, RunSummary, TypedRunOutput, UserInput,
 };
 pub use skill::{AllowedTool, LoadSkillTool, Skill, SkillError, SkillRegistry};
 pub use tool::{

@@ -333,6 +333,10 @@ impl<I: Provider> RetryProvider<I> {
 
 #[async_trait]
 impl<I: Provider + Send + Sync> Provider for RetryProvider<I> {
+    fn model(&self) -> Option<&str> {
+        self.inner.model()
+    }
+
     async fn chat(&self, request: ChatRequest) -> Result<ChatResponse, ProviderError> {
         let mut attempts = 0usize;
         loop {
