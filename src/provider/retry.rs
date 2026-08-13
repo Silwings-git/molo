@@ -320,6 +320,7 @@ impl<I: Provider> RetryProvider<I> {
             ) => (*d).min(RETRY_AFTER_CAP),
             _ => self.policy.backoff.delay(attempts),
         };
+        #[cfg(feature = "tracing")]
         tracing::warn!(
             attempt = attempts + 1,
             max_attempts = self.policy.max_attempts,

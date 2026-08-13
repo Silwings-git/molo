@@ -3,15 +3,18 @@
 //! This module defines the `Provider` trait and its companion data types:
 //! requests ([`ChatRequest`]), responses ([`ChatResponse`] / [`StreamEvent`]),
 //! errors ([`ProviderError`]), and usage ([`Usage`]). The trait itself is
-//! vendor-agnostic; the implementations ([`OpenAiProvider`] / [`FakeProvider`]
-//! / [`RetryProvider`]) all implement the same trait, and any implementation
-//! can be wrapped by [`RetryProvider`] to gain retry capability.
+//! vendor-agnostic; the implementations ([`FakeProvider`] /
+//! [`RetryProvider`], and [`OpenAiProvider`] with the `openai` feature) all
+//! implement the same trait, and any implementation can be wrapped by
+//! [`RetryProvider`] to gain retry capability.
 
 mod fake;
+#[cfg(feature = "openai")]
 mod openai;
 mod retry;
 
 pub use fake::{FakeProvider, FakeReply};
+#[cfg(feature = "openai")]
 pub use openai::{OpenAiProvider, StructuredOutputMode};
 pub use retry::{Backoff, RetryPolicy, RetryProvider, Retryable};
 
@@ -176,7 +179,8 @@ pub struct ModelOptions {
     /// - Agent side: the final answer is **validated framework-side**, and on
     ///   mismatch the validation error is fed back to the model for a retry
     ///   (counted against the turn budget; see
-    ///   [`ReActAgent::with_structured_output`](crate::agent::ReActAgent::with_structured_output)).
+    ///   [`ReActAgent::with_structured_output`](crate::agent::ReActAgent::with_structured_output),
+    ///   available with the `structured` feature).
     ///
     /// `None` = free-form text reply.
     pub structured: Option<serde_json::Value>,

@@ -547,7 +547,10 @@ impl SkillRegistry {
                 Err(e) => {
                     // Single-entry read failure: warn and skip, do not
                     // interrupt other directories.
+                    #[cfg(feature = "tracing")]
                     tracing::warn!("failed to read skill directory entry: {e}");
+                    #[cfg(not(feature = "tracing"))]
+                    let _ = e;
                     continue;
                 }
             }
@@ -557,7 +560,12 @@ impl SkillRegistry {
                 Ok(skill) => {
                     registry.add(skill);
                 }
-                Err(err) => tracing::warn!("skipping skill directory {}: {err}", dir.display()),
+                Err(err) => {
+                    #[cfg(feature = "tracing")]
+                    tracing::warn!("skipping skill directory {}: {err}", dir.display());
+                    #[cfg(not(feature = "tracing"))]
+                    let _ = err;
+                }
             }
         }
         Ok(registry)
@@ -602,7 +610,10 @@ impl SkillRegistry {
                     }
                 }
                 Err(err) => {
+                    #[cfg(feature = "tracing")]
                     tracing::warn!("skipping skill source directory {}: {err}", path.display());
+                    #[cfg(not(feature = "tracing"))]
+                    let _ = err;
                 }
             }
         }

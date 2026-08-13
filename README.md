@@ -30,24 +30,25 @@ boundaries and dependency rules.
 ## Status
 
 molo is in an early 0.x phase with a planned architecture evolution. The
-`0.2.x` crate currently ships the agent-runtime side: the `ReActAgent`
-reasoning loop, provider, memory, tools, MCP, skills, structured output, and
-observability. The harness and coding-workload layers are being designed and
-will land as optional components in later releases. Public API breaking
-changes are expected throughout 0.x when they serve the target architecture;
-each one ships with a migration path.
+`0.3.x` crate ships the agent-runtime side: the `ReActAgent` reasoning loop,
+provider traits, memory, tools, effects, optional OpenAI-compatible provider,
+MCP, skills, structured output, macros, and observability. The harness and
+coding-workload layers are being designed and will land as optional components
+in later releases. Public API breaking changes are expected throughout 0.x
+when they serve the target architecture; each one ships with a migration path.
 
 ## ✨ Features
 
 - **Built-in reasoning loop** — `ReActAgent` implements the classic
   "think → call tools → feed results back → answer" loop, with a tool-round
   limit, cooperative cancellation, usage aggregation, event channel, and
-  tracing spans included.
+  optional tracing spans.
 - **Everything is pluggable** — `Provider` (LLM), `Memory` (context) and
   `Tool` (capabilities) are traits; swap implementations per scenario without
   touching the loop.
-- **Real-world integrations** — MCP client for external tools, Agent Skills
-  with progressive disclosure, structured output validated against JSON Schema.
+- **Real-world integrations** — optional MCP client for external tools, Agent
+  Skills with progressive disclosure, and structured output validated against
+  JSON Schema.
 - **Observable & controllable** — stream every token, subscribe to agent
   events, talk to the outside world (human confirmation, agent-to-agent
   conversation), and cancel runs cooperatively.
@@ -63,8 +64,18 @@ assembles everything in one call.
 
 ```toml
 [dependencies]
-molo = "0.2"
+molo = "0.3"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+```
+
+The default feature set is intentionally small. Enable optional capabilities
+when you use them:
+
+```toml
+molo = { version = "0.3", features = ["openai"] }      # OpenAiProvider
+molo = { version = "0.3", features = ["macros"] }      # #[molo::tool]
+molo = { version = "0.3", features = ["structured"] }  # TypedAgent / validation
+molo = { version = "0.3", features = ["full"] }        # all optional features
 ```
 
 ### Self-test without an API
@@ -84,8 +95,9 @@ assert_eq!(answer, "Hello");
 
 ### Talk to a real LLM
 
-Swap in `OpenAiProvider` (any OpenAI-compatible endpoint), wrap it in
-`RetryProvider` for retry/timeout protection, and add tools:
+Enable `features = ["openai"]`, swap in `OpenAiProvider` (any
+OpenAI-compatible endpoint), wrap it in `RetryProvider` for retry/timeout
+protection, and add tools:
 
 ```rust
 use molo::{react_agent, Agent, OpenAiProvider};
@@ -131,7 +143,8 @@ println!("{} tokens", output.summary.usage.total_tokens);
 ```
 
 Typed output has the same structured path via `run_typed_request`, returning
-both the deserialized value and the raw `RunOutput`.
+both the deserialized value and the raw `RunOutput`. It requires the
+`structured` feature.
 
 ## 🧩 Core Concepts
 
@@ -140,15 +153,15 @@ root re-exports each module's core items, so `use molo::...` covers most cases:
 
 | Concept | What it does | Key types |
 | --- | --- | --- |
-| Agent | the reasoning loop | `Agent`, `AgentKernel`, `AgentAction`, `ReActAgent`, `react_agent!`, `TypedAgent`, `CancellableAgent` |
-| Provider | LLM communication | `Provider`, `OpenAiProvider`, `RetryProvider`, `FakeProvider` |
+| Agent | the reasoning loop | `Agent`, `AgentKernel`, `AgentAction`, `ReActAgent`, `react_agent!`, `CancellableAgent`; `TypedAgent` with `structured` |
+| Provider | LLM communication | `Provider`, `RetryProvider`, `FakeProvider`; `OpenAiProvider` with `openai` |
 | Memory | context management | `Memory`, `InMemoryMemory`, `WindowMemory`, `SummarizeStrategy` |
-| Tool | model-visible capabilities | `Tool`, `ToolSchema`, `ToolPolicy`, `ToolOutput`, `ToolResult`, `ToolRegistry`, `SharedState`, `#[molo::tool]` |
+| Tool | model-visible capabilities | `Tool`, `ToolSchema`, `ToolPolicy`, `ToolOutput`, `ToolResult`, `ToolRegistry`, `SharedState`; `#[molo::tool]` with `macros` |
 | Effect | side-effect boundary | `EffectRequest`, `EffectObservation`, `EffectKind`, `RiskLevel` |
-| Skill | capability packs (Agent Skills protocol) | `Skill`, `SkillRegistry`, `LoadSkillTool` |
-| MCP | external tool servers | `McpClient`, `McpTool` |
+| Skill | capability packs (Agent Skills protocol) | `Skill`, `SkillRegistry`, `LoadSkillTool` with `skills` |
+| MCP | external tool servers | `McpClient`, `McpTool` with `mcp` |
 | Message | conversation model | `Message`, `ContentBlock`, `ToolCall` |
-| MessageChannel | external conversation (human/agents) | `CliMessageChannel`, `MpscChannel`, `BroadcastChannel`, `WatchChannel` |
+| MessageChannel | external conversation (human/agents) | `MpscChannel`, `BroadcastChannel`, `WatchChannel`; `CliMessageChannel` with `cli-channel` |
 | EventChannel | observation of a run | `BroadcastEventChannel`, `MpscEventChannel` |
 
 ### Choosing between implementations
@@ -156,12 +169,12 @@ root re-exports each module's core items, so `use molo::...` covers most cases:
 - **Context** — `InMemoryMemory` for short or unbounded sessions; `WindowMemory`
   trims the oldest turns to a token budget; add `SummarizeStrategy` to compress
   over-budget messages into a single summary.
-- **Talking to the LLM** — `FakeProvider` for development (scripted replies, no
-  API), `OpenAiProvider` + `RetryProvider` for production.
-- **External conversation** — `CliMessageChannel` for human-terminal interaction,
-  `MpscChannel` for one-to-one in-process agent conversation,
-  `BroadcastChannel` / `WatchChannel` for one-to-many broadcast and
-  latest-value notifications.
+- **Talking to the LLM** — `FakeProvider` for development (scripted replies,
+  no API), `OpenAiProvider` + `RetryProvider` for production with `openai`.
+- **External conversation** — `MpscChannel` for one-to-one in-process agent
+  conversation, `BroadcastChannel` / `WatchChannel` for one-to-many broadcast
+  and latest-value notifications, and `CliMessageChannel` for human-terminal
+  interaction with `cli-channel`.
 - **Observing the process** — `BroadcastEventChannel` (multiple subscribers,
   slow ones drop the oldest events) or `MpscEventChannel` (single subscriber,
   nothing dropped within capacity).
@@ -169,6 +182,8 @@ root re-exports each module's core items, so `use molo::...` covers most cases:
 ## 🛠 Highlights
 
 ### Tools: one-shot definition with `#[molo::tool]`
+
+Requires `features = ["macros"]`.
 
 Writing a tool by hand takes ~25 lines of boilerplate; the macro generates the
 struct, schema, argument parsing, output wrapping, and error conversion from an
@@ -200,6 +215,8 @@ harness can choose sequential or parallel execution.
 
 ### Typed (structured) output
 
+Requires `features = ["structured"]`.
+
 `run_typed` validates the model's reply against a JSON Schema derived from
 your return type; on validation failure the error is fed back to the model for
 retry (3 attempts by default):
@@ -210,6 +227,8 @@ println!("{}°C, {}", weather.temperature, weather.condition);
 ```
 
 ### MCP client
+
+Requires `features = ["mcp"]`.
 
 Bring tools exposed by external MCP servers into the agent. `McpClient`
 supports the stdio child-process and Streamable HTTP transports (via `rmcp`):
@@ -223,6 +242,8 @@ for tool in client.tools().await? {
 ```
 
 ### Skills (Agent Skills open protocol)
+
+Requires `features = ["skills"]`.
 
 A skill is a directory containing `SKILL.md` (YAML frontmatter + Markdown).
 The core mechanism is **progressive disclosure**: the model first sees only a
@@ -252,9 +273,10 @@ mid-reply leaves no residue and the next turn starts fresh.
   tool calls).
 - `EventChannel` — subscribe to the `AgentEvent` stream of a run for
   decoupled observation.
-- Loops emit `tracing` spans at fixed points (`agent.run`, `llm_request`,
-  `tool`). No subscriber is installed — bring your own (e.g.
-  `tracing-subscriber`), and wire OpenTelemetry yourself if needed.
+- With `features = ["tracing"]`, loops emit `tracing` spans at fixed points
+  (`agent.run`, `llm_request`, `tool`). No subscriber is installed — bring
+  your own (e.g. `tracing-subscriber`), and wire OpenTelemetry yourself if
+  needed.
 
 ## 📚 Examples
 
@@ -266,59 +288,59 @@ Self-contained examples (no real API needed) are marked ✦.
 
 | Example | Run | What it shows |
 | --- | --- | --- |
-| ✦ `react_agent` | `cargo run --example react_agent` | The built-in `ReActAgent` + `react_agent!` macro (stream / chat modes) |
-| `agent` | `cargo run --example agent` | Hand-writing the `Agent` trait loop yourself |
-| `tool_agent` | `cargo run --example tool_agent` | Tool-call loop with `Provider::chat` / `stream_chat` |
-| `sub_agent` | `cargo run --example sub_agent` | Sub-agent delegation, `SubAgentTool` / `SubAgentPool` |
+| ✦ `react_agent` | `cargo run --example react_agent --features openai,structured` | The built-in `ReActAgent` + `react_agent!` macro (stream / chat modes) |
+| `agent` | `cargo run --example agent --features openai,structured` | Hand-writing the `Agent` trait loop yourself |
+| `tool_agent` | `cargo run --example tool_agent --features openai,structured` | Tool-call loop with `Provider::chat` / `stream_chat` |
+| `sub_agent` | `cargo run --example sub_agent --features openai,structured` | Sub-agent delegation, `SubAgentTool` / `SubAgentPool` |
 
 ### Tools
 
 | Example | Run | What it shows |
 | --- | --- | --- |
-| ✦ `tool_registry` | `cargo run --example tool_registry` | Registry full API: register / names / schemas / call / subset |
-| ✦ `tool_macro` | `cargo run --example tool_macro` | One-shot tool definitions with `#[molo::tool]` |
+| ✦ `tool_registry` | `cargo run --example tool_registry --features structured` | Registry full API: register / names / schemas / call / subset |
+| ✦ `tool_macro` | `cargo run --example tool_macro --features macros` | One-shot tool definitions with `#[molo::tool]` |
 | ✦ `shared_state` | `cargo run --example shared_state` | Three ways to use `SharedState` |
-| ✦ `mcp` | `cargo run --example mcp` | MCP client adapter, self-contained fake server |
+| ✦ `mcp` | `cargo run --example mcp --features mcp` | MCP client adapter, self-contained fake server |
 
 ### Provider
 
 | Example | Run | What it shows |
 | --- | --- | --- |
-| `chat` | `cargo run --example chat` | Plain chat with a real model |
-| `chat_stream` | `cargo run --example chat_stream` | Streaming chat, tokens as they arrive |
-| `multimodal` | `cargo run --example multimodal -- <image path>` | Image input (`ContentBlock::Image`) to a multimodal model |
+| `chat` | `cargo run --example chat --features openai` | Plain chat with a real model |
+| `chat_stream` | `cargo run --example chat_stream --features openai` | Streaming chat, tokens as they arrive |
+| `multimodal` | `cargo run --example multimodal --features openai -- <image path>` | Image input (`ContentBlock::Image`) to a multimodal model |
 | ✦ `fake_provider` | `cargo run --example fake_provider` | Scripted replies for testing your own loop |
-| `retry` | `cargo run --example retry` | `RetryProvider` wrapper |
-| `usage` | `cargo run --example usage` | Per-run execution summary (tokens, rounds) |
-| `trace` | `cargo run --example trace` | Rendering the tracing spans to the console |
+| `retry` | `cargo run --example retry --features openai` | `RetryProvider` wrapper |
+| `usage` | `cargo run --example usage --features openai,structured` | Per-run execution summary (tokens, rounds) |
+| `trace` | `cargo run --example trace --features macros,tracing` | Rendering the tracing spans to the console |
 
 ### Memory
 
 | Example | Run | What it shows |
 | --- | --- | --- |
 | ✦ `window_memory` | `cargo run --example window_memory` | `WindowMemory` trimming and custom trim strategies |
-| `window_memory_agent` | `cargo run --example window_memory_agent` | Real-model agent with a token-budget window |
+| `window_memory_agent` | `cargo run --example window_memory_agent --features openai` | Real-model agent with a token-budget window |
 | ✦ `summarize` | `cargo run --example summarize` | `SummarizeStrategy`: compress old messages into a summary |
-| `summarize_agent` | `cargo run --example summarize_agent` | Real-model streaming agent with summary compression |
+| `summarize_agent` | `cargo run --example summarize_agent --features openai,tracing` | Real-model streaming agent with summary compression |
 
 ### Channels
 
 | Example | Run | What it shows |
 | --- | --- | --- |
-| ✦ `message_channel` | `cargo run --example message_channel` | All four channel implementations (Cli / Mpsc / Broadcast / Watch) |
-| `confirm_agent` | `cargo run --example confirm_agent` | Human confirmation via `MessageChannel` |
-| `mpsc_agent` | `cargo run --example mpsc_agent` | Two-agent conversation over `MpscChannel` |
-| `broadcast_agent` | `cargo run --example broadcast_agent` | One-to-many broadcast notifications |
-| `watch_agent` | `cargo run --example watch_agent` | Latest-value status publishing via `WatchChannel` |
+| ✦ `message_channel` | `cargo run --example message_channel --features structured,cli-channel` | All four channel implementations (Cli / Mpsc / Broadcast / Watch) |
+| `confirm_agent` | `cargo run --example confirm_agent --features openai,structured,cli-channel` | Human confirmation via `MessageChannel` |
+| `mpsc_agent` | `cargo run --example mpsc_agent --features openai,structured` | Two-agent conversation over `MpscChannel` |
+| `broadcast_agent` | `cargo run --example broadcast_agent --features openai,structured` | One-to-many broadcast notifications |
+| `watch_agent` | `cargo run --example watch_agent --features openai,structured` | Latest-value status publishing via `WatchChannel` |
 | ✦ `event_channel` | `cargo run --example event_channel` | Subscribing to the event stream (self-contained) |
-| `event_channel_agent` | `cargo run --example event_channel_agent` | Real-model agent observed through an `EventChannel` |
+| `event_channel_agent` | `cargo run --example event_channel_agent --features openai,structured` | Real-model agent observed through an `EventChannel` |
 
 ### Output, skills, cancellation
 
 | Example | Run | What it shows |
 | --- | --- | --- |
-| ✦ `structured` | `cargo run --example structured` | Typed output with `run_typed` and JSON Schema validation |
-| ✦ `skill` | `cargo run --example skill` | Skills: discovery, progressive disclosure, activation |
+| ✦ `structured` | `cargo run --example structured --features structured` | Typed output with `run_typed` and JSON Schema validation |
+| ✦ `skill` | `cargo run --example skill --features skills` | Skills: discovery, progressive disclosure, activation |
 | ✦ `cancellation` | `cargo run --example cancellation` | Cooperative cancellation mid-reply, then continue |
 
 ## ⚙️ Configuration

@@ -1,6 +1,6 @@
 [package]
 name = "molo-macros"
-version = "0.2.4"
+version = "0.3.0"
 edition = "2024"
 rust-version = "1.97"
 description = "Procedural macros for molo: one-shot tool definitions (#[molo::tool])"

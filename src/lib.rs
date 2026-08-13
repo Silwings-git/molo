@@ -10,12 +10,25 @@
 //! tools, structured output, and observability. The target architecture also
 //! includes an optional harness layer (approval, sandbox, audit, transcript)
 //! that governs and executes side effects, and an optional coding-workload
-//! SDK (workspace, shell, git, patch, repo context). The `0.2.x` crate
-//! currently ships the agent-runtime side of that picture; the harness and
-//! coding layers are being introduced as optional components in later
-//! releases. Public API breaking changes are expected throughout 0.x when
-//! they serve the target architecture, and each one ships with a migration
-//! path.
+//! SDK (workspace, shell, git, patch, repo context). Public API breaking
+//! changes are expected throughout 0.x when they serve the target
+//! architecture, and each one ships with a migration path.
+//!
+//! # Feature Flags
+//!
+//! The default dependency surface is the lightweight core path. Optional
+//! capabilities are enabled explicitly:
+//!
+//! - `openai`: [`OpenAiProvider`] and OpenAI-compatible HTTP support.
+//! - `structured`: typed output, [`StructuredValidator`], and JSON Schema
+//!   validation.
+//! - `macros`: the [`tool`](macro@molo::tool) attribute macro. This also
+//!   enables `structured` because macro-generated schemas use `schemars`.
+//! - `skills`: Agent Skills protocol support.
+//! - `mcp`: MCP client adapter support.
+//! - `cli-channel`: [`CliMessageChannel`] for stdin/stdout interaction.
+//! - `tracing`: internal tracing spans and logs.
+//! - `full`: all optional capabilities above.
 //!
 //! # Quick Start
 //!
@@ -41,7 +54,8 @@
 //! # }
 //! ```
 //!
-//! For a real LLM, swap [`FakeProvider`] for [`OpenAiProvider`]; for retry
+//! For a real LLM, enable the `openai` feature and swap [`FakeProvider`] for
+//! [`OpenAiProvider`]; for retry
 //! and timeout protection, wrap it in [`RetryProvider`]; for interaction
 //! with the outside world (human approval, agent-to-agent conversation),
 //! attach a [`MessageChannel`]; to observe the reasoning process, attach an
@@ -55,27 +69,24 @@
 //!
 //! - [`agent`] — the agent interface and reasoning loop — [`Agent`] /
 //!   [`CancellableAgent`] / [`AgentError`], typed output via [`TypedAgent`]
-//!   with the validator [`StructuredValidator`], the [`ReActAgent`]
-//!   assembly with the [`react_agent!`] macro, sub-agent parts
+//!   with the validator [`StructuredValidator`] when the `structured`
+//!   feature is enabled, the [`ReActAgent`] assembly with the
+//!   [`react_agent!`] macro, sub-agent parts
 //!   ([`SubAgentTool`](crate::agent::SubAgentTool) /
 //!   [`SubAgentPool`](crate::agent::SubAgentPool)), streaming output chunks
 //!   and run summaries ([`MessageChunk`] / [`RunSummary`]);
 //! - [`provider`] — LLM communication — the [`Provider`] interface,
 //!   request / response / usage models ([`ChatRequest`] / [`ChatResponse`] /
-//!   [`Usage`]), and implementations [`OpenAiProvider`] / [`RetryProvider`] /
-//!   [`FakeProvider`];
+//!   [`Usage`]), and implementations [`RetryProvider`] / [`FakeProvider`],
+//!   plus [`OpenAiProvider`] with the `openai` feature;
 //! - [`tool`](mod@crate::tool): external capabilities — the [`Tool`]
 //!   interface and tool definitions ([`ToolSchema`]), registration and
 //!   execution ([`ToolRegistry`]), cross-tool shared state
 //!   ([`SharedState`]), and the procedural macro for one-shot tool
-//!   definitions [`tool`](macro@molo::tool);
-//! - [`skill`] — skills — capability packages following the Agent Skills
-//!   open protocol ([`Skill`] parsing / validation, [`SkillRegistry`]
-//!   discovery and hot-swapping, progressive disclosure loading via
-//!   [`LoadSkillTool`]);
-//! - [`mcp`] — MCP client adapter — wiring tools exposed by external MCP
-//!   servers into molo ([`McpClient`] connects and pulls, [`McpTool`]
-//!   adapts tools, [`McpError`]);
+//!   definitions [`tool`](macro@molo::tool) with the `macros` feature;
+//! - `skill` — skills — capability packages following the Agent Skills
+//!   open protocol, available with the `skills` feature;
+//! - `mcp` — MCP client adapter, available with the `mcp` feature;
 //! - [`memory`] — context management — the [`Memory`] interface and
 //!   implementations [`InMemoryMemory`] / [`WindowMemory`] (trims the
 //!   oldest turns by token budget), summary compression
@@ -83,9 +94,9 @@
 //!   single summary;
 //! - [`message`] — the conversation message model — [`Message`] /
 //!   [`ContentBlock`] / [`ToolCall`];
-//! - [`message_channel`] — channels for external conversation —
-//!   [`CliMessageChannel`] and three more implementations (request-reply /
-//!   one-way notification);
+//! - [`message_channel`] — channels for external conversation — in-process
+//!   request-reply / notification channels, plus [`CliMessageChannel`] with
+//!   the `cli-channel` feature;
 //! - [`event_channel`] — observation channels — subscribe to the event
 //!   stream of an agent run ([`AgentEvent`] payloads).
 //!
@@ -97,13 +108,14 @@
 //!   [`InMemoryMemory`]; long sessions that must stay within budget use
 //!   [`WindowMemory`];
 //! - **Talking to the LLM**: for development, inject scripted replies with
-//!   [`FakeProvider`], no real API needed; for production use
-//!   [`OpenAiProvider`], wrapped in [`RetryProvider`] for retry / timeout
-//!   protection;
-//! - **External conversation**: use [`CliMessageChannel`] for
-//!   human-terminal interaction, [`MpscChannel`] for one-to-one in-process
-//!   agent conversation, [`BroadcastChannel`] / [`WatchChannel`] for
-//!   one-to-many broadcast / latest-value change notifications;
+//!   [`FakeProvider`], no real API needed; for production enable `openai`
+//!   and use [`OpenAiProvider`], wrapped in [`RetryProvider`] for retry /
+//!   timeout protection;
+//! - **External conversation**: use [`MpscChannel`] for one-to-one
+//!   in-process agent conversation, [`BroadcastChannel`] / [`WatchChannel`]
+//!   for one-to-many broadcast / latest-value change notifications, and
+//!   [`CliMessageChannel`] with `cli-channel` for human-terminal
+//!   interaction;
 //! - **Observing the reasoning process**: subscribe to agent events via
 //!   [`BroadcastEventChannel`] (multiple subscribers; slow ones drop the
 //!   oldest events) or [`MpscEventChannel`] (single subscriber; nothing is
@@ -124,12 +136,14 @@
 pub mod agent;
 pub mod effect;
 pub mod event_channel;
+#[cfg(feature = "mcp")]
 pub mod mcp;
 pub mod memory;
 pub mod message;
 pub mod message_channel;
 pub mod provider;
 pub mod run;
+#[cfg(feature = "skills")]
 pub mod skill;
 pub mod tool;
 
@@ -142,36 +156,43 @@ extern crate self as molo;
 // which transitive dependencies cannot resolve from user crates, so they
 // are routed through this crate's root.
 pub use async_trait::async_trait;
+#[cfg(feature = "macros")]
 pub use molo_macros::tool;
 
 pub use agent::{
     Agent, AgentAction, AgentConfig, AgentError, AgentEvent, AgentKernel, CancellableAgent,
     MessageChunk, ModelObservation, ModelRequest, Observation, ReActAgent, ReActEvent,
-    StructuredOutcome, StructuredValidator, TypedAgent,
 };
+#[cfg(feature = "structured")]
+pub use agent::{StructuredOutcome, StructuredValidator, TypedAgent};
 pub use effect::{
     DisplayFormat, DisplayOutput, EffectKind, EffectObservation, EffectOutput, EffectRequest,
     EffectSource, EffectStatus, RiskLevel,
 };
 pub use event_channel::{BroadcastEventChannel, EventChannel, EventReceiver, MpscEventChannel};
+#[cfg(feature = "mcp")]
 pub use mcp::{McpClient, McpError, McpTool};
 pub use memory::{
     Budget, CharTokenCounter, InMemoryMemory, Memory, MemoryError, SummarizeStrategy, TokenCounter,
     TrimResult, TrimStrategy, WindowDrop, WindowMemory,
 };
 pub use message::{ContentBlock, ImageContent, Message, ToolCall};
+#[cfg(feature = "cli-channel")]
+pub use message_channel::CliMessageChannel;
 pub use message_channel::{
-    BroadcastChannel, BroadcastReceiver, ChannelError, CliMessageChannel, IncomingMessage,
-    MessageChannel, MpscChannel, WatchChannel, WatchReceiver,
+    BroadcastChannel, BroadcastReceiver, ChannelError, IncomingMessage, MessageChannel,
+    MpscChannel, WatchChannel, WatchReceiver,
 };
 pub use provider::{
     Backoff, ChatRequest, ChatResponse, FakeProvider, FakeReply, FinishReason, ModelOptions,
-    OpenAiProvider, Provider, ProviderError, RetryPolicy, RetryProvider, Retryable, StreamEvent,
-    StructuredOutputMode, Usage,
+    Provider, ProviderError, RetryPolicy, RetryProvider, Retryable, StreamEvent, Usage,
 };
-pub use run::{
-    Artifact, RunContext, RunMetadata, RunOutput, RunRequest, RunSummary, TypedRunOutput, UserInput,
-};
+#[cfg(feature = "openai")]
+pub use provider::{OpenAiProvider, StructuredOutputMode};
+#[cfg(feature = "structured")]
+pub use run::TypedRunOutput;
+pub use run::{Artifact, RunContext, RunMetadata, RunOutput, RunRequest, RunSummary, UserInput};
+#[cfg(feature = "skills")]
 pub use skill::{AllowedTool, LoadSkillTool, Skill, SkillError, SkillRegistry};
 pub use tool::{
     MissingTools, RegistryError, SharedState, SideEffectLevel, Tool, ToolContext, ToolError,

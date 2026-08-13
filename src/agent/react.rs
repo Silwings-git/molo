@@ -18,12 +18,15 @@
 //! the application-side hook for round-level gates.
 
 use super::config::AgentConfig;
+#[cfg(feature = "structured")]
 use super::structured::{StructuredOutcome, StructuredValidator};
 use crate::CancellationToken;
+#[cfg(feature = "structured")]
+use crate::agent::TypedAgent;
 use crate::agent::events::ReActEvent;
 use crate::agent::{
     Agent, AgentAction, AgentError, AgentEvent, AgentKernel, CancellableAgent, MessageChunk,
-    ModelObservation, ModelRequest, Observation, RunSummary, TypedAgent,
+    ModelObservation, ModelRequest, Observation, RunSummary,
 };
 use crate::effect::{EffectObservation, EffectRequest};
 use crate::event_channel::EventChannel;
@@ -32,12 +35,17 @@ use crate::message::{Message, ToolCall};
 use crate::provider::{
     ChatRequest, FinishReason, ModelOptions, Provider, ProviderError, StreamEvent, Usage,
 };
-use crate::run::{Artifact, RunContext, RunMetadata, RunOutput, RunRequest, TypedRunOutput};
+#[cfg(feature = "structured")]
+use crate::run::TypedRunOutput;
+use crate::run::{Artifact, RunContext, RunMetadata, RunOutput, RunRequest};
+#[cfg(feature = "skills")]
 use crate::skill::{LoadSkillTool, SkillRegistry};
 use crate::tool::{SharedState, ToolMemoryPolicy, ToolOutput, ToolRegistry, ToolResult};
 use futures::StreamExt;
 use futures::stream::BoxStream;
+#[cfg(feature = "structured")]
 use schemars::JsonSchema;
+#[cfg(feature = "structured")]
 use serde::de::DeserializeOwned;
 use std::collections::HashMap;
 use std::collections::HashSet;
@@ -47,6 +55,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Instant;
+#[cfg(feature = "tracing")]
 use tracing::Instrument;
 
 /// Convenience assembly macro: registers a list of tools (possibly
@@ -231,15 +240,19 @@ pub struct ReActAgent {
     /// assembled; the application reads and writes this field directly
     /// across runs (hot-swappable — additions/removals take effect on the
     /// next request).
+    #[cfg(feature = "skills")]
     pub skills: Arc<SkillRegistry>,
     /// Session-visible allowlist (`None` = all skills visible; only
     /// effective in dynamic mode).
+    #[cfg(feature = "skills")]
     enabled_skills: Option<Arc<HashSet<String>>>,
     /// Pre-activated skill names, in activation order (bodies join the
     /// system prompt without the model's involvement).
+    #[cfg(feature = "skills")]
     activated_skills: Vec<String>,
     /// Skill assembly mode (none / dynamic progressive disclosure / static
     /// inlining).
+    #[cfg(feature = "skills")]
     skill_mode: SkillMode,
     /// Step-wise kernel state. `None` means no `AgentKernel` run is active.
     kernel_state: Option<ReActKernelState>,
@@ -253,6 +266,7 @@ pub struct ReActAgent {
 ///   demand;
 /// - [`Inline`](SkillMode::Inline): static inlining — all bodies stay in
 ///   the system prompt, and load_skill is not registered.
+#[cfg(feature = "skills")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SkillMode {
     /// No skills assembled.
@@ -313,9 +327,13 @@ impl ReActAgent {
             state: SharedState::default(),
             events: None,
             executor: Box::new(SerialToolRoundExecutor),
+            #[cfg(feature = "skills")]
             skills: Arc::new(SkillRegistry::new()),
+            #[cfg(feature = "skills")]
             enabled_skills: None,
+            #[cfg(feature = "skills")]
             activated_skills: Vec::new(),
+            #[cfg(feature = "skills")]
             skill_mode: SkillMode::None,
             kernel_state: None,
         }
@@ -414,6 +432,7 @@ impl ReActAgent {
     /// # Ok(())
     /// # }
     /// ```
+    #[cfg(feature = "structured")]
     pub fn with_structured_output(mut self, schema: serde_json::Value) -> Self {
         self.config.options.structured = Some(schema);
         self
@@ -556,6 +575,7 @@ impl ReActAgent {
     /// # Ok(())
     /// # }
     /// ```
+    #[cfg(feature = "skills")]
     pub fn with_skills(mut self, registry: SkillRegistry) -> Self {
         self.skills = Arc::new(registry);
         self.skill_mode = SkillMode::Dynamic;
@@ -576,6 +596,7 @@ impl ReActAgent {
     ///
     /// Mutually exclusive with [`with_skills`](ReActAgent::with_skills);
     /// the last call wins.
+    #[cfg(feature = "skills")]
     pub fn with_skills_inline(mut self, registry: SkillRegistry) -> Self {
         self.skills = Arc::new(registry);
         // If switching from dynamic mode: remove load_skill, to avoid
@@ -602,6 +623,7 @@ impl ReActAgent {
     /// ([`with_skills`](ReActAgent::with_skills)); in inline mode
     /// ([`with_skills_inline`](ReActAgent::with_skills_inline)) all bodies
     /// are already resident, so the allowlist has no effect.
+    #[cfg(feature = "skills")]
     pub fn with_enabled_skills(mut self, names: &[&str]) -> Self {
         let set: HashSet<String> = names.iter().map(|n| n.to_string()).collect();
         self.enabled_skills = Some(Arc::new(set));
@@ -635,6 +657,7 @@ impl ReActAgent {
     /// Activation succeeded (the skill exists and is visible) or it was
     /// already activated → `true`; the skill doesn't exist, is outside the
     /// allowlist, or the mode is inline → `false`.
+    #[cfg(feature = "skills")]
     pub fn activate_skill(&mut self, name: &str) -> bool {
         if self.skill_mode != SkillMode::Dynamic {
             return false;
@@ -668,6 +691,7 @@ impl ReActAgent {
     /// let mut agent = react_agent!(FakeProvider::new([FakeReply::Text("Hello".into())]));
     /// assert!(!agent.deactivate_skill("greet"));
     /// ```
+    #[cfg(feature = "skills")]
     pub fn deactivate_skill(&mut self, name: &str) -> bool {
         if self.skill_mode != SkillMode::Dynamic {
             return false;
@@ -682,6 +706,7 @@ impl ReActAgent {
 
     /// Whether the skill is in the session allowlist (no allowlist set =
     /// everything visible).
+    #[cfg(feature = "skills")]
     fn skill_visible(&self, name: &str) -> bool {
         match &self.enabled_skills {
             None => true,
@@ -690,6 +715,7 @@ impl ReActAgent {
     }
 
     /// Whether the skill is pre-activated.
+    #[cfg(feature = "skills")]
     fn is_activated(&self, name: &str) -> bool {
         self.activated_skills.iter().any(|n| n == name)
     }
@@ -718,9 +744,12 @@ impl ReActAgent {
         // Structured validator: built when this run has a schema; the retry
         // budget lives in the component (the count accumulates across
         // rounds and doesn't consume the tool-round budget).
+        #[cfg(feature = "structured")]
         let mut validator = schema.map(|schema| {
             StructuredValidator::new(schema.clone(), self.config.max_structured_retries)
         });
+        #[cfg(not(feature = "structured"))]
+        let _ = schema;
         // Tool-round counter: the limit check only counts rounds where the
         // model requested tools — conversation rounds and structured
         // validation-retry rounds don't consume the tool-round budget
@@ -765,27 +794,26 @@ impl ReActAgent {
                 // hand-written schema in the config — endpoint-side
                 // constraint and framework-side validation use the same
                 // one.
-                let response = match run_until_context(
-                    context,
-                    self.provider
-                        .chat(ChatRequest {
-                            messages: self.assemble_messages(self.memory.context().await?),
-                            tools: schemas.clone(),
-                            options: options.clone(),
-                        })
-                        .instrument(llm_span.clone()),
-                )
-                .await
+                let chat = self.provider.chat(ChatRequest {
+                    messages: self.assemble_messages(self.memory.context().await?),
+                    tools: schemas.clone(),
+                    options: options.clone(),
+                });
+                let response =
+                    match run_until_context(context, instrument(chat, llm_span.clone())).await {
+                        Ok(Ok(response)) => response,
+                        Ok(Err(e)) => {
+                            #[cfg(feature = "tracing")]
+                            llm_span.record("error", e.to_string());
+                            return Err(AgentError::Provider(e));
+                        }
+                        Err(e) => return Err(e),
+                    };
+                #[cfg(feature = "tracing")]
                 {
-                    Ok(Ok(response)) => response,
-                    Ok(Err(e)) => {
-                        llm_span.record("error", e.to_string());
-                        return Err(AgentError::Provider(e));
-                    }
-                    Err(e) => return Err(e),
-                };
-                llm_span.record("usage.prompt_tokens", response.usage.prompt_tokens);
-                llm_span.record("usage.completion_tokens", response.usage.completion_tokens);
+                    llm_span.record("usage.prompt_tokens", response.usage.prompt_tokens);
+                    llm_span.record("usage.completion_tokens", response.usage.completion_tokens);
+                }
                 counters.usage_total += response.usage;
                 let finish_reason = response.finish_reason.clone();
 
@@ -846,15 +874,20 @@ impl ReActAgent {
                     // feed it back to the model for retry (budget is built
                     // into the component, decoupled from the tool-round
                     // limit); exceeding it fails the run.
-                    if let Some(validator) = &mut validator {
-                        match validator.validate(&content) {
-                            StructuredOutcome::Passed => {}
-                            StructuredOutcome::Retry { message } => {
-                                self.memory.record(message).await?;
-                                return Ok::<Option<FinalAnswer>, AgentError>(None);
-                            }
-                            StructuredOutcome::Exhausted { max_retries } => {
-                                return Err(AgentError::StructuredRetriesExhausted(max_retries));
+                    #[cfg(feature = "structured")]
+                    {
+                        if let Some(validator) = &mut validator {
+                            match validator.validate(&content) {
+                                StructuredOutcome::Passed => {}
+                                StructuredOutcome::Retry { message } => {
+                                    self.memory.record(message).await?;
+                                    return Ok::<Option<FinalAnswer>, AgentError>(None);
+                                }
+                                StructuredOutcome::Exhausted { max_retries } => {
+                                    return Err(AgentError::StructuredRetriesExhausted(
+                                        max_retries,
+                                    ));
+                                }
                             }
                         }
                     }
@@ -936,43 +969,50 @@ impl ReActAgent {
     /// - Inline mode: base prompt + all skill bodies (the allowlist has no
     ///   effect).
     fn assemble_system_prompt(&self) -> String {
-        let base = self.system_prompt.as_str();
-        let skills = self.skills.skills();
-        if skills.is_empty() {
-            return base.to_string();
+        #[cfg(not(feature = "skills"))]
+        {
+            self.system_prompt.clone()
         }
-        let mut out = String::new();
-        out.push_str(base);
-        match self.skill_mode {
-            SkillMode::None => {}
-            SkillMode::Dynamic => {
-                // Menu: skills in the allowlist that are not activated, in
-                // registration order.
-                let menu: Vec<String> = skills
-                    .iter()
-                    .filter(|s| self.skill_visible(s.name()) && !self.is_activated(s.name()))
-                    .map(|s| format!("- {}: {}", s.name(), s.description()))
-                    .collect();
-                append_sections(&mut out, &menu);
-                // Pre-activated bodies: in activation order; skills already
-                // removed are skipped when get misses.
-                let activated: Vec<String> = self
-                    .activated_skills
-                    .iter()
-                    .filter_map(|n| self.skills.get(n))
-                    .map(|s| format!("[Skill {}]\n{}", s.name(), s.body()))
-                    .collect();
-                append_sections(&mut out, &activated);
+        #[cfg(feature = "skills")]
+        {
+            let base = self.system_prompt.as_str();
+            let skills = self.skills.skills();
+            if skills.is_empty() {
+                return base.to_string();
             }
-            SkillMode::Inline => {
-                let bodies: Vec<String> = skills
-                    .iter()
-                    .map(|s| format!("[Skill {}]\n{}", s.name(), s.body()))
-                    .collect();
-                append_sections(&mut out, &bodies);
+            let mut out = String::new();
+            out.push_str(base);
+            match self.skill_mode {
+                SkillMode::None => {}
+                SkillMode::Dynamic => {
+                    // Menu: skills in the allowlist that are not activated, in
+                    // registration order.
+                    let menu: Vec<String> = skills
+                        .iter()
+                        .filter(|s| self.skill_visible(s.name()) && !self.is_activated(s.name()))
+                        .map(|s| format!("- {}: {}", s.name(), s.description()))
+                        .collect();
+                    append_sections(&mut out, &menu);
+                    // Pre-activated bodies: in activation order; skills already
+                    // removed are skipped when get misses.
+                    let activated: Vec<String> = self
+                        .activated_skills
+                        .iter()
+                        .filter_map(|n| self.skills.get(n))
+                        .map(|s| format!("[Skill {}]\n{}", s.name(), s.body()))
+                        .collect();
+                    append_sections(&mut out, &activated);
+                }
+                SkillMode::Inline => {
+                    let bodies: Vec<String> = skills
+                        .iter()
+                        .map(|s| format!("[Skill {}]\n{}", s.name(), s.body()))
+                        .collect();
+                    append_sections(&mut out, &bodies);
+                }
             }
+            out
         }
-        out
     }
 }
 
@@ -1045,11 +1085,9 @@ impl ToolRoundCtx<'_> {
         // Execute; the Result status rides along with the event (Ok/Err is
         // classified by the registry), and the text (Ok result / Err's
         // Display) is recorded and fed back to the model.
-        let result = self
-            .registry
-            .call(&call, self.context, self.state)
-            .instrument(tool_span.clone())
-            .await;
+        let call_future = self.registry.call(&call, self.context, self.state);
+        let result = instrument(call_future, tool_span.clone()).await;
+        #[cfg(feature = "tracing")]
         if let Err(e) = &result {
             tool_span.record("error", e.to_string());
         }
@@ -1284,6 +1322,7 @@ impl ToolCallOutcome {
     }
 }
 
+#[cfg(feature = "structured")]
 impl ReActAgent {
     /// Typed run: same semantics as [`Agent::run`](Agent::run) (records
     /// input, drives the loop), but the final answer is deserialized into
@@ -1347,6 +1386,7 @@ impl ReActAgent {
     }
 }
 
+#[cfg(feature = "structured")]
 #[async_trait::async_trait]
 impl TypedAgent for ReActAgent {
     async fn run_typed_request_with_context<U>(
@@ -1406,6 +1446,7 @@ struct ReActKernelState {
     counters: RunCounters,
     options: ModelOptions,
     schemas: Vec<crate::tool::ToolSchema>,
+    #[cfg(feature = "structured")]
     validator: Option<StructuredValidator>,
     tool_rounds: usize,
     pending_tools: VecDeque<ToolCall>,
@@ -1461,7 +1502,8 @@ impl fmt::Debug for ReActAgent {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         // Provider / Memory are trait objects and can't be Debug'd; print
         // the composition and behavior config.
-        f.debug_struct("ReActAgent")
+        let mut debug = f.debug_struct("ReActAgent");
+        debug
             .field("provider", &"Box<dyn Provider>")
             .field("memory", &"Box<dyn Memory>")
             .field("tools", &self.registry)
@@ -1474,15 +1516,17 @@ impl fmt::Debug for ReActAgent {
                     Some(_) => "Some<dyn EventChannel>",
                     None => "None",
                 },
-            )
-            .field("skills", &self.skills)
-            .finish()
+            );
+        #[cfg(feature = "skills")]
+        debug.field("skills", &self.skills);
+        debug.finish()
     }
 }
 
 /// Append a set of sections to the system prompt: sections are separated
 /// by blank lines, with a blank line inserted before existing content. An
 /// empty section list is a no-op.
+#[cfg(feature = "skills")]
 fn append_sections(out: &mut String, sections: &[String]) {
     if sections.is_empty() {
         return;
@@ -1539,6 +1583,7 @@ impl AgentKernel for ReActAgent {
             .options
             .clone()
             .unwrap_or_else(|| self.config.options.clone());
+        #[cfg(feature = "structured")]
         let validator = options.structured.as_ref().map(|schema| {
             StructuredValidator::new(schema.clone(), self.config.max_structured_retries)
         });
@@ -1549,6 +1594,7 @@ impl AgentKernel for ReActAgent {
             counters: RunCounters::default(),
             options,
             schemas: self.registry.schemas(),
+            #[cfg(feature = "structured")]
             validator,
             tool_rounds: 0,
             pending_tools: VecDeque::new(),
@@ -1631,20 +1677,23 @@ impl ReActAgent {
         }
 
         if tool_calls.is_empty() {
-            if let Some(validator) = &mut state.validator {
-                match validator.validate(&content) {
-                    StructuredOutcome::Passed => {}
-                    StructuredOutcome::Retry { message } => {
-                        self.memory.record(message).await?;
-                        state.counters.rounds += 1;
-                        let messages = self.assemble_messages(self.memory.context().await?);
-                        let action = state.next_model_request(messages);
-                        self.kernel_state = Some(state);
-                        return Ok(action);
-                    }
-                    StructuredOutcome::Exhausted { max_retries } => {
-                        self.kernel_state = None;
-                        return Err(AgentError::StructuredRetriesExhausted(max_retries));
+            #[cfg(feature = "structured")]
+            {
+                if let Some(validator) = &mut state.validator {
+                    match validator.validate(&content) {
+                        StructuredOutcome::Passed => {}
+                        StructuredOutcome::Retry { message } => {
+                            self.memory.record(message).await?;
+                            state.counters.rounds += 1;
+                            let messages = self.assemble_messages(self.memory.context().await?);
+                            let action = state.next_model_request(messages);
+                            self.kernel_state = Some(state);
+                            return Ok(action);
+                        }
+                        StructuredOutcome::Exhausted { max_retries } => {
+                            self.kernel_state = None;
+                            return Err(AgentError::StructuredRetriesExhausted(max_retries));
+                        }
                     }
                 }
             }
@@ -1954,35 +2003,82 @@ impl ReActAgent {
 
 /// The `agent.run` root span: the observability identifier of a whole run
 /// (including the error recorded on failure).
-fn span_run(run_id: &str) -> tracing::Span {
-    tracing::info_span!("agent.run", "run.id" = %run_id, error = tracing::field::Empty)
+#[cfg(feature = "tracing")]
+type TraceSpan = tracing::Span;
+
+#[cfg(not(feature = "tracing"))]
+#[derive(Debug, Clone, Copy)]
+struct TraceSpan;
+
+#[cfg(feature = "tracing")]
+fn instrument<F>(future: F, span: TraceSpan) -> tracing::instrument::Instrumented<F>
+where
+    F: Future,
+{
+    future.instrument(span)
+}
+
+#[cfg(not(feature = "tracing"))]
+fn instrument<F>(future: F, _span: TraceSpan) -> F
+where
+    F: Future,
+{
+    future
+}
+
+fn span_run(run_id: &str) -> TraceSpan {
+    #[cfg(feature = "tracing")]
+    {
+        tracing::info_span!("agent.run", "run.id" = %run_id, error = tracing::field::Empty)
+    }
+    #[cfg(not(feature = "tracing"))]
+    {
+        let _ = run_id;
+        TraceSpan
+    }
 }
 
 /// Provider-call span: duration comes from span timing automatically; usage
 /// goes out through both channels (the business-side RunSummary as usual,
 /// observability records it on the span fields at wrap-up); errors are
 /// recorded when the Provider fails (both paths' error branches record).
-fn span_llm(run_id: &str, round: usize) -> tracing::Span {
-    tracing::debug_span!(
-        "llm_request",
-        "run.id" = %run_id,
-        round = round,
-        usage.prompt_tokens = tracing::field::Empty,
-        usage.completion_tokens = tracing::field::Empty,
-        error = tracing::field::Empty,
-    )
+fn span_llm(run_id: &str, round: usize) -> TraceSpan {
+    #[cfg(feature = "tracing")]
+    {
+        tracing::debug_span!(
+            "llm_request",
+            "run.id" = %run_id,
+            round = round,
+            usage.prompt_tokens = tracing::field::Empty,
+            usage.completion_tokens = tracing::field::Empty,
+            error = tracing::field::Empty,
+        )
+    }
+    #[cfg(not(feature = "tracing"))]
+    {
+        let _ = (run_id, round);
+        TraceSpan
+    }
 }
 
 /// Tool-call span: carries duration; records error on failure (see
 /// run_tool_call).
-fn span_tool(run_id: &str, round: usize, name: &str) -> tracing::Span {
-    tracing::debug_span!(
-        "tool",
-        "run.id" = %run_id,
-        round = round,
-        name = %name,
-        error = tracing::field::Empty,
-    )
+fn span_tool(run_id: &str, round: usize, name: &str) -> TraceSpan {
+    #[cfg(feature = "tracing")]
+    {
+        tracing::debug_span!(
+            "tool",
+            "run.id" = %run_id,
+            round = round,
+            name = %name,
+            error = tracing::field::Empty,
+        )
+    }
+    #[cfg(not(feature = "tracing"))]
+    {
+        let _ = (run_id, round, name);
+        TraceSpan
+    }
 }
 
 /// Generator terminal wrap-up: publish `RunEnded` (with the accumulated
@@ -2015,7 +2111,7 @@ fn publish_ended(
 /// as publish_ended).
 fn stream_end(
     events: &Option<Arc<dyn EventChannel>>,
-    run_span: &tracing::Span,
+    #[cfg_attr(not(feature = "tracing"), allow(unused_variables))] run_span: &TraceSpan,
     summary: RunSummary,
     error: AgentError,
 ) -> Result<MessageChunk, AgentError> {
@@ -2023,6 +2119,7 @@ fn stream_end(
     // terminal chunk), so no span error is recorded — otherwise the
     // observability dashboard would mark a user-initiated stop as a
     // failure.
+    #[cfg(feature = "tracing")]
     if !matches!(error, AgentError::Cancelled) {
         run_span.record("error", error.to_string());
     }
@@ -2158,7 +2255,7 @@ impl ReActAgent {
         let run_span = span_run(&run_id);
         let provider_model = self.provider.model().map(str::to_string);
         let started_at = Instant::now();
-        let result = async {
+        let run_future = async {
             // Record first, publish after (consistent with the streaming
             // path): RunStarted's claim that "the user input is recorded"
             // holds; when recording fails, neither RunStarted nor RunEnded
@@ -2219,9 +2316,9 @@ impl ReActAgent {
             // the streaming path.
             publish_ended(&self.events, summary, output_result.as_ref().err().cloned());
             output_result
-        }
-        .instrument(run_span.clone())
-        .await;
+        };
+        let result = instrument(run_future, run_span.clone()).await;
+        #[cfg(feature = "tracing")]
         if let Err(e) = &result {
             run_span.record("error", e.to_string());
         }
@@ -2286,9 +2383,12 @@ impl ReActAgent {
             // Structured validator: built when this run has a hand-written
             // schema from the request or config; the retry budget lives in
             // the component.
+            #[cfg(feature = "structured")]
             let mut validator = validation_schema.as_ref().map(|schema| {
                 StructuredValidator::new(schema.clone(), self.config.max_structured_retries)
             });
+            #[cfg(not(feature = "structured"))]
+            let _ = &validation_schema;
             // Tool-round counter (same semantics as the non-streaming
             // path): the limit only counts rounds where the model requested
             // tools; structured validation-retry rounds don't consume it
@@ -2363,15 +2463,14 @@ impl ReActAgent {
                 // while the run is on the stack (SpanStream enters on every
                 // poll), so the hierarchy is correct automatically.
                 let llm_span = span_llm(&run_id, rounds);
+                let stream_chat = self.provider.stream_chat(ChatRequest {
+                    messages: self.assemble_messages(messages),
+                    tools: schemas.clone(),
+                    options: options.clone(),
+                });
                 let mut provider_stream = match run_until_context(
                     &context,
-                    self.provider
-                    .stream_chat(ChatRequest {
-                            messages: self.assemble_messages(messages),
-                            tools: schemas.clone(),
-                            options: options.clone(),
-                        })
-                        .instrument(llm_span.clone()),
+                    instrument(stream_chat, llm_span.clone()),
                 )
                 .await
                 {
@@ -2379,6 +2478,7 @@ impl ReActAgent {
                     Ok(Err(e)) => {
                         // Provider errors are recorded on the llm span
                         // (observability pinpoints the failed call).
+                        #[cfg(feature = "tracing")]
                         llm_span.record("error", e.to_string());
                         let summary = run_summary_from_parts(
                             rounds,
@@ -2429,7 +2529,7 @@ impl ReActAgent {
                     // (this round is voided).
                     let next = run_until_context(
                         &context,
-                        provider_stream.next().instrument(llm_span.clone()),
+                        instrument(provider_stream.next(), llm_span.clone()),
                     )
                     .await;
                     let Some(event) = (match next {
@@ -2520,8 +2620,11 @@ impl ReActAgent {
                             // span at wrap-up, and the business-side
                             // RunSummary accumulates as usual.
                             if let Some(usage) = usage {
+                                #[cfg(feature = "tracing")]
+                                {
                                 llm_span.record("usage.prompt_tokens", usage.prompt_tokens);
                                 llm_span.record("usage.completion_tokens", usage.completion_tokens);
+                                }
                                 usage_total += usage;
                             }
                             round_finish_reason = Some(reason);
@@ -2538,6 +2641,7 @@ impl ReActAgent {
                             // terminate the stream (no Done afterwards);
                             // recorded on the llm span (observability
                             // pinpoints the failed call).
+                            #[cfg(feature = "tracing")]
                             llm_span.record("error", e.to_string());
                             let summary = run_summary_from_parts(
                                 rounds,
@@ -2588,41 +2692,44 @@ impl ReActAgent {
                     // into the component, decoupled from the tool-round
                     // limit), and exceeding it terminates the stream with
                     // an error; only a pass wraps up.
-                    if let Some(validator) = &mut validator {
-                        match validator.validate(&text) {
-                            StructuredOutcome::Passed => {}
-                            StructuredOutcome::Retry { message } => {
-                                // Record the feedback and continue to the
-                                // next round (no Done dispatched).
-                                match self.memory.record(message).await {
-                                    Ok(()) => continue 'rounds,
-                                    Err(e) => {
-                                        let summary = run_summary_from_parts(
-                                            rounds,
-                                            tool_calls_total,
-                                            usage_total,
-                                            None,
-                                            started_at,
-                                            provider_model.clone(),
-                                        );
-                                        yield stream_end(&self.events, &run_span, summary,
-                                            AgentError::Memory(e));
-                                        break;
+                    #[cfg(feature = "structured")]
+                    {
+                        if let Some(validator) = &mut validator {
+                            match validator.validate(&text) {
+                                StructuredOutcome::Passed => {}
+                                StructuredOutcome::Retry { message } => {
+                                    // Record the feedback and continue to the
+                                    // next round (no Done dispatched).
+                                    match self.memory.record(message).await {
+                                        Ok(()) => continue 'rounds,
+                                        Err(e) => {
+                                            let summary = run_summary_from_parts(
+                                                rounds,
+                                                tool_calls_total,
+                                                usage_total,
+                                                None,
+                                                started_at,
+                                                provider_model.clone(),
+                                            );
+                                            yield stream_end(&self.events, &run_span, summary,
+                                                AgentError::Memory(e));
+                                            break;
+                                        }
                                     }
                                 }
-                            }
-                            StructuredOutcome::Exhausted { max_retries } => {
-                                let summary = run_summary_from_parts(
-                                    rounds,
-                                    tool_calls_total,
-                                    usage_total,
-                                    None,
-                                    started_at,
-                                    provider_model.clone(),
-                                );
-                                yield stream_end(&self.events, &run_span, summary,
-                                    AgentError::StructuredRetriesExhausted(max_retries));
-                                break 'rounds;
+                                StructuredOutcome::Exhausted { max_retries } => {
+                                    let summary = run_summary_from_parts(
+                                        rounds,
+                                        tool_calls_total,
+                                        usage_total,
+                                        None,
+                                        started_at,
+                                        provider_model.clone(),
+                                    );
+                                    yield stream_end(&self.events, &run_span, summary,
+                                        AgentError::StructuredRetriesExhausted(max_retries));
+                                    break 'rounds;
+                                }
                             }
                         }
                     }
@@ -2759,7 +2866,8 @@ impl CancellableAgent for ReActAgent {
 /// no unsafe.
 struct SpanStream<S> {
     stream: Pin<Box<S>>,
-    span: tracing::Span,
+    #[cfg_attr(not(feature = "tracing"), allow(dead_code))]
+    span: TraceSpan,
 }
 
 impl<S: futures::Stream> futures::Stream for SpanStream<S> {
@@ -2772,7 +2880,9 @@ impl<S: futures::Stream> futures::Stream for SpanStream<S> {
         // Clone the span handle before entering: the guard borrows the
         // local handle, not self (we need &mut self below; Span is a shared
         // handle, so the clone refers to the same span).
+        #[cfg(feature = "tracing")]
         let span = self.span.clone();
+        #[cfg(feature = "tracing")]
         let _enter = span.enter();
         // SpanStream is Unpin (both Pin<Box<S>> and Span are Unpin) ⇒
         // DerefMut is safe; poll the pinned inner stream directly, no
@@ -2794,6 +2904,7 @@ mod tests {
     };
     use crate::tool::{Tool, ToolContext, ToolError, ToolOutput, ToolResult, ToolSchema};
     use futures::StreamExt;
+    #[cfg(feature = "structured")]
     use serde::Deserialize;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -4326,6 +4437,7 @@ mod tests {
 
     /// Structured output: an answer conforming to the schema is returned
     /// directly (validation passes in a single round).
+    #[cfg(feature = "structured")]
     #[tokio::test]
     async fn structured_output_valid_answer_passes() {
         let schema = serde_json::json!({
@@ -4342,6 +4454,7 @@ mod tests {
 
     /// Structured output: invalid JSON is first fed back to the model for
     /// retry; the corrected second round passes.
+    #[cfg(feature = "structured")]
     #[tokio::test]
     async fn structured_output_retries_after_invalid_answer() {
         let schema = serde_json::json!({
@@ -4370,6 +4483,7 @@ mod tests {
     /// (`max_structured_retries`); exhausting it without success fails the
     /// run — the tool-round limit is not consumed, and no "tool round limit
     /// exceeded" is reported.
+    #[cfg(feature = "structured")]
     #[tokio::test]
     async fn structured_output_exhausts_retry_budget() {
         let schema = serde_json::json!({ "type": "object" });
@@ -4395,6 +4509,7 @@ mod tests {
     /// Typed run: the schema is auto-generated from the type and injected
     /// into the request; after validation passes, the answer deserializes
     /// into the target type.
+    #[cfg(feature = "structured")]
     #[tokio::test]
     async fn typed_output_parses_valid_answer() {
         #[derive(Debug, Deserialize, JsonSchema)]
@@ -4412,6 +4527,7 @@ mod tests {
         assert!(agent.config.options.structured.is_none());
     }
 
+    #[cfg(feature = "structured")]
     #[tokio::test]
     async fn typed_run_request_returns_value_and_output() {
         #[derive(Debug, Deserialize, JsonSchema, PartialEq)]
@@ -4442,6 +4558,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "structured")]
     #[tokio::test]
     async fn typed_schema_overrides_request_and_config_schema() {
         #[derive(Debug, Deserialize, JsonSchema)]
@@ -4486,6 +4603,7 @@ mod tests {
 
     /// Typed run: an invalid answer is fed back for retry first; the
     /// corrected second round deserializes successfully.
+    #[cfg(feature = "structured")]
     #[tokio::test]
     async fn typed_output_retries_then_parses() {
         #[derive(Debug, Deserialize, JsonSchema)]
@@ -4507,6 +4625,7 @@ mod tests {
     /// deserialization fails → StructuredParse (the schemars-generated
     /// path agrees with serde by default; conflicts only come from
     /// user-custom schemas).
+    #[cfg(feature = "structured")]
     #[tokio::test]
     async fn typed_output_parse_failure_on_schema_mismatch() {
         fn string_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
@@ -4530,6 +4649,7 @@ mod tests {
     /// TypedAgent interface: code with the generic bound `A: TypedAgent`
     /// can call run_typed on any implementation (independent of the
     /// concrete type; Box<dyn Agent> is unaffected).
+    #[cfg(feature = "structured")]
     #[tokio::test]
     async fn typed_agent_trait_generic_call() {
         #[derive(Debug, Deserialize, JsonSchema)]
@@ -4552,6 +4672,7 @@ mod tests {
     /// Typed and text runs can be mixed: run_typed yields typed results,
     /// Agent::run yields text (no structured constraint; free text is
     /// unaffected by this run's schema).
+    #[cfg(feature = "structured")]
     #[tokio::test]
     async fn typed_output_agent_trait_run_returns_text() {
         #[derive(Debug, Deserialize, JsonSchema)]
@@ -4574,6 +4695,7 @@ mod tests {
     /// Streaming: structured validation retries have an independent budget;
     /// exceeding it terminates with an in-stream error (same semantics as
     /// run).
+    #[cfg(feature = "structured")]
     #[tokio::test]
     async fn structured_output_stream_exhausts_retry_budget() {
         let schema = serde_json::json!({ "type": "object" });
@@ -5438,938 +5560,952 @@ mod tests {
         }
     }
 
-    // ---- Observability spans: structure and fields (asserted with a
-    // collecting subscriber) ----
+    #[cfg(feature = "tracing")]
+    mod tracing_tests {
+        use super::*;
 
-    use std::collections::HashMap;
-    use std::sync::atomic::AtomicU64;
-    use tracing::field::{Field, Visit};
-    use tracing::subscriber::Subscriber;
-    use tracing::{Event, Id, Level, Metadata};
+        // ---- Observability spans: structure and fields (asserted with a
+        // collecting subscriber) ----
 
-    /// Creation info of one span (name / level / field values at
-    /// creation).
-    #[derive(Debug, Clone, PartialEq, Eq)]
-    struct SpanInfo {
-        name: &'static str,
-        level: Level,
-        fields: Vec<(String, String)>,
-    }
+        use std::collections::HashMap;
+        use std::sync::atomic::AtomicU64;
+        use tracing::field::{Field, Visit};
+        use tracing::subscriber::Subscriber;
+        use tracing::{Event, Id, Level, Metadata};
 
-    /// The operation sequence received by the subscriber (enter / exit /
-    /// close / field record).
-    #[derive(Debug, Clone, PartialEq, Eq)]
-    enum Op {
-        Enter(String),
-        Exit(String),
-        Close(String),
-        Record(String, String),
-    }
-
-    /// Collecting subscriber: gathers span creation, enter/exit, and field
-    /// records into Vecs for the tests to assert hierarchy and fields.
-    /// tokio::test defaults to current_thread, so event order is
-    /// deterministic.
-    #[derive(Debug, Default)]
-    struct CollectSubscriber {
-        spans: std::sync::Mutex<Vec<SpanInfo>>,
-        ops: std::sync::Mutex<Vec<Op>>,
-        names: std::sync::Mutex<HashMap<Id, String>>,
-        next_id: AtomicU64,
-    }
-
-    /// Collect field values as debug text (all of Visit's default methods
-    /// land in record_debug).
-    struct FieldCollector<'a>(&'a mut Vec<(String, String)>);
-
-    impl Visit for FieldCollector<'_> {
-        fn record_debug(&mut self, field: &Field, value: &dyn fmt::Debug) {
-            self.0
-                .push((field.name().to_string(), format!("{value:?}")));
-        }
-    }
-
-    impl Subscriber for CollectSubscriber {
-        fn enabled(&self, _metadata: &Metadata<'_>) -> bool {
-            true
+        /// Creation info of one span (name / level / field values at
+        /// creation).
+        #[derive(Debug, Clone, PartialEq, Eq)]
+        struct SpanInfo {
+            name: &'static str,
+            level: Level,
+            fields: Vec<(String, String)>,
         }
 
-        fn new_span(&self, span: &tracing::span::Attributes<'_>) -> Id {
-            // fetch_add returns the old value (0 on the first call), and
-            // tracing Ids must be non-zero.
-            let id = Id::from_u64(self.next_id.fetch_add(1, Ordering::Relaxed) + 1);
-            let mut fields = Vec::new();
-            span.record(&mut FieldCollector(&mut fields));
-            self.spans.lock().unwrap().push(SpanInfo {
-                name: span.metadata().name(),
-                level: *span.metadata().level(),
-                fields,
-            });
-            self.names
-                .lock()
-                .unwrap()
-                .insert(id.clone(), span.metadata().name().to_string());
-            id
+        /// The operation sequence received by the subscriber (enter / exit /
+        /// close / field record).
+        #[derive(Debug, Clone, PartialEq, Eq)]
+        enum Op {
+            Enter(String),
+            Exit(String),
+            Close(String),
+            Record(String, String),
         }
 
-        fn record(&self, id: &Id, values: &tracing::span::Record<'_>) {
-            let name = self.names.lock().unwrap().get(id).cloned();
-            let Some(name) = name else { return };
-            let mut fields = Vec::new();
-            values.record(&mut FieldCollector(&mut fields));
-            let mut ops = self.ops.lock().unwrap();
-            for (field, value) in fields {
-                ops.push(Op::Record(name.clone(), format!("{field}={value}")));
+        /// Collecting subscriber: gathers span creation, enter/exit, and field
+        /// records into Vecs for the tests to assert hierarchy and fields.
+        /// tokio::test defaults to current_thread, so event order is
+        /// deterministic.
+        #[derive(Debug, Default)]
+        struct CollectSubscriber {
+            spans: std::sync::Mutex<Vec<SpanInfo>>,
+            ops: std::sync::Mutex<Vec<Op>>,
+            names: std::sync::Mutex<HashMap<Id, String>>,
+            next_id: AtomicU64,
+        }
+
+        /// Collect field values as debug text (all of Visit's default methods
+        /// land in record_debug).
+        struct FieldCollector<'a>(&'a mut Vec<(String, String)>);
+
+        impl Visit for FieldCollector<'_> {
+            fn record_debug(&mut self, field: &Field, value: &dyn fmt::Debug) {
+                self.0
+                    .push((field.name().to_string(), format!("{value:?}")));
             }
         }
 
-        fn enter(&self, id: &Id) {
-            let name = self.names.lock().unwrap().get(id).cloned();
-            if let Some(name) = name {
-                self.ops.lock().unwrap().push(Op::Enter(name));
+        impl Subscriber for CollectSubscriber {
+            fn enabled(&self, _metadata: &Metadata<'_>) -> bool {
+                true
             }
-        }
 
-        fn exit(&self, id: &Id) {
-            let name = self.names.lock().unwrap().get(id).cloned();
-            if let Some(name) = name {
-                self.ops.lock().unwrap().push(Op::Exit(name));
+            fn new_span(&self, span: &tracing::span::Attributes<'_>) -> Id {
+                // fetch_add returns the old value (0 on the first call), and
+                // tracing Ids must be non-zero.
+                let id = Id::from_u64(self.next_id.fetch_add(1, Ordering::Relaxed) + 1);
+                let mut fields = Vec::new();
+                span.record(&mut FieldCollector(&mut fields));
+                self.spans.lock().unwrap().push(SpanInfo {
+                    name: span.metadata().name(),
+                    level: *span.metadata().level(),
+                    fields,
+                });
+                self.names
+                    .lock()
+                    .unwrap()
+                    .insert(id.clone(), span.metadata().name().to_string());
+                id
             }
-        }
 
-        fn try_close(&self, id: Id) -> bool {
-            let name = self.names.lock().unwrap().get(&id).cloned();
-            if let Some(name) = name {
-                self.ops.lock().unwrap().push(Op::Close(name));
+            fn record(&self, id: &Id, values: &tracing::span::Record<'_>) {
+                let name = self.names.lock().unwrap().get(id).cloned();
+                let Some(name) = name else { return };
+                let mut fields = Vec::new();
+                values.record(&mut FieldCollector(&mut fields));
+                let mut ops = self.ops.lock().unwrap();
+                for (field, value) in fields {
+                    ops.push(Op::Record(name.clone(), format!("{field}={value}")));
+                }
             }
-            true
+
+            fn enter(&self, id: &Id) {
+                let name = self.names.lock().unwrap().get(id).cloned();
+                if let Some(name) = name {
+                    self.ops.lock().unwrap().push(Op::Enter(name));
+                }
+            }
+
+            fn exit(&self, id: &Id) {
+                let name = self.names.lock().unwrap().get(id).cloned();
+                if let Some(name) = name {
+                    self.ops.lock().unwrap().push(Op::Exit(name));
+                }
+            }
+
+            fn try_close(&self, id: Id) -> bool {
+                let name = self.names.lock().unwrap().get(&id).cloned();
+                if let Some(name) = name {
+                    self.ops.lock().unwrap().push(Op::Close(name));
+                }
+                true
+            }
+
+            fn clone_span(&self, id: &Id) -> Id {
+                id.clone()
+            }
+
+            fn event(&self, _event: &Event<'_>) {}
+            fn record_follows_from(&self, _span: &Id, _follows: &Id) {}
         }
 
-        fn clone_span(&self, id: &Id) -> Id {
-            id.clone()
+        /// Swap the current thread's default dispatch to the collecting
+        /// subscriber (the guard is held across awaits).
+        fn collect_guard(sub: &Arc<CollectSubscriber>) -> tracing::dispatcher::DefaultGuard {
+            tracing::dispatcher::set_default(&tracing::Dispatch::new(sub.clone()))
         }
 
-        fn event(&self, _event: &Event<'_>) {}
-        fn record_follows_from(&self, _span: &Id, _follows: &Id) {}
-    }
+        fn enter_names(ops: &[Op]) -> Vec<String> {
+            ops.iter()
+                .filter_map(|op| match op {
+                    Op::Enter(name) => Some(name.clone()),
+                    _ => None,
+                })
+                .collect()
+        }
 
-    /// Swap the current thread's default dispatch to the collecting
-    /// subscriber (the guard is held across awaits).
-    fn collect_guard(sub: &Arc<CollectSubscriber>) -> tracing::dispatcher::DefaultGuard {
-        tracing::dispatcher::set_default(&tracing::Dispatch::new(sub.clone()))
-    }
+        fn records_of(ops: &[Op], span: &str) -> Vec<String> {
+            ops.iter()
+                .filter_map(|op| match op {
+                    Op::Record(s, kv) if s == span => Some(kv.clone()),
+                    _ => None,
+                })
+                .collect()
+        }
 
-    fn enter_names(ops: &[Op]) -> Vec<String> {
-        ops.iter()
-            .filter_map(|op| match op {
-                Op::Enter(name) => Some(name.clone()),
-                _ => None,
-            })
-            .collect()
-    }
-
-    fn records_of(ops: &[Op], span: &str) -> Vec<String> {
-        ops.iter()
-            .filter_map(|op| match op {
-                Op::Record(s, kv) if s == span => Some(kv.clone()),
-                _ => None,
-            })
-            .collect()
-    }
-
-    /// Assert hierarchy invariants (shared by both paths): (1) whenever a
-    /// span is entered, `agent.run` must be on the enter/exit stack (no
-    /// orphan spans — llm/tool must render under run);
-    /// (2) no span with the same name on the stack (the same span can't be
-    /// entered twice); (3) enter/exit strictly pair up.
-    fn assert_nesting_invariants(ops: &[Op]) {
-        let mut stack: Vec<String> = Vec::new();
-        for op in ops {
-            match op {
-                Op::Enter(name) => {
-                    if name != "agent.run" {
+        /// Assert hierarchy invariants (shared by both paths): (1) whenever a
+        /// span is entered, `agent.run` must be on the enter/exit stack (no
+        /// orphan spans — llm/tool must render under run);
+        /// (2) no span with the same name on the stack (the same span can't be
+        /// entered twice); (3) enter/exit strictly pair up.
+        fn assert_nesting_invariants(ops: &[Op]) {
+            let mut stack: Vec<String> = Vec::new();
+            for op in ops {
+                match op {
+                    Op::Enter(name) => {
+                        if name != "agent.run" {
+                            assert!(
+                                stack.contains(&"agent.run".to_string()),
+                                "span {name} requires agent.run on the stack when entering (stack: {stack:?})"
+                            );
+                        }
                         assert!(
-                            stack.contains(&"agent.run".to_string()),
-                            "span {name} requires agent.run on the stack when entering (stack: {stack:?})"
+                            !stack.contains(name),
+                            "same span entered twice (double instrumenting): {name} (stack: {stack:?})"
+                        );
+                        stack.push(name.clone());
+                    }
+                    Op::Exit(name) => {
+                        assert_eq!(
+                            stack.pop().as_deref(),
+                            Some(name.as_str()),
+                            "exit must pair with enter: {name}"
                         );
                     }
-                    assert!(
-                        !stack.contains(name),
-                        "same span entered twice (double instrumenting): {name} (stack: {stack:?})"
-                    );
-                    stack.push(name.clone());
+                    _ => {}
                 }
-                Op::Exit(name) => {
-                    assert_eq!(
-                        stack.pop().as_deref(),
-                        Some(name.as_str()),
-                        "exit must pair with enter: {name}"
-                    );
-                }
-                _ => {}
-            }
-        }
-    }
-
-    /// Non-streaming path: span tree agent.run → llm_request / tool (two
-    /// levels, grouped by the round attribute); hierarchy invariants hold
-    /// (no orphans, no double enters); llm_request records usage at wrap-up
-    /// (dual channel); run.id is consistent across the tree.
-    #[tokio::test]
-    async fn trace_span_tree_non_stream() {
-        let sub = Arc::new(CollectSubscriber::default());
-        let _guard = collect_guard(&sub);
-
-        let (calc, _calls) = FakeTool::new("calc", "42");
-        let mut registry = ToolRegistry::new();
-        registry.register(calc);
-        let fake = SharedFake::new([
-            FakeReply::WithUsage {
-                reply: Box::new(FakeReply::ToolCalls {
-                    content: "".into(),
-                    calls: vec![call("c1", "calc", "{}")],
-                }),
-                usage: Usage::new(10, 2),
-            },
-            FakeReply::text_with_usage("42", Usage::new(20, 5)),
-        ]);
-        let mut agent = agent_with_registry(fake, registry, AgentConfig::default());
-        assert_eq!(agent.run("Compute").await.unwrap(), "42");
-
-        let ops = sub.ops.lock().unwrap().clone();
-        // Hierarchy invariants (no orphan spans, no double enters, paired
-        // exits).
-        assert_nesting_invariants(&ops);
-        // Structure: two rounds, one llm_request each (round one also has a
-        // tool). Note every instrumented future enters and exits twice (one
-        // poll + one more enter inside Instrumented's drop; tracing
-        // guarantees inner's Drop also runs in the span context), so the
-        // assertions use "first-appearance order" and lower-bound counts
-        // rather than exact enter/exit sequences.
-        let enters = enter_names(&ops);
-        let mut first_seen = Vec::new();
-        for name in enters.iter() {
-            if !first_seen.contains(name) {
-                first_seen.push(name.clone());
-            }
-        }
-        assert_eq!(first_seen, ["agent.run", "llm_request", "tool"]);
-        assert!(enters.iter().filter(|n| *n == "llm_request").count() >= 2);
-        assert!(enters.iter().filter(|n| *n == "tool").count() >= 1);
-
-        // usage via both channels: llm_request records on the span at
-        // wrap-up (the usage injected per round).
-        assert_eq!(
-            records_of(&ops, "llm_request"),
-            [
-                "usage.prompt_tokens=10",
-                "usage.completion_tokens=2",
-                "usage.prompt_tokens=20",
-                "usage.completion_tokens=5",
-            ]
-        );
-
-        // Levels: agent.run is INFO (skeleton visible by default), detail
-        // spans are DEBUG.
-        let spans = sub.spans.lock().unwrap().clone();
-        let run_span = spans.iter().find(|s| s.name == "agent.run").unwrap();
-        assert_eq!(run_span.level, Level::INFO);
-        assert_eq!(
-            spans
-                .iter()
-                .find(|s| s.name == "llm_request")
-                .unwrap()
-                .level,
-            Level::DEBUG
-        );
-        assert_eq!(
-            spans.iter().find(|s| s.name == "tool").unwrap().level,
-            Level::DEBUG
-        );
-
-        // round attribute: llm_request carries the round number (two
-        // rounds = 1, 2 — the grouping key).
-        let llm_rounds: Vec<u64> = spans
-            .iter()
-            .filter(|s| s.name == "llm_request")
-            .map(|s| {
-                s.fields
-                    .iter()
-                    .find(|(f, _)| f == "round")
-                    .map(|(_, v)| v.parse().unwrap())
-                    .unwrap()
-            })
-            .collect();
-        assert_eq!(llm_rounds, vec![1, 2]);
-
-        // run.id: every span carries the same run id (the correlation key
-        // with the event stream's RunStarted).
-        let run_ids: Vec<String> = spans
-            .iter()
-            .map(|s| {
-                s.fields
-                    .iter()
-                    .find(|(f, _)| f == "run.id")
-                    .map(|(_, v)| v.clone())
-                    .unwrap_or_else(|| panic!("span {} must carry a run.id field", s.name))
-            })
-            .collect();
-        assert!(run_ids.iter().all(|id| id == &run_ids[0]));
-        assert!(run_ids[0].starts_with("run-"));
-    }
-
-    /// Streaming path: the same span structure; the run span enters on
-    /// every poll (covering the whole consumption period); usage is
-    /// recorded at wrap-up when the Done event arrives.
-    #[tokio::test]
-    async fn trace_span_tree_stream() {
-        let sub = Arc::new(CollectSubscriber::default());
-        let _guard = collect_guard(&sub);
-
-        let (calc, _calls) = FakeTool::new("calc", "42");
-        let mut registry = ToolRegistry::new();
-        registry.register(calc);
-        let fake = SharedFake::new([
-            FakeReply::WithUsage {
-                reply: Box::new(FakeReply::ToolCalls {
-                    content: "".into(),
-                    calls: vec![call("c1", "calc", "{}")],
-                }),
-                usage: Usage::new(10, 2),
-            },
-            FakeReply::text_with_usage("42", Usage::new(20, 5)),
-        ]);
-        let mut agent = agent_with_registry(fake, registry, AgentConfig::default());
-        agent
-            .run_stream("Compute")
-            .await
-            .unwrap()
-            .for_each(|_| async {})
-            .await;
-
-        let ops = sub.ops.lock().unwrap().clone();
-        // Hierarchy invariants: any change that breaks the span hierarchy
-        // (e.g. losing an instrument on the tool path) is caught by this
-        // assertion.
-        assert_nesting_invariants(&ops);
-        // First-appearance enter order = the hierarchy; per-await
-        // instrumenting inside the generator makes the same span enter and
-        // exit many times (across polls + drops), so only first-appearance
-        // order and multiple enters of run are asserted.
-        let enters = enter_names(&ops);
-        let mut first_seen = Vec::new();
-        for name in enters.iter() {
-            if !first_seen.contains(name) {
-                first_seen.push(name.clone());
-            }
-        }
-        assert_eq!(first_seen, ["agent.run", "llm_request", "tool"]);
-        // The run span enters on every poll: it enters many times during
-        // stream consumption, far beyond the 2 of poll+drop.
-        assert!(enters.iter().filter(|n| *n == "agent.run").count() > 2);
-
-        // usage recorded at wrap-up (the per-round injected usage).
-        assert_eq!(
-            records_of(&ops, "llm_request"),
-            [
-                "usage.prompt_tokens=10",
-                "usage.completion_tokens=2",
-                "usage.prompt_tokens=20",
-                "usage.completion_tokens=5",
-            ]
-        );
-    }
-
-    /// Two runs: run.id differs (per-instance increment); the event stream's
-    /// RunStarted carries the same id — the correlation key between trace
-    /// and the event stream.
-    #[tokio::test]
-    async fn trace_run_id_differs_between_runs() {
-        let sub = Arc::new(CollectSubscriber::default());
-        let _guard = collect_guard(&sub);
-
-        let fake = SharedFake::new([FakeReply::Text("hi".into()), FakeReply::Text("bye".into())]);
-        let (mut agent, mut rx) = attach_channel(agent(fake, ""));
-        agent.run("one").await.unwrap();
-        agent.run("two").await.unwrap();
-        drop(agent);
-
-        let spans = sub.spans.lock().unwrap().clone();
-        let run_ids: Vec<String> = spans
-            .iter()
-            .filter(|s| s.name == "agent.run")
-            .map(|s| {
-                s.fields
-                    .iter()
-                    .find(|(f, _)| f == "run.id")
-                    .map(|(_, v)| v.clone())
-                    .unwrap()
-            })
-            .collect();
-        assert_eq!(run_ids.len(), 2);
-        assert_ne!(run_ids[0], run_ids[1]);
-
-        // Event-stream side: RunStarted carries the same run id as the span
-        // (one per run).
-        let events = drain(&mut rx).await;
-        let event_ids: Vec<String> = events
-            .iter()
-            .filter_map(|e| match react_event(&**e) {
-                ReActEvent::RunStarted { run_id, .. } => Some(run_id.clone()),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(event_ids, run_ids);
-    }
-
-    /// Run failure: the agent.run span records an error at wrap-up
-    /// (observability spots the failed run at a glance).
-    #[tokio::test]
-    async fn trace_run_error_recorded() {
-        let sub = Arc::new(CollectSubscriber::default());
-        let _guard = collect_guard(&sub);
-
-        let (calc, _calls) = FakeTool::new("calc", "42");
-        let mut registry = ToolRegistry::new();
-        registry.register(calc);
-        let fake = SharedFake::new([
-            FakeReply::ToolCalls {
-                content: "".into(),
-                calls: vec![call("c1", "calc", "{}")],
-            },
-            FakeReply::ToolCalls {
-                content: "".into(),
-                calls: vec![call("c2", "calc", "{}")],
-            },
-        ]);
-        let mut agent = agent_with_registry(
-            fake,
-            registry,
-            AgentConfig {
-                max_tool_rounds: 2,
-                ..Default::default()
-            },
-        );
-        assert!(matches!(
-            agent.run("Keep computing").await,
-            Err(AgentError::TooManyToolRounds(2))
-        ));
-
-        let ops = sub.ops.lock().unwrap().clone();
-        // Values are Debug-formatted, so strings carry quotes; the error
-        // text is asserted with starts_with (extensible, not locked to the
-        // full text).
-        let records = records_of(&ops, "agent.run");
-        assert_eq!(records.len(), 1);
-        assert!(
-            records[0].starts_with("error=\"model requested tools for more than 2 rounds"),
-            "unexpected records: {records:?}"
-        );
-    }
-
-    /// Tool failure: the tool span records an error (the failure is fed
-    /// back as text; the run ends normally, agent.run has no error).
-    #[tokio::test]
-    async fn trace_tool_error_recorded() {
-        struct FailingTool;
-        #[async_trait::async_trait]
-        impl Tool for FailingTool {
-            fn schema(&self) -> ToolSchema {
-                ToolSchema::new("boom", "Tool that always fails", serde_json::json!({}))
-            }
-            async fn call(
-                &self,
-                _arguments: serde_json::Value,
-                _context: ToolContext<'_>,
-            ) -> Result<ToolResult, ToolError> {
-                Err(ToolError::Execution("internal error".into()))
             }
         }
 
-        let sub = Arc::new(CollectSubscriber::default());
-        let _guard = collect_guard(&sub);
+        /// Non-streaming path: span tree agent.run → llm_request / tool (two
+        /// levels, grouped by the round attribute); hierarchy invariants hold
+        /// (no orphans, no double enters); llm_request records usage at wrap-up
+        /// (dual channel); run.id is consistent across the tree.
+        #[tokio::test]
+        async fn trace_span_tree_non_stream() {
+            let sub = Arc::new(CollectSubscriber::default());
+            let _guard = collect_guard(&sub);
 
-        let mut registry = ToolRegistry::new();
-        registry.register(FailingTool);
-        let fake = SharedFake::new([
-            FakeReply::ToolCalls {
-                content: "".into(),
-                calls: vec![call("c1", "boom", "{}")],
-            },
-            FakeReply::Text("Got it".into()),
-        ]);
-        let mut agent = agent_with_registry(fake, registry, AgentConfig::default());
-        agent.run("Trigger failure").await.unwrap();
-
-        let ops = sub.ops.lock().unwrap().clone();
-        // The tool span records the failure (the registry classification's
-        // Display); the run ends normally, with no error.
-        let tool_errors = records_of(&ops, "tool");
-        assert_eq!(tool_errors.len(), 1);
-        assert!(tool_errors[0].contains("internal error"));
-        assert!(records_of(&ops, "agent.run").is_empty());
-    }
-
-    /// Provider failure (non-streaming): the llm_request span records the
-    /// error — observability can pinpoint which call of which round failed;
-    /// the run span records too (the whole run failed).
-    #[tokio::test]
-    async fn trace_llm_error_recorded() {
-        let sub = Arc::new(CollectSubscriber::default());
-        let _guard = collect_guard(&sub);
-
-        // Script exhausted: the second run's conversation fails outright.
-        let fake = SharedFake::new([FakeReply::Text("hi".into())]);
-        let mut agent = agent(fake, "");
-        agent.run("one").await.unwrap();
-        let err = agent.run("two").await.unwrap_err();
-        assert!(matches!(err, AgentError::Provider(_)));
-
-        let ops = sub.ops.lock().unwrap().clone();
-        // The failed call: the llm_request span has an error record (the
-        // first run's successful call only has usage records; the two spans'
-        // records land in the same collector).
-        let llm_records = records_of(&ops, "llm_request");
-        assert!(
-            llm_records.iter().any(|r| r.starts_with("error=")),
-            "the failed round's llm span should have an error: {llm_records:?}"
-        );
-        // The run span also records the failed outcome.
-        assert!(
-            records_of(&ops, "agent.run")
-                .iter()
-                .any(|r| r.starts_with("error="))
-        );
-    }
-
-    /// Provider failure mid-stream (streaming): the consumption loop's Err
-    /// event records the error on the llm_request span, and the run span
-    /// records in sync; hierarchy invariants still hold.
-    #[tokio::test]
-    async fn trace_stream_llm_error_recorded() {
-        struct FailInStream;
-        #[async_trait::async_trait]
-        impl Provider for FailInStream {
-            async fn chat(&self, _request: ChatRequest) -> Result<ChatResponse, ProviderError> {
-                unreachable!("this test uses streaming path only")
-            }
-            async fn stream_chat(
-                &self,
-                _request: ChatRequest,
-            ) -> Result<BoxStream<'static, Result<StreamEvent, ProviderError>>, ProviderError>
-            {
-                Ok(Box::pin(futures::stream::iter(vec![
-                    Ok(StreamEvent::Delta("hi".into())),
-                    Err(ProviderError::Api {
-                        status: 0,
-                        message: "boom".into(),
+            let (calc, _calls) = FakeTool::new("calc", "42");
+            let mut registry = ToolRegistry::new();
+            registry.register(calc);
+            let fake = SharedFake::new([
+                FakeReply::WithUsage {
+                    reply: Box::new(FakeReply::ToolCalls {
+                        content: "".into(),
+                        calls: vec![call("c1", "calc", "{}")],
                     }),
-                ])))
+                    usage: Usage::new(10, 2),
+                },
+                FakeReply::text_with_usage("42", Usage::new(20, 5)),
+            ]);
+            let mut agent = agent_with_registry(fake, registry, AgentConfig::default());
+            assert_eq!(agent.run("Compute").await.unwrap(), "42");
+
+            let ops = sub.ops.lock().unwrap().clone();
+            // Hierarchy invariants (no orphan spans, no double enters, paired
+            // exits).
+            assert_nesting_invariants(&ops);
+            // Structure: two rounds, one llm_request each (round one also has a
+            // tool). Note every instrumented future enters and exits twice (one
+            // poll + one more enter inside Instrumented's drop; tracing
+            // guarantees inner's Drop also runs in the span context), so the
+            // assertions use "first-appearance order" and lower-bound counts
+            // rather than exact enter/exit sequences.
+            let enters = enter_names(&ops);
+            let mut first_seen = Vec::new();
+            for name in enters.iter() {
+                if !first_seen.contains(name) {
+                    first_seen.push(name.clone());
+                }
+            }
+            assert_eq!(first_seen, ["agent.run", "llm_request", "tool"]);
+            assert!(enters.iter().filter(|n| *n == "llm_request").count() >= 2);
+            assert!(enters.iter().filter(|n| *n == "tool").count() >= 1);
+
+            // usage via both channels: llm_request records on the span at
+            // wrap-up (the usage injected per round).
+            assert_eq!(
+                records_of(&ops, "llm_request"),
+                [
+                    "usage.prompt_tokens=10",
+                    "usage.completion_tokens=2",
+                    "usage.prompt_tokens=20",
+                    "usage.completion_tokens=5",
+                ]
+            );
+
+            // Levels: agent.run is INFO (skeleton visible by default), detail
+            // spans are DEBUG.
+            let spans = sub.spans.lock().unwrap().clone();
+            let run_span = spans.iter().find(|s| s.name == "agent.run").unwrap();
+            assert_eq!(run_span.level, Level::INFO);
+            assert_eq!(
+                spans
+                    .iter()
+                    .find(|s| s.name == "llm_request")
+                    .unwrap()
+                    .level,
+                Level::DEBUG
+            );
+            assert_eq!(
+                spans.iter().find(|s| s.name == "tool").unwrap().level,
+                Level::DEBUG
+            );
+
+            // round attribute: llm_request carries the round number (two
+            // rounds = 1, 2 — the grouping key).
+            let llm_rounds: Vec<u64> = spans
+                .iter()
+                .filter(|s| s.name == "llm_request")
+                .map(|s| {
+                    s.fields
+                        .iter()
+                        .find(|(f, _)| f == "round")
+                        .map(|(_, v)| v.parse().unwrap())
+                        .unwrap()
+                })
+                .collect();
+            assert_eq!(llm_rounds, vec![1, 2]);
+
+            // run.id: every span carries the same run id (the correlation key
+            // with the event stream's RunStarted).
+            let run_ids: Vec<String> = spans
+                .iter()
+                .map(|s| {
+                    s.fields
+                        .iter()
+                        .find(|(f, _)| f == "run.id")
+                        .map(|(_, v)| v.clone())
+                        .unwrap_or_else(|| panic!("span {} must carry a run.id field", s.name))
+                })
+                .collect();
+            assert!(run_ids.iter().all(|id| id == &run_ids[0]));
+            assert!(run_ids[0].starts_with("run-"));
+        }
+
+        /// Streaming path: the same span structure; the run span enters on
+        /// every poll (covering the whole consumption period); usage is
+        /// recorded at wrap-up when the Done event arrives.
+        #[tokio::test]
+        async fn trace_span_tree_stream() {
+            let sub = Arc::new(CollectSubscriber::default());
+            let _guard = collect_guard(&sub);
+
+            let (calc, _calls) = FakeTool::new("calc", "42");
+            let mut registry = ToolRegistry::new();
+            registry.register(calc);
+            let fake = SharedFake::new([
+                FakeReply::WithUsage {
+                    reply: Box::new(FakeReply::ToolCalls {
+                        content: "".into(),
+                        calls: vec![call("c1", "calc", "{}")],
+                    }),
+                    usage: Usage::new(10, 2),
+                },
+                FakeReply::text_with_usage("42", Usage::new(20, 5)),
+            ]);
+            let mut agent = agent_with_registry(fake, registry, AgentConfig::default());
+            agent
+                .run_stream("Compute")
+                .await
+                .unwrap()
+                .for_each(|_| async {})
+                .await;
+
+            let ops = sub.ops.lock().unwrap().clone();
+            // Hierarchy invariants: any change that breaks the span hierarchy
+            // (e.g. losing an instrument on the tool path) is caught by this
+            // assertion.
+            assert_nesting_invariants(&ops);
+            // First-appearance enter order = the hierarchy; per-await
+            // instrumenting inside the generator makes the same span enter and
+            // exit many times (across polls + drops), so only first-appearance
+            // order and multiple enters of run are asserted.
+            let enters = enter_names(&ops);
+            let mut first_seen = Vec::new();
+            for name in enters.iter() {
+                if !first_seen.contains(name) {
+                    first_seen.push(name.clone());
+                }
+            }
+            assert_eq!(first_seen, ["agent.run", "llm_request", "tool"]);
+            // The run span enters on every poll: it enters many times during
+            // stream consumption, far beyond the 2 of poll+drop.
+            assert!(enters.iter().filter(|n| *n == "agent.run").count() > 2);
+
+            // usage recorded at wrap-up (the per-round injected usage).
+            assert_eq!(
+                records_of(&ops, "llm_request"),
+                [
+                    "usage.prompt_tokens=10",
+                    "usage.completion_tokens=2",
+                    "usage.prompt_tokens=20",
+                    "usage.completion_tokens=5",
+                ]
+            );
+        }
+
+        /// Two runs: run.id differs (per-instance increment); the event stream's
+        /// RunStarted carries the same id — the correlation key between trace
+        /// and the event stream.
+        #[tokio::test]
+        async fn trace_run_id_differs_between_runs() {
+            let sub = Arc::new(CollectSubscriber::default());
+            let _guard = collect_guard(&sub);
+
+            let fake =
+                SharedFake::new([FakeReply::Text("hi".into()), FakeReply::Text("bye".into())]);
+            let (mut agent, mut rx) = attach_channel(agent(fake, ""));
+            agent.run("one").await.unwrap();
+            agent.run("two").await.unwrap();
+            drop(agent);
+
+            let spans = sub.spans.lock().unwrap().clone();
+            let run_ids: Vec<String> = spans
+                .iter()
+                .filter(|s| s.name == "agent.run")
+                .map(|s| {
+                    s.fields
+                        .iter()
+                        .find(|(f, _)| f == "run.id")
+                        .map(|(_, v)| v.clone())
+                        .unwrap()
+                })
+                .collect();
+            assert_eq!(run_ids.len(), 2);
+            assert_ne!(run_ids[0], run_ids[1]);
+
+            // Event-stream side: RunStarted carries the same run id as the span
+            // (one per run).
+            let events = drain(&mut rx).await;
+            let event_ids: Vec<String> = events
+                .iter()
+                .filter_map(|e| match react_event(&**e) {
+                    ReActEvent::RunStarted { run_id, .. } => Some(run_id.clone()),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(event_ids, run_ids);
+        }
+
+        /// Run failure: the agent.run span records an error at wrap-up
+        /// (observability spots the failed run at a glance).
+        #[tokio::test]
+        async fn trace_run_error_recorded() {
+            let sub = Arc::new(CollectSubscriber::default());
+            let _guard = collect_guard(&sub);
+
+            let (calc, _calls) = FakeTool::new("calc", "42");
+            let mut registry = ToolRegistry::new();
+            registry.register(calc);
+            let fake = SharedFake::new([
+                FakeReply::ToolCalls {
+                    content: "".into(),
+                    calls: vec![call("c1", "calc", "{}")],
+                },
+                FakeReply::ToolCalls {
+                    content: "".into(),
+                    calls: vec![call("c2", "calc", "{}")],
+                },
+            ]);
+            let mut agent = agent_with_registry(
+                fake,
+                registry,
+                AgentConfig {
+                    max_tool_rounds: 2,
+                    ..Default::default()
+                },
+            );
+            assert!(matches!(
+                agent.run("Keep computing").await,
+                Err(AgentError::TooManyToolRounds(2))
+            ));
+
+            let ops = sub.ops.lock().unwrap().clone();
+            // Values are Debug-formatted, so strings carry quotes; the error
+            // text is asserted with starts_with (extensible, not locked to the
+            // full text).
+            let records = records_of(&ops, "agent.run");
+            assert_eq!(records.len(), 1);
+            assert!(
+                records[0].starts_with("error=\"model requested tools for more than 2 rounds"),
+                "unexpected records: {records:?}"
+            );
+        }
+
+        /// Tool failure: the tool span records an error (the failure is fed
+        /// back as text; the run ends normally, agent.run has no error).
+        #[tokio::test]
+        async fn trace_tool_error_recorded() {
+            struct FailingTool;
+            #[async_trait::async_trait]
+            impl Tool for FailingTool {
+                fn schema(&self) -> ToolSchema {
+                    ToolSchema::new("boom", "Tool that always fails", serde_json::json!({}))
+                }
+                async fn call(
+                    &self,
+                    _arguments: serde_json::Value,
+                    _context: ToolContext<'_>,
+                ) -> Result<ToolResult, ToolError> {
+                    Err(ToolError::Execution("internal error".into()))
+                }
+            }
+
+            let sub = Arc::new(CollectSubscriber::default());
+            let _guard = collect_guard(&sub);
+
+            let mut registry = ToolRegistry::new();
+            registry.register(FailingTool);
+            let fake = SharedFake::new([
+                FakeReply::ToolCalls {
+                    content: "".into(),
+                    calls: vec![call("c1", "boom", "{}")],
+                },
+                FakeReply::Text("Got it".into()),
+            ]);
+            let mut agent = agent_with_registry(fake, registry, AgentConfig::default());
+            agent.run("Trigger failure").await.unwrap();
+
+            let ops = sub.ops.lock().unwrap().clone();
+            // The tool span records the failure (the registry classification's
+            // Display); the run ends normally, with no error.
+            let tool_errors = records_of(&ops, "tool");
+            assert_eq!(tool_errors.len(), 1);
+            assert!(tool_errors[0].contains("internal error"));
+            assert!(records_of(&ops, "agent.run").is_empty());
+        }
+
+        /// Provider failure (non-streaming): the llm_request span records the
+        /// error — observability can pinpoint which call of which round failed;
+        /// the run span records too (the whole run failed).
+        #[tokio::test]
+        async fn trace_llm_error_recorded() {
+            let sub = Arc::new(CollectSubscriber::default());
+            let _guard = collect_guard(&sub);
+
+            // Script exhausted: the second run's conversation fails outright.
+            let fake = SharedFake::new([FakeReply::Text("hi".into())]);
+            let mut agent = agent(fake, "");
+            agent.run("one").await.unwrap();
+            let err = agent.run("two").await.unwrap_err();
+            assert!(matches!(err, AgentError::Provider(_)));
+
+            let ops = sub.ops.lock().unwrap().clone();
+            // The failed call: the llm_request span has an error record (the
+            // first run's successful call only has usage records; the two spans'
+            // records land in the same collector).
+            let llm_records = records_of(&ops, "llm_request");
+            assert!(
+                llm_records.iter().any(|r| r.starts_with("error=")),
+                "the failed round's llm span should have an error: {llm_records:?}"
+            );
+            // The run span also records the failed outcome.
+            assert!(
+                records_of(&ops, "agent.run")
+                    .iter()
+                    .any(|r| r.starts_with("error="))
+            );
+        }
+
+        /// Provider failure mid-stream (streaming): the consumption loop's Err
+        /// event records the error on the llm_request span, and the run span
+        /// records in sync; hierarchy invariants still hold.
+        #[tokio::test]
+        async fn trace_stream_llm_error_recorded() {
+            struct FailInStream;
+            #[async_trait::async_trait]
+            impl Provider for FailInStream {
+                async fn chat(&self, _request: ChatRequest) -> Result<ChatResponse, ProviderError> {
+                    unreachable!("this test uses streaming path only")
+                }
+                async fn stream_chat(
+                    &self,
+                    _request: ChatRequest,
+                ) -> Result<BoxStream<'static, Result<StreamEvent, ProviderError>>, ProviderError>
+                {
+                    Ok(Box::pin(futures::stream::iter(vec![
+                        Ok(StreamEvent::Delta("hi".into())),
+                        Err(ProviderError::Api {
+                            status: 0,
+                            message: "boom".into(),
+                        }),
+                    ])))
+                }
+            }
+
+            let sub = Arc::new(CollectSubscriber::default());
+            let _guard = collect_guard(&sub);
+
+            let mut agent = ReActAgent::new(FailInStream, ToolRegistry::new(), "");
+            let mut stream = agent.run_stream("two").await.unwrap();
+            while stream.next().await.is_some() {}
+
+            let ops = sub.ops.lock().unwrap().clone();
+            assert_nesting_invariants(&ops);
+            assert!(
+                records_of(&ops, "llm_request")
+                    .iter()
+                    .any(|r| r.contains("boom"))
+            );
+            assert!(
+                records_of(&ops, "agent.run")
+                    .iter()
+                    .any(|r| r.contains("boom"))
+            );
+        }
+    }
+
+    #[cfg(feature = "skills")]
+    mod skill_tests {
+        use super::*;
+        use crate::skill::SkillRegistry;
+
+        // ---------- Skill assembly ----------
+
+        /// Test skill: builds a minimal valid SKILL.md.
+        fn skill(name: &str, description: &str, body: &str) -> crate::skill::Skill {
+            crate::skill::Skill::parse(&format!(
+                "---\nname: {name}\ndescription: {description}\n---\n{body}"
+            ))
+            .unwrap()
+        }
+
+        /// A registry containing multiple skills.
+        fn skill_registry(skills: &[(&str, &str, &str)]) -> SkillRegistry {
+            let registry = SkillRegistry::new();
+            for (name, description, body) in skills {
+                registry.add(skill(name, description, body));
+            }
+            registry
+        }
+
+        /// The System message text of the most recent request.
+        fn system_text(fake: &SharedFake) -> String {
+            let requests = fake.requests();
+            let last = requests.last().expect("expected a request");
+            match &last.messages[0] {
+                Message::System(s) => s.clone(),
+                other => panic!("first message must be System, got: {other:?}"),
             }
         }
 
-        let sub = Arc::new(CollectSubscriber::default());
-        let _guard = collect_guard(&sub);
-
-        let mut agent = ReActAgent::new(FailInStream, ToolRegistry::new(), "");
-        let mut stream = agent.run_stream("two").await.unwrap();
-        while stream.next().await.is_some() {}
-
-        let ops = sub.ops.lock().unwrap().clone();
-        assert_nesting_invariants(&ops);
-        assert!(
-            records_of(&ops, "llm_request")
+        /// The ToolResult content carrying the given substring in the most
+        /// recent request.
+        fn tool_result_contains(fake: &SharedFake, needle: &str) {
+            let requests = fake.requests();
+            let last = requests.last().expect("expected a request");
+            let content = last
+                .messages
                 .iter()
-                .any(|r| r.contains("boom"))
-        );
-        assert!(
-            records_of(&ops, "agent.run")
-                .iter()
-                .any(|r| r.contains("boom"))
-        );
-    }
-
-    // ---------- Skill assembly ----------
-
-    /// Test skill: builds a minimal valid SKILL.md.
-    fn skill(name: &str, description: &str, body: &str) -> crate::skill::Skill {
-        crate::skill::Skill::parse(&format!(
-            "---\nname: {name}\ndescription: {description}\n---\n{body}"
-        ))
-        .unwrap()
-    }
-
-    /// A registry containing multiple skills.
-    fn skill_registry(skills: &[(&str, &str, &str)]) -> SkillRegistry {
-        let registry = SkillRegistry::new();
-        for (name, description, body) in skills {
-            registry.add(skill(name, description, body));
+                .find_map(|m| match m {
+                    Message::ToolResult { content, .. } => Some(content.clone()),
+                    _ => None,
+                })
+                .expect("expected ToolResult");
+            assert!(
+                content.contains(needle),
+                "ToolResult should contain {needle:?}, got: {content:?}"
+            );
         }
-        registry
-    }
 
-    /// The System message text of the most recent request.
-    fn system_text(fake: &SharedFake) -> String {
-        let requests = fake.requests();
-        let last = requests.last().expect("expected a request");
-        match &last.messages[0] {
-            Message::System(s) => s.clone(),
-            other => panic!("first message must be System, got: {other:?}"),
+        #[tokio::test]
+        async fn with_skills_adds_menu_to_system_prompt() {
+            let fake = SharedFake::new([FakeReply::Text("OK".into())]);
+            let mut agent =
+                agent(fake.clone(), "You are an assistant").with_skills(skill_registry(&[
+                    ("code-review", "Review code", "Step one"),
+                    ("greet", "Say hello", "Hello"),
+                ]));
+
+            agent.run("Are you there").await.unwrap();
+            let system = system_text(&fake);
+            assert!(
+                system.starts_with("You are an assistant"),
+                "base prompt must come first: {system}"
+            );
+            assert!(system.contains("- code-review: Review code"));
+            assert!(system.contains("- greet: Say hello"));
         }
-    }
 
-    /// The ToolResult content carrying the given substring in the most
-    /// recent request.
-    fn tool_result_contains(fake: &SharedFake, needle: &str) {
-        let requests = fake.requests();
-        let last = requests.last().expect("expected a request");
-        let content = last
-            .messages
-            .iter()
-            .find_map(|m| match m {
-                Message::ToolResult { content, .. } => Some(content.clone()),
-                _ => None,
-            })
-            .expect("expected ToolResult");
-        assert!(
-            content.contains(needle),
-            "ToolResult should contain {needle:?}, got: {content:?}"
-        );
-    }
+        #[tokio::test]
+        async fn with_skills_registers_load_skill() {
+            let fake = SharedFake::new([FakeReply::Text("OK".into())]);
+            let mut agent = agent(fake.clone(), "You are an assistant")
+                .with_skills(skill_registry(&[("greet", "Say hello", "Hello body")]));
 
-    #[tokio::test]
-    async fn with_skills_adds_menu_to_system_prompt() {
-        let fake = SharedFake::new([FakeReply::Text("OK".into())]);
-        let mut agent = agent(fake.clone(), "You are an assistant").with_skills(skill_registry(&[
-            ("code-review", "Review code", "Step one"),
-            ("greet", "Say hello", "Hello"),
-        ]));
-
-        agent.run("Are you there").await.unwrap();
-        let system = system_text(&fake);
-        assert!(
-            system.starts_with("You are an assistant"),
-            "base prompt must come first: {system}"
-        );
-        assert!(system.contains("- code-review: Review code"));
-        assert!(system.contains("- greet: Say hello"));
-    }
-
-    #[tokio::test]
-    async fn with_skills_registers_load_skill() {
-        let fake = SharedFake::new([FakeReply::Text("OK".into())]);
-        let mut agent = agent(fake.clone(), "You are an assistant")
-            .with_skills(skill_registry(&[("greet", "Say hello", "Hello body")]));
-
-        // The tool is registered into the registry; the schema reaches the
-        // request's tools, visible to the model.
-        assert!(agent.registry.names().contains(&"load_skill".to_string()));
-        agent.run("Are you there").await.unwrap();
-        assert!(
-            fake.requests()[0]
-                .tools
-                .iter()
-                .any(|t| t.name == "load_skill")
-        );
-    }
-
-    #[tokio::test]
-    async fn load_skill_used_in_loop() {
-        let fake = SharedFake::new([
-            FakeReply::ToolCalls {
-                content: "".into(),
-                calls: vec![call("c1", "load_skill", r#"{"name":"greet"}"#)],
-            },
-            FakeReply::Text("Done".into()),
-        ]);
-        let mut agent = agent(fake.clone(), "You are an assistant")
-            .with_skills(skill_registry(&[("greet", "Say hello", "Hello body")]));
-
-        let answer = agent.run("Say hello").await.unwrap();
-        assert_eq!(answer, "Done");
-        // The body is recorded as a ToolResult and sent back to the model in
-        // the second request.
-        let requests = fake.requests();
-        assert_eq!(requests.len(), 2);
-        let tool_results: Vec<&Message> = requests[1]
-            .messages
-            .iter()
-            .filter(|m| matches!(m, Message::ToolResult { .. }))
-            .collect();
-        assert_eq!(tool_results.len(), 1);
-        match tool_results[0] {
-            Message::ToolResult { content, .. } => assert!(content.contains("Hello body")),
-            _ => unreachable!(),
-        }
-    }
-
-    #[tokio::test]
-    async fn load_skill_not_found_returns_error_text() {
-        let fake = SharedFake::new([
-            FakeReply::ToolCalls {
-                content: "".into(),
-                calls: vec![call("c1", "load_skill", r#"{"name":"ghost"}"#)],
-            },
-            FakeReply::Text("Try another".into()),
-        ]);
-        let mut agent = agent(fake.clone(), "You are an assistant")
-            .with_skills(skill_registry(&[("greet", "Say hello", "Hello body")]));
-
-        agent.run("Load skill").await.unwrap();
-        tool_result_contains(&fake, "not found");
-    }
-
-    #[tokio::test]
-    async fn load_skill_not_enabled_returns_text() {
-        let fake = SharedFake::new([
-            FakeReply::ToolCalls {
-                content: "".into(),
-                calls: vec![call("c1", "load_skill", r#"{"name":"other"}"#)],
-            },
-            FakeReply::Text("Understood".into()),
-        ]);
-        let mut agent = agent(fake.clone(), "You are an assistant")
-            .with_skills(skill_registry(&[
-                ("greet", "Say hello", "Hello body"),
-                ("other", "Another", "Other content"),
-            ]))
-            .with_enabled_skills(&["greet"]);
-
-        agent.run("Load").await.unwrap();
-        tool_result_contains(&fake, "not enabled");
-    }
-
-    #[tokio::test]
-    async fn with_skills_inline_embeds_all_bodies() {
-        let fake = SharedFake::new([FakeReply::Text("OK".into())]);
-        let mut agent =
-            agent(fake.clone(), "You are an assistant").with_skills_inline(skill_registry(&[
-                ("greet", "Say hello", "Hello body"),
-                ("other", "Another", "Other content"),
-            ]));
-        assert!(!agent.registry.names().contains(&"load_skill".to_string()));
-
-        agent.run("Are you there").await.unwrap();
-        let system = system_text(&fake);
-        assert!(system.contains("[Skill greet]\nHello body"));
-        assert!(system.contains("[Skill other]\nOther content"));
-        // Inline mode has no menu.
-        assert!(!system.contains("- greet:"));
-    }
-
-    #[tokio::test]
-    async fn with_enabled_skills_filters_menu() {
-        let fake = SharedFake::new([FakeReply::Text("OK".into())]);
-        let mut agent = agent(fake.clone(), "You are an assistant")
-            .with_skills(skill_registry(&[
-                ("greet", "Say hello", "Hello body"),
-                ("other", "Another", "Other content"),
-            ]))
-            .with_enabled_skills(&["greet"]);
-
-        agent.run("Are you there").await.unwrap();
-        let system = system_text(&fake);
-        assert!(system.contains("- greet: Say hello"));
-        assert!(!system.contains("- other:"));
-    }
-
-    #[tokio::test]
-    async fn activate_skill_embeds_body_and_leaves_menu() {
-        let fake = SharedFake::new([FakeReply::Text("OK".into())]);
-        let mut agent = agent(fake.clone(), "You are an assistant").with_skills(skill_registry(&[
-            ("greet", "Say hello", "Hello body"),
-            ("other", "Another", "Other content"),
-        ]));
-        assert!(agent.activate_skill("greet"));
-
-        agent.run("Are you there").await.unwrap();
-        let system = system_text(&fake);
-        assert!(system.contains("[Skill greet]\nHello body"));
-        // Pre-activated skills leave the menu; other skills remain.
-        assert!(!system.contains("- greet:"));
-        assert!(system.contains("- other: Another"));
-    }
-
-    #[tokio::test]
-    async fn deactivate_skill_returns_to_menu() {
-        let fake = SharedFake::new([FakeReply::Text("OK".into())]);
-        let mut agent = agent(fake.clone(), "You are an assistant")
-            .with_skills(skill_registry(&[("greet", "Say hello", "Hello body")]));
-        assert!(agent.activate_skill("greet"));
-        assert!(agent.deactivate_skill("greet"));
-
-        agent.run("Are you there").await.unwrap();
-        let system = system_text(&fake);
-        assert!(system.contains("- greet: Say hello"));
-        assert!(!system.contains("[Skill greet]"));
-        // Deactivating a skill that isn't activated: false.
-        assert!(!agent.deactivate_skill("greet"));
-    }
-
-    #[tokio::test]
-    async fn activate_skill_failure_paths() {
-        // Nonexistent / outside the allowlist → false; repeated activation
-        // is idempotent → true.
-        let mut whitelisted = agent(SharedFake::new([FakeReply::Text("OK".into())]), "")
-            .with_skills(skill_registry(&[("greet", "Say hello", "Hello body")]))
-            .with_enabled_skills(&["greet"]);
-        assert!(!whitelisted.activate_skill("ghost"));
-        assert!(!whitelisted.activate_skill("other"));
-        assert!(whitelisted.activate_skill("greet"));
-        assert!(whitelisted.activate_skill("greet"));
-
-        // Inline mode: pre-activation has no effect.
-        let mut inline = agent(SharedFake::new([FakeReply::Text("OK".into())]), "")
-            .with_skills_inline(skill_registry(&[("greet", "Say hello", "Hello body")]));
-        assert!(!inline.activate_skill("greet"));
-        assert!(!inline.deactivate_skill("greet"));
-    }
-
-    #[tokio::test]
-    async fn empty_skills_registry_zero_cost() {
-        let fake = SharedFake::new([FakeReply::Text("OK".into())]);
-        let mut agent =
-            agent(fake.clone(), "You are an assistant").with_skills(SkillRegistry::new());
-        agent.run("Are you there").await.unwrap();
-        // Empty registry: the system prompt is unchanged.
-        assert_eq!(system_text(&fake), "You are an assistant");
-        // load_skill is registered: hot-swapping from empty to populated
-        // lets the model load immediately.
-        assert!(agent.registry.names().contains(&"load_skill".to_string()));
-    }
-
-    #[tokio::test]
-    async fn skills_hot_swap_takes_effect_next_request() {
-        let fake = SharedFake::new([
-            FakeReply::Text("first round".into()),
-            FakeReply::Text("second round".into()),
-        ]);
-        let mut swap_agent =
-            agent(fake.clone(), "You are an assistant").with_skills(SkillRegistry::new());
-
-        swap_agent.run("Are you there").await.unwrap();
-        // The application side hot-swaps via the pub skills handle: it takes
-        // effect on the next request.
-        swap_agent
-            .skills
-            .add(skill("late", "Skill added later", "Late body"));
-        swap_agent.run("Once more").await.unwrap();
-        assert!(system_text(&fake).contains("- late: Skill added later"));
-
-        // load_skill looks up by name at call time: newly hot-swapped skills
-        // load immediately.
-        let fake2 = SharedFake::new([
-            FakeReply::ToolCalls {
-                content: "".into(),
-                calls: vec![call("c1", "load_skill", r#"{"name":"late"}"#)],
-            },
-            FakeReply::Text("Done".into()),
-        ]);
-        let mut late_agent =
-            agent(fake2.clone(), "You are an assistant").with_skills(SkillRegistry::new());
-        late_agent
-            .skills
-            .add(skill("late", "Skill added later", "Late body"));
-        late_agent.run("Load").await.unwrap();
-        tool_result_contains(&fake2, "Late body");
-    }
-
-    #[tokio::test]
-    async fn with_skills_inline_overrides_with_skills() {
-        let fake = SharedFake::new([FakeReply::Text("OK".into())]);
-        let mut agent = agent(fake.clone(), "You are an assistant")
-            .with_skills(skill_registry(&[("a", "A", "Body-a")]))
-            .with_skills_inline(skill_registry(&[("b", "B", "Body-b")]));
-        // Dynamic → inline switch: load_skill is removed.
-        assert!(!agent.registry.names().contains(&"load_skill".to_string()));
-
-        agent.run("Are you there").await.unwrap();
-        let system = system_text(&fake);
-        assert!(system.contains("[Skill b]\nBody-b"));
-        assert!(!system.contains("Body-a"));
-    }
-
-    #[tokio::test]
-    async fn load_skill_content_survives_window_trim() {
-        // Small budget window: skill bodies (protected) stay resident while
-        // regular conversation rounds are trimmed as usual.
-        let fake = SharedFake::new([
-            FakeReply::ToolCalls {
-                content: "".into(),
-                calls: vec![call("c1", "load_skill", r#"{"name":"greet"}"#)],
-            },
-            FakeReply::Text("round one".into()),
-            FakeReply::Text("round two".into()),
-            FakeReply::Text("round three".into()),
-        ]);
-        let mut agent = agent(fake.clone(), "You are an assistant")
-            .with_memory(crate::memory::WindowMemory::new(3))
-            .with_skills(skill_registry(&[(
-                "greet",
-                "Say hello",
-                "Skill body content",
-            )]));
-
-        agent.run("Load").await.unwrap();
-        agent.run("round two").await.unwrap();
-        agent.run("round three").await.unwrap();
-
-        // Context of the last request: the protected first round (skill
-        // body) and the latest round are kept; the middle regular rounds
-        // are trimmed.
-        let requests = fake.requests();
-        let last = requests.last().unwrap();
-        let texts: Vec<String> = last
-            .messages
-            .iter()
-            .map(|m| match m {
-                Message::ToolResult { content, .. } => content.clone(),
-                Message::User(blocks) => blocks
+            // The tool is registered into the registry; the schema reaches the
+            // request's tools, visible to the model.
+            assert!(agent.registry.names().contains(&"load_skill".to_string()));
+            agent.run("Are you there").await.unwrap();
+            assert!(
+                fake.requests()[0]
+                    .tools
                     .iter()
-                    .map(|b| match b {
-                        crate::ContentBlock::Text(t) => t.clone(),
-                        crate::ContentBlock::Image(_) | crate::ContentBlock::Wire(_) => {
-                            String::new()
-                        }
-                    })
-                    .collect(),
-                _ => String::new(),
-            })
-            .collect();
-        let joined = texts.join("|");
-        assert!(
-            joined.contains("Skill body content"),
-            "skill body should stay resident: {joined}"
-        );
-        assert!(
-            joined.contains("round three"),
-            "latest round should be kept: {joined}"
-        );
-        assert!(
-            !joined.contains("round two"),
-            "middle regular rounds should be trimmed: {joined}"
-        );
-    }
+                    .any(|t| t.name == "load_skill")
+            );
+        }
 
-    #[tokio::test]
-    async fn enabled_skills_before_with_skills_order_independent() {
-        // Allowlist set before assembly: with_skills reads the allowlist
-        // when registering load_skill.
-        let fake = SharedFake::new([
-            FakeReply::ToolCalls {
-                content: "".into(),
-                calls: vec![call("c1", "load_skill", r#"{"name":"other"}"#)],
-            },
-            FakeReply::Text("Understood".into()),
-        ]);
-        let mut agent = agent(fake.clone(), "You are an assistant")
-            .with_enabled_skills(&["greet"])
-            .with_skills(skill_registry(&[
-                ("greet", "Say hello", "Hello body"),
-                ("other", "Another", "Other content"),
-            ]));
+        #[tokio::test]
+        async fn load_skill_used_in_loop() {
+            let fake = SharedFake::new([
+                FakeReply::ToolCalls {
+                    content: "".into(),
+                    calls: vec![call("c1", "load_skill", r#"{"name":"greet"}"#)],
+                },
+                FakeReply::Text("Done".into()),
+            ]);
+            let mut agent = agent(fake.clone(), "You are an assistant")
+                .with_skills(skill_registry(&[("greet", "Say hello", "Hello body")]));
 
-        agent.run("Load").await.unwrap();
-        tool_result_contains(&fake, "not enabled");
+            let answer = agent.run("Say hello").await.unwrap();
+            assert_eq!(answer, "Done");
+            // The body is recorded as a ToolResult and sent back to the model in
+            // the second request.
+            let requests = fake.requests();
+            assert_eq!(requests.len(), 2);
+            let tool_results: Vec<&Message> = requests[1]
+                .messages
+                .iter()
+                .filter(|m| matches!(m, Message::ToolResult { .. }))
+                .collect();
+            assert_eq!(tool_results.len(), 1);
+            match tool_results[0] {
+                Message::ToolResult { content, .. } => assert!(content.contains("Hello body")),
+                _ => unreachable!(),
+            }
+        }
+
+        #[tokio::test]
+        async fn load_skill_not_found_returns_error_text() {
+            let fake = SharedFake::new([
+                FakeReply::ToolCalls {
+                    content: "".into(),
+                    calls: vec![call("c1", "load_skill", r#"{"name":"ghost"}"#)],
+                },
+                FakeReply::Text("Try another".into()),
+            ]);
+            let mut agent = agent(fake.clone(), "You are an assistant")
+                .with_skills(skill_registry(&[("greet", "Say hello", "Hello body")]));
+
+            agent.run("Load skill").await.unwrap();
+            tool_result_contains(&fake, "not found");
+        }
+
+        #[tokio::test]
+        async fn load_skill_not_enabled_returns_text() {
+            let fake = SharedFake::new([
+                FakeReply::ToolCalls {
+                    content: "".into(),
+                    calls: vec![call("c1", "load_skill", r#"{"name":"other"}"#)],
+                },
+                FakeReply::Text("Understood".into()),
+            ]);
+            let mut agent = agent(fake.clone(), "You are an assistant")
+                .with_skills(skill_registry(&[
+                    ("greet", "Say hello", "Hello body"),
+                    ("other", "Another", "Other content"),
+                ]))
+                .with_enabled_skills(&["greet"]);
+
+            agent.run("Load").await.unwrap();
+            tool_result_contains(&fake, "not enabled");
+        }
+
+        #[tokio::test]
+        async fn with_skills_inline_embeds_all_bodies() {
+            let fake = SharedFake::new([FakeReply::Text("OK".into())]);
+            let mut agent =
+                agent(fake.clone(), "You are an assistant").with_skills_inline(skill_registry(&[
+                    ("greet", "Say hello", "Hello body"),
+                    ("other", "Another", "Other content"),
+                ]));
+            assert!(!agent.registry.names().contains(&"load_skill".to_string()));
+
+            agent.run("Are you there").await.unwrap();
+            let system = system_text(&fake);
+            assert!(system.contains("[Skill greet]\nHello body"));
+            assert!(system.contains("[Skill other]\nOther content"));
+            // Inline mode has no menu.
+            assert!(!system.contains("- greet:"));
+        }
+
+        #[tokio::test]
+        async fn with_enabled_skills_filters_menu() {
+            let fake = SharedFake::new([FakeReply::Text("OK".into())]);
+            let mut agent = agent(fake.clone(), "You are an assistant")
+                .with_skills(skill_registry(&[
+                    ("greet", "Say hello", "Hello body"),
+                    ("other", "Another", "Other content"),
+                ]))
+                .with_enabled_skills(&["greet"]);
+
+            agent.run("Are you there").await.unwrap();
+            let system = system_text(&fake);
+            assert!(system.contains("- greet: Say hello"));
+            assert!(!system.contains("- other:"));
+        }
+
+        #[tokio::test]
+        async fn activate_skill_embeds_body_and_leaves_menu() {
+            let fake = SharedFake::new([FakeReply::Text("OK".into())]);
+            let mut agent =
+                agent(fake.clone(), "You are an assistant").with_skills(skill_registry(&[
+                    ("greet", "Say hello", "Hello body"),
+                    ("other", "Another", "Other content"),
+                ]));
+            assert!(agent.activate_skill("greet"));
+
+            agent.run("Are you there").await.unwrap();
+            let system = system_text(&fake);
+            assert!(system.contains("[Skill greet]\nHello body"));
+            // Pre-activated skills leave the menu; other skills remain.
+            assert!(!system.contains("- greet:"));
+            assert!(system.contains("- other: Another"));
+        }
+
+        #[tokio::test]
+        async fn deactivate_skill_returns_to_menu() {
+            let fake = SharedFake::new([FakeReply::Text("OK".into())]);
+            let mut agent = agent(fake.clone(), "You are an assistant")
+                .with_skills(skill_registry(&[("greet", "Say hello", "Hello body")]));
+            assert!(agent.activate_skill("greet"));
+            assert!(agent.deactivate_skill("greet"));
+
+            agent.run("Are you there").await.unwrap();
+            let system = system_text(&fake);
+            assert!(system.contains("- greet: Say hello"));
+            assert!(!system.contains("[Skill greet]"));
+            // Deactivating a skill that isn't activated: false.
+            assert!(!agent.deactivate_skill("greet"));
+        }
+
+        #[tokio::test]
+        async fn activate_skill_failure_paths() {
+            // Nonexistent / outside the allowlist → false; repeated activation
+            // is idempotent → true.
+            let mut whitelisted = agent(SharedFake::new([FakeReply::Text("OK".into())]), "")
+                .with_skills(skill_registry(&[("greet", "Say hello", "Hello body")]))
+                .with_enabled_skills(&["greet"]);
+            assert!(!whitelisted.activate_skill("ghost"));
+            assert!(!whitelisted.activate_skill("other"));
+            assert!(whitelisted.activate_skill("greet"));
+            assert!(whitelisted.activate_skill("greet"));
+
+            // Inline mode: pre-activation has no effect.
+            let mut inline = agent(SharedFake::new([FakeReply::Text("OK".into())]), "")
+                .with_skills_inline(skill_registry(&[("greet", "Say hello", "Hello body")]));
+            assert!(!inline.activate_skill("greet"));
+            assert!(!inline.deactivate_skill("greet"));
+        }
+
+        #[tokio::test]
+        async fn empty_skills_registry_zero_cost() {
+            let fake = SharedFake::new([FakeReply::Text("OK".into())]);
+            let mut agent =
+                agent(fake.clone(), "You are an assistant").with_skills(SkillRegistry::new());
+            agent.run("Are you there").await.unwrap();
+            // Empty registry: the system prompt is unchanged.
+            assert_eq!(system_text(&fake), "You are an assistant");
+            // load_skill is registered: hot-swapping from empty to populated
+            // lets the model load immediately.
+            assert!(agent.registry.names().contains(&"load_skill".to_string()));
+        }
+
+        #[tokio::test]
+        async fn skills_hot_swap_takes_effect_next_request() {
+            let fake = SharedFake::new([
+                FakeReply::Text("first round".into()),
+                FakeReply::Text("second round".into()),
+            ]);
+            let mut swap_agent =
+                agent(fake.clone(), "You are an assistant").with_skills(SkillRegistry::new());
+
+            swap_agent.run("Are you there").await.unwrap();
+            // The application side hot-swaps via the pub skills handle: it takes
+            // effect on the next request.
+            swap_agent
+                .skills
+                .add(skill("late", "Skill added later", "Late body"));
+            swap_agent.run("Once more").await.unwrap();
+            assert!(system_text(&fake).contains("- late: Skill added later"));
+
+            // load_skill looks up by name at call time: newly hot-swapped skills
+            // load immediately.
+            let fake2 = SharedFake::new([
+                FakeReply::ToolCalls {
+                    content: "".into(),
+                    calls: vec![call("c1", "load_skill", r#"{"name":"late"}"#)],
+                },
+                FakeReply::Text("Done".into()),
+            ]);
+            let mut late_agent =
+                agent(fake2.clone(), "You are an assistant").with_skills(SkillRegistry::new());
+            late_agent
+                .skills
+                .add(skill("late", "Skill added later", "Late body"));
+            late_agent.run("Load").await.unwrap();
+            tool_result_contains(&fake2, "Late body");
+        }
+
+        #[tokio::test]
+        async fn with_skills_inline_overrides_with_skills() {
+            let fake = SharedFake::new([FakeReply::Text("OK".into())]);
+            let mut agent = agent(fake.clone(), "You are an assistant")
+                .with_skills(skill_registry(&[("a", "A", "Body-a")]))
+                .with_skills_inline(skill_registry(&[("b", "B", "Body-b")]));
+            // Dynamic → inline switch: load_skill is removed.
+            assert!(!agent.registry.names().contains(&"load_skill".to_string()));
+
+            agent.run("Are you there").await.unwrap();
+            let system = system_text(&fake);
+            assert!(system.contains("[Skill b]\nBody-b"));
+            assert!(!system.contains("Body-a"));
+        }
+
+        #[tokio::test]
+        async fn load_skill_content_survives_window_trim() {
+            // Small budget window: skill bodies (protected) stay resident while
+            // regular conversation rounds are trimmed as usual.
+            let fake = SharedFake::new([
+                FakeReply::ToolCalls {
+                    content: "".into(),
+                    calls: vec![call("c1", "load_skill", r#"{"name":"greet"}"#)],
+                },
+                FakeReply::Text("round one".into()),
+                FakeReply::Text("round two".into()),
+                FakeReply::Text("round three".into()),
+            ]);
+            let mut agent = agent(fake.clone(), "You are an assistant")
+                .with_memory(crate::memory::WindowMemory::new(3))
+                .with_skills(skill_registry(&[(
+                    "greet",
+                    "Say hello",
+                    "Skill body content",
+                )]));
+
+            agent.run("Load").await.unwrap();
+            agent.run("round two").await.unwrap();
+            agent.run("round three").await.unwrap();
+
+            // Context of the last request: the protected first round (skill
+            // body) and the latest round are kept; the middle regular rounds
+            // are trimmed.
+            let requests = fake.requests();
+            let last = requests.last().unwrap();
+            let texts: Vec<String> = last
+                .messages
+                .iter()
+                .map(|m| match m {
+                    Message::ToolResult { content, .. } => content.clone(),
+                    Message::User(blocks) => blocks
+                        .iter()
+                        .map(|b| match b {
+                            crate::ContentBlock::Text(t) => t.clone(),
+                            crate::ContentBlock::Image(_) | crate::ContentBlock::Wire(_) => {
+                                String::new()
+                            }
+                        })
+                        .collect(),
+                    _ => String::new(),
+                })
+                .collect();
+            let joined = texts.join("|");
+            assert!(
+                joined.contains("Skill body content"),
+                "skill body should stay resident: {joined}"
+            );
+            assert!(
+                joined.contains("round three"),
+                "latest round should be kept: {joined}"
+            );
+            assert!(
+                !joined.contains("round two"),
+                "middle regular rounds should be trimmed: {joined}"
+            );
+        }
+
+        #[tokio::test]
+        async fn enabled_skills_before_with_skills_order_independent() {
+            // Allowlist set before assembly: with_skills reads the allowlist
+            // when registering load_skill.
+            let fake = SharedFake::new([
+                FakeReply::ToolCalls {
+                    content: "".into(),
+                    calls: vec![call("c1", "load_skill", r#"{"name":"other"}"#)],
+                },
+                FakeReply::Text("Understood".into()),
+            ]);
+            let mut agent = agent(fake.clone(), "You are an assistant")
+                .with_enabled_skills(&["greet"])
+                .with_skills(skill_registry(&[
+                    ("greet", "Say hello", "Hello body"),
+                    ("other", "Another", "Other content"),
+                ]));
+
+            agent.run("Load").await.unwrap();
+            tool_result_contains(&fake, "not enabled");
+        }
     }
 }

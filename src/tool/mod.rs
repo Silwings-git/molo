@@ -451,7 +451,7 @@ impl From<serde_json::Error> for ToolError {
 mod registry;
 mod shared_state;
 
-#[cfg(test)]
+#[cfg(all(test, feature = "macros"))]
 mod macro_tests {
     // Functional tests for the `#[molo::tool]` macro: generated Tool
     // implementations register, execute, and produce correct schemas.

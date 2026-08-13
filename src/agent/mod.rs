@@ -14,7 +14,8 @@
 //!   named sub-agent pool (the main loop delegates sub-loops via tools);
 //! - Structured output: [`TypedAgent`] typed-output interface,
 //!   [`StructuredValidator`] validation component (validation / feedback
-//!   messages / retry budget in one);
+//!   messages / retry budget in one), available with the `structured`
+//!   feature;
 //! - Message chunks and summaries: [`MessageChunk`] / [`RunSummary`];
 //! - Optional behavior configuration: [`AgentConfig`].
 //!
@@ -50,6 +51,7 @@
 mod config;
 mod events;
 mod react;
+#[cfg(feature = "structured")]
 mod structured;
 mod sub_agent;
 
@@ -58,6 +60,7 @@ pub use events::ReActEvent;
 pub use react::{
     ReActAgent, SerialToolRoundExecutor, ToolCallOutcome, ToolRoundCtx, ToolRoundExecutor,
 };
+#[cfg(feature = "structured")]
 pub use structured::{
     StructuredOutcome, StructuredValidator, structured_retry_message, validate_structured,
 };
@@ -66,7 +69,9 @@ pub use sub_agent::{PoolError, SubAgentPool, SubAgentTool};
 use crate::effect::{EffectObservation, EffectRequest};
 use crate::memory::MemoryError;
 use crate::provider::{ChatRequest, ChatResponse, ProviderError};
-use crate::run::{RunContext, RunMetadata, RunOutput, RunRequest, TypedRunOutput};
+#[cfg(feature = "structured")]
+use crate::run::TypedRunOutput;
+use crate::run::{RunContext, RunMetadata, RunOutput, RunRequest};
 use futures::stream::BoxStream;
 use std::fmt;
 use tokio_util::sync::CancellationToken;
@@ -397,6 +402,7 @@ pub trait CancellableAgent: Agent {
 /// [`structured_retry_message`] inside their own loops (the built-in
 /// [`ReActAgent`] assembly is exactly this shape).
 #[async_trait::async_trait]
+#[cfg(feature = "structured")]
 pub trait TypedAgent: Agent {
     /// Typed structured run with caller-provided execution context.
     async fn run_typed_request_with_context<U>(

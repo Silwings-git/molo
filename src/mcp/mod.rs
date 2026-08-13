@@ -668,6 +668,7 @@ fn content_to_text(blocks: &[ContentBlock]) -> String {
             // new variants at compile time — output a placeholder and warn,
             // never silently swallow.
             _ => {
+                #[cfg(feature = "tracing")]
                 tracing::warn!("mcp tool result contains an unknown content block");
                 "[content]".into()
             }

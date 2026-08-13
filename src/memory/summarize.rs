@@ -214,7 +214,10 @@ impl SummarizeStrategy {
                 // On failure, degrade to window dropping (projection): the
                 // conversation continues, storage keeps the original text, and
                 // summarization is retried on the next over-budget retrieval.
+                #[cfg(feature = "tracing")]
                 tracing::warn!(%error, "summarize failed, falling back to window drop");
+                #[cfg(not(feature = "tracing"))]
+                let _ = error;
                 None
             }
         };
@@ -232,13 +235,16 @@ impl SummarizeStrategy {
         // The summary message's tokens count toward the budget and may leave
         // the materialized result over budget (the next retrieval compacts
         // again) — the log carries this info for diagnosis.
-        let summary_tokens = count_message(counter, &result[0]).await?;
-        tracing::info!(
-            compressed = cut,
-            kept = messages.len() - cut,
-            summary_tokens,
-            "context summarized by LLM"
-        );
+        #[cfg(feature = "tracing")]
+        {
+            let summary_tokens = count_message(counter, &result[0]).await?;
+            tracing::info!(
+                compressed = cut,
+                kept = messages.len() - cut,
+                summary_tokens,
+                "context summarized by LLM"
+            );
+        }
         Ok(TrimResult {
             messages: result,
             replace: true,

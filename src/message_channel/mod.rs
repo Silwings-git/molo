@@ -15,15 +15,15 @@
 //!
 //! | Need | Choice |
 //! |------|------|
-//! | Interacting with a human: terminal questions, confirmation, approval | [`CliMessageChannel`] |
+//! | Interacting with a human: terminal questions, confirmation, approval | [`CliMessageChannel`] (`cli-channel` feature) |
 //! | One-on-one dialogue between two Agents, with request-response in both directions | [`MpscChannel`] |
 //! | One-to-many broadcast notifications, no reply expected | [`BroadcastChannel`] |
 //! | Observing changes of the latest state (status, heartbeat, progress) | [`WatchChannel`] |
 //!
 //! Selection notes:
 //!
-//! - **Need request-response** → [`CliMessageChannel`] (human)
-//!   or [`MpscChannel`] (Agent); the other two don't support `ask`
+//! - **Need request-response** → [`MpscChannel`] (Agent) or
+//!   [`CliMessageChannel`] (human, `cli-channel` feature); the other two don't support `ask`
 //!   and return [`ChannelError::NotSupported`].
 //! - **One-way notifications only** → [`BroadcastChannel`] or
 //!   [`WatchChannel`]; neither waits for the counterparty's confirmation.
@@ -177,11 +177,13 @@ impl IncomingMessage {
 }
 
 mod broadcast;
+#[cfg(feature = "cli-channel")]
 mod cli;
 mod mpsc;
 mod watch;
 
 pub use broadcast::{BroadcastChannel, BroadcastReceiver};
+#[cfg(feature = "cli-channel")]
 pub use cli::CliMessageChannel;
 pub use mpsc::MpscChannel;
 pub use watch::{WatchChannel, WatchReceiver};
