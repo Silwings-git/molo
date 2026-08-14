@@ -18,7 +18,144 @@ pub use shared_state::SharedState;
 use crate::effect::{DisplayOutput, EffectRequest, RiskLevel};
 use crate::run::{Artifact, RunContext, RunMetadata};
 use serde::{Deserialize, Serialize};
+use std::fmt;
 use std::time::Duration;
+
+/// Namespace assigned to a tool by the host application or extension layer.
+///
+/// The provider-facing tool name is still a single unique string. The
+/// namespace is host-facing metadata used for extension unload, policy,
+/// audit, and debugging.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct ToolNamespace {
+    /// Namespace kind.
+    pub kind: ToolNamespaceKind,
+    /// Stable host-assigned namespace id.
+    pub id: String,
+}
+
+impl ToolNamespace {
+    /// Constructs a namespace from a kind and stable id.
+    pub fn new(kind: ToolNamespaceKind, id: impl Into<String>) -> Self {
+        Self {
+            kind,
+            id: id.into(),
+        }
+    }
+
+    /// Namespace for local application tools registered without extension
+    /// source metadata.
+    pub fn local() -> Self {
+        Self::new(ToolNamespaceKind::Local, "local")
+    }
+
+    /// Namespace for tools discovered from one MCP server.
+    pub fn mcp_server(id: impl Into<String>) -> Self {
+        Self::new(ToolNamespaceKind::McpServer, id)
+    }
+
+    /// Namespace for tools exposed by one skill layer.
+    pub fn skill_layer(id: impl Into<String>) -> Self {
+        Self::new(ToolNamespaceKind::SkillLayer, id)
+    }
+}
+
+impl fmt::Display for ToolNamespace {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{:?}:{}", self.kind, self.id)
+    }
+}
+
+/// Kind of tool namespace.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[non_exhaustive]
+pub enum ToolNamespaceKind {
+    /// Local application-owned tools.
+    Local,
+    /// Tools discovered from an MCP server.
+    McpServer,
+    /// Tools exposed by an Agent Skills layer.
+    SkillLayer,
+    /// Tools exposed by a sub-agent.
+    SubAgent,
+    /// Application-specific namespace kind.
+    Custom(String),
+}
+
+/// Trust level assigned to a tool source.
+///
+/// This value is a policy input only. It does not grant permission and must
+/// not be used to bypass harness governance.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub enum ToolTrustLevel {
+    /// Host-owned trusted code.
+    Trusted,
+    /// Project-local source selected by the host.
+    Project,
+    /// User-installed extension source.
+    UserInstalled,
+    /// External process or service.
+    External,
+    /// Untrusted source.
+    Untrusted,
+}
+
+/// Host-facing metadata describing where a provider-visible tool came from.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolSource {
+    /// Source namespace.
+    pub namespace: ToolNamespace,
+    /// Raw source name before provider-facing disambiguation.
+    pub raw_name: String,
+    /// Provider-facing display name registered in [`ToolRegistry`].
+    pub display_name: String,
+    /// Source trust level.
+    pub trust: ToolTrustLevel,
+    /// Host/application metadata.
+    pub metadata: RunMetadata,
+}
+
+impl ToolSource {
+    /// Constructs source metadata with external trust by default.
+    pub fn new(
+        namespace: ToolNamespace,
+        raw_name: impl Into<String>,
+        display_name: impl Into<String>,
+    ) -> Self {
+        Self {
+            namespace,
+            raw_name: raw_name.into(),
+            display_name: display_name.into(),
+            trust: ToolTrustLevel::External,
+            metadata: RunMetadata::new(),
+        }
+    }
+
+    /// Constructs source metadata for a local application tool.
+    pub fn local(name: impl Into<String>) -> Self {
+        let name = name.into();
+        Self {
+            namespace: ToolNamespace::local(),
+            raw_name: name.clone(),
+            display_name: name,
+            trust: ToolTrustLevel::Trusted,
+            metadata: RunMetadata::new(),
+        }
+    }
+
+    /// Sets the trust level.
+    pub fn with_trust(mut self, trust: ToolTrustLevel) -> Self {
+        self.trust = trust;
+        self
+    }
+
+    /// Sets source metadata.
+    pub fn with_metadata(mut self, metadata: RunMetadata) -> Self {
+        self.metadata = metadata;
+        self
+    }
+}
 
 /// The definition of a tool.
 ///

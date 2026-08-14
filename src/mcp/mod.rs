@@ -30,20 +30,30 @@
 //! server) is out of scope. Resource / prompt protocol capabilities are also
 //! not wired in — this component focuses on tool integration.
 
+use std::collections::HashMap;
+use std::fmt;
 use std::future::Future;
 use std::process::Command as StdCommand;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use rmcp::model::{CallToolRequestParams, ContentBlock, ProtocolVersion};
 use rmcp::service::{ClientCacheConfig, ClientInitializeError, RoleClient, RunningService};
 use rmcp::transport::child_process::TokioChildProcess;
 use rmcp::transport::streamable_http_client::StreamableHttpClientWorker;
 use rmcp::{ClientLifecycleMode, ClientServiceExt};
+use serde::{Deserialize, Serialize};
 
-use crate::effect::RiskLevel;
+use crate::effect::{DisplayFormat, DisplayOutput, EffectKind, EffectRequest, RiskLevel};
+#[cfg(feature = "harness")]
+use crate::harness::{
+    ClassifiedEffect, EffectExecutor, ExecutionError, ExecutionPolicy, NetworkPolicy,
+    PolicyDecision, PolicyEngine, RawEffectOutput, SandboxPolicy,
+};
+use crate::run::{RunContext, RunMetadata};
 use crate::tool::{
-    SideEffectLevel, Tool, ToolContext, ToolError, ToolOutput, ToolPolicy, ToolResult, ToolSchema,
+    SideEffectLevel, Tool, ToolContext, ToolError, ToolNamespace, ToolOutput, ToolPolicy,
+    ToolResult, ToolSchema, ToolSource, ToolTrustLevel,
 };
 
 /// Connection shape: captured at construction, used at `connect()` time.
@@ -69,6 +79,133 @@ const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const DEFAULT_LIST_TIMEOUT: Duration = Duration::from_secs(10);
 /// Default timeout for a single tools/call invocation.
 const DEFAULT_CALL_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Stable host-assigned MCP server id.
+///
+/// MCP server-reported names are not globally unique. Hosts should choose a
+/// stable id for policy, audit, registry namespace, and effect payloads.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct McpServerId(String);
+
+impl McpServerId {
+    /// Constructs an MCP server id.
+    pub fn new(id: impl Into<String>) -> Self {
+        Self(id.into())
+    }
+
+    /// Returns the server id as a string slice.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for McpServerId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl From<String> for McpServerId {
+    fn from(value: String) -> Self {
+        Self::new(value)
+    }
+}
+
+impl From<&str> for McpServerId {
+    fn from(value: &str) -> Self {
+        Self::new(value)
+    }
+}
+
+/// MCP tool id scoped to one server.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct McpToolId {
+    /// Host-assigned MCP server id.
+    pub server: McpServerId,
+    /// Raw tool name exposed by that server.
+    pub raw_name: String,
+}
+
+impl McpToolId {
+    /// Constructs a scoped MCP tool id.
+    pub fn new(server: impl Into<McpServerId>, raw_name: impl Into<String>) -> Self {
+        Self {
+            server: server.into(),
+            raw_name: raw_name.into(),
+        }
+    }
+}
+
+/// Cache hint for an MCP tool catalog.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct McpCacheHint {
+    /// Cache time-to-live in milliseconds, when supplied by the server or
+    /// host adapter.
+    pub ttl_ms: Option<u64>,
+}
+
+/// Description of one MCP tool discovered from a server.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct McpToolDescriptor {
+    /// Scoped MCP tool id.
+    pub id: McpToolId,
+    /// Provider-facing, globally disambiguated tool name.
+    pub display_name: String,
+    /// Tool description.
+    pub description: String,
+    /// Input JSON Schema.
+    pub input_schema: serde_json::Value,
+    /// Output JSON Schema, when the server supplies one.
+    pub output_schema: Option<serde_json::Value>,
+    /// Server-supplied annotations. Treat as untrusted unless the server is
+    /// explicitly trusted by host policy.
+    pub annotations: serde_json::Value,
+    /// Stable digest of the input schema used to detect catalog drift.
+    pub schema_digest: String,
+    /// Optional cache hint.
+    pub cache: Option<McpCacheHint>,
+    /// Host/application metadata.
+    pub metadata: RunMetadata,
+}
+
+impl McpToolDescriptor {
+    /// Source metadata suitable for [`ToolRegistry`](crate::ToolRegistry)
+    /// source-aware registration.
+    pub fn source(&self, trust: ToolTrustLevel) -> ToolSource {
+        ToolSource::new(
+            ToolNamespace::mcp_server(self.id.server.as_str()),
+            self.id.raw_name.clone(),
+            self.display_name.clone(),
+        )
+        .with_trust(trust)
+        .with_metadata(self.metadata.clone())
+    }
+}
+
+/// Snapshot of a server's MCP tool catalog.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct McpToolCatalog {
+    /// Host-assigned server id.
+    pub server: McpServerId,
+    /// Tools in deterministic server/list order.
+    pub tools: Vec<McpToolDescriptor>,
+    /// Fetch time.
+    pub fetched_at: SystemTime,
+    /// Expiration time, when known.
+    pub expires_at: Option<SystemTime>,
+    /// Host/application metadata.
+    pub metadata: RunMetadata,
+}
+
+/// MCP tool execution mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub enum McpToolMode {
+    /// Tool calls the server directly inside [`Tool::call`].
+    DirectOutput,
+    /// Tool only emits an [`EffectRequest`] for a harness to execute.
+    GovernedEffect,
+}
 
 /// MCP client adapter: connects to an MCP server and converts its tools into
 /// molo tools.
@@ -361,12 +498,43 @@ impl McpClient {
         Ok(())
     }
 
-    /// Pulls all tools from the server and converts them into molo tools;
-    /// connects automatically and re-pulls on every call.
+    /// Pulls the server's tool catalog; connects automatically and re-pulls
+    /// on every call.
     ///
-    /// The returned [`McpTool`]s can be registered directly into a
+    /// Discovery is separate from tool wrapping so hosts can inspect
+    /// descriptors, register source metadata, or choose governed effect tools.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`McpError::Connect`] when the automatic connect fails; returns
+    /// [`McpError::ListTools`] with the concrete reason when listing tools
+    /// fails.
+    pub async fn tool_catalog(&mut self) -> Result<McpToolCatalog, McpError> {
+        let tools = self.list_tools_raw().await?;
+        Ok(McpToolCatalog {
+            server: McpServerId::new(self.server_name.clone()),
+            tools: tools
+                .into_iter()
+                .map(|tool| descriptor_from_tool(&self.server_name, tool, self.prefix))
+                .collect(),
+            fetched_at: SystemTime::now(),
+            expires_at: None,
+            metadata: RunMetadata::new(),
+        })
+    }
+
+    /// Pulls all tools from the server and converts them into direct molo
+    /// tools; connects automatically and re-pulls on every call.
+    ///
+    /// The returned [`McpDirectTool`]s can be registered directly into a
     /// `ToolRegistry` (or cloned to share across multiple registries); tool
     /// names follow [`with_name_prefix`](McpClient::with_name_prefix).
+    ///
+    /// This is the direct convenience path: each tool calls the MCP server
+    /// inside [`Tool::call`] and therefore does not pass through harness
+    /// policy, approval, sandbox/network policy, audit, or transcript. Use
+    /// [`effect_tools`](Self::effect_tools) with `mcp + harness` for
+    /// production side-effect governance.
     ///
     /// # Example
     ///
@@ -379,7 +547,44 @@ impl McpClient {
     /// Returns [`McpError::Connect`] when the automatic connect fails; returns
     /// [`McpError::ListTools`] with the concrete reason when listing tools
     /// fails (protocol-level error).
-    pub async fn tools(&mut self) -> Result<Vec<McpTool>, McpError> {
+    pub async fn tools(&mut self) -> Result<Vec<McpDirectTool>, McpError> {
+        self.connect().await?;
+        let Some(running) = self.running.clone() else {
+            return Err(McpError::ListTools {
+                server: self.server_name.clone(),
+                message: "no active connection".into(),
+            });
+        };
+        Ok(self
+            .tool_catalog()
+            .await?
+            .tools
+            .into_iter()
+            .map(|descriptor| {
+                McpDirectTool::new(descriptor, self.call_timeout, Arc::clone(&running))
+            })
+            .collect())
+    }
+
+    /// Pulls all tools from the server and converts them into governed effect
+    /// tools.
+    ///
+    /// These tools do not hold an MCP connection and do not call the server
+    /// directly. A call returns [`ToolResult::Effect`] with
+    /// [`EffectKind::Mcp`], to be executed by a harness with an
+    /// [`McpEffectExecutor`].
+    #[cfg(feature = "harness")]
+    pub async fn effect_tools(&mut self) -> Result<Vec<McpEffectTool>, McpError> {
+        Ok(self
+            .tool_catalog()
+            .await?
+            .tools
+            .into_iter()
+            .map(McpEffectTool::new)
+            .collect())
+    }
+
+    async fn list_tools_raw(&mut self) -> Result<Vec<rmcp::model::Tool>, McpError> {
         self.connect().await?;
         let Some(running) = self.running.clone() else {
             return Err(McpError::ListTools {
@@ -408,18 +613,7 @@ impl McpClient {
                 ),
             });
         }
-        Ok(tools
-            .into_iter()
-            .map(|tool| {
-                McpTool::new(
-                    &self.server_name,
-                    tool,
-                    self.prefix,
-                    self.call_timeout,
-                    Arc::clone(&running),
-                )
-            })
-            .collect())
+        Ok(tools)
     }
 }
 
@@ -434,54 +628,82 @@ impl std::fmt::Debug for McpClient {
     }
 }
 
-/// Adapter tool produced by [`McpClient::tools`]: implements molo's [`Tool`]
-/// trait and proxies calls to the MCP server.
+/// Direct adapter tool produced by [`McpClient::tools`]: implements molo's
+/// [`Tool`] trait and proxies calls to the MCP server.
+///
+/// # Safety Boundary
+///
+/// This direct path calls the MCP server inside [`Tool::call`]. It does not
+/// pass through the harness lifecycle, so production applications with
+/// external or side-effecting servers should prefer [`McpEffectTool`] and
+/// [`McpEffectExecutor`] with the `mcp + harness` features enabled.
 ///
 /// Holds a connection reference (Arc) internally and is Clone-able — register
 /// it in multiple registries (or share between a main agent and sub-agents)
 /// sharing the same connection and state.
 #[derive(Clone)]
-pub struct McpTool {
+pub struct McpDirectTool {
     /// Display name (per the prefix switch; visible to the model).
     name: String,
+    /// Host-assigned server id.
+    server_id: McpServerId,
     /// The raw name on the server (used for forwarding requests).
     raw_name: String,
     /// Tool description.
     description: String,
     /// Parameter JSON Schema (passed through verbatim).
     parameters: serde_json::Value,
+    /// Catalog schema digest.
+    schema_digest: String,
+    /// Source annotations.
+    annotations: serde_json::Value,
     /// Timeout for a single call (from the producing McpClient's config).
     call_timeout: Duration,
     /// Connection handle.
     peer: Arc<RunningService<RoleClient, ()>>,
 }
 
-impl McpTool {
-    /// Builds an adapter tool from the server-returned tool description;
-    /// `prefix` decides whether the display name carries the `{server_name}__`
-    /// namespace; `call_timeout` is the per-call timeout (from
-    /// [`McpClient::with_call_timeout`]).
+impl McpDirectTool {
+    /// Builds a direct adapter tool from a descriptor.
     fn new(
-        server_name: &str,
-        tool: rmcp::model::Tool,
-        prefix: bool,
+        descriptor: McpToolDescriptor,
         call_timeout: Duration,
         peer: Arc<RunningService<RoleClient, ()>>,
     ) -> Self {
-        let mapped = map_tool(server_name, tool, prefix);
         Self {
-            name: mapped.name,
-            raw_name: mapped.raw_name,
-            description: mapped.description,
-            parameters: mapped.parameters,
+            name: descriptor.display_name,
+            server_id: descriptor.id.server,
+            raw_name: descriptor.id.raw_name,
+            description: descriptor.description,
+            parameters: descriptor.input_schema,
+            schema_digest: descriptor.schema_digest,
+            annotations: descriptor.annotations,
             call_timeout,
             peer,
         }
     }
+
+    /// Source metadata for registering this direct tool in a source-aware
+    /// [`ToolRegistry`](crate::ToolRegistry).
+    pub fn source(&self) -> ToolSource {
+        ToolSource::new(
+            ToolNamespace::mcp_server(self.server_id.as_str()),
+            self.raw_name.clone(),
+            self.name.clone(),
+        )
+        .with_trust(ToolTrustLevel::External)
+    }
 }
+
+/// Backward-compatible alias for the direct MCP tool wrapper.
+///
+/// New code should prefer [`McpDirectTool`] for prototype/direct execution or
+/// [`McpEffectTool`] for harness-governed execution.
+pub type McpTool = McpDirectTool;
 
 /// Mapping result of a server tool description: display name / raw name /
 /// description / parameter Schema.
+#[cfg(test)]
 struct MappedTool {
     name: String,
     raw_name: String,
@@ -490,6 +712,7 @@ struct MappedTool {
 }
 
 /// Pure mapping: server tool description → [`MappedTool`].
+#[cfg(test)]
 fn map_tool(server_name: &str, tool: rmcp::model::Tool, prefix: bool) -> MappedTool {
     let raw_name = tool.name.to_string();
     MappedTool {
@@ -500,9 +723,60 @@ fn map_tool(server_name: &str, tool: rmcp::model::Tool, prefix: bool) -> MappedT
     }
 }
 
-impl std::fmt::Debug for McpTool {
+fn descriptor_from_tool(
+    server_name: &str,
+    tool: rmcp::model::Tool,
+    prefix: bool,
+) -> McpToolDescriptor {
+    let raw_name = tool.name.to_string();
+    let input_schema = serde_json::Value::Object((*tool.input_schema).clone());
+    let output_schema = tool
+        .output_schema
+        .map(|schema| serde_json::Value::Object((*schema).clone()));
+    let annotations = tool
+        .annotations
+        .and_then(|annotations| serde_json::to_value(annotations).ok())
+        .unwrap_or(serde_json::Value::Null);
+    McpToolDescriptor {
+        id: McpToolId::new(server_name, raw_name.clone()),
+        display_name: tool_display_name(server_name, &raw_name, prefix),
+        description: tool.description.unwrap_or_default().to_string(),
+        schema_digest: schema_digest(&input_schema),
+        input_schema,
+        output_schema,
+        annotations,
+        cache: None,
+        metadata: RunMetadata::new(),
+    }
+}
+
+fn schema_digest(schema: &serde_json::Value) -> String {
+    const FNV_OFFSET: u64 = 0xcbf29ce484222325;
+    const FNV_PRIME: u64 = 0x100000001b3;
+
+    let text = serde_json::to_string(schema).unwrap_or_else(|_| schema.to_string());
+    let mut hash = FNV_OFFSET;
+    for byte in text.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(FNV_PRIME);
+    }
+    format!("fnv64:{hash:016x}")
+}
+
+#[cfg(feature = "harness")]
+fn risk_rank(risk: RiskLevel) -> u8 {
+    match risk {
+        RiskLevel::Low => 0,
+        RiskLevel::Medium => 1,
+        RiskLevel::High => 2,
+        RiskLevel::Critical => 3,
+    }
+}
+
+impl std::fmt::Debug for McpDirectTool {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("McpTool")
+        f.debug_struct("McpDirectTool")
+            .field("server_id", &self.server_id)
             .field("name", &self.name)
             .field("raw_name", &self.raw_name)
             .finish_non_exhaustive()
@@ -510,8 +784,22 @@ impl std::fmt::Debug for McpTool {
 }
 
 #[async_trait::async_trait]
-impl Tool for McpTool {
+impl Tool for McpDirectTool {
     fn schema(&self) -> ToolSchema {
+        let mut metadata = RunMetadata::new();
+        metadata.insert(
+            "mcp_server_id".to_string(),
+            serde_json::json!(self.server_id.as_str()),
+        );
+        metadata.insert(
+            "mcp_raw_tool_name".to_string(),
+            serde_json::json!(self.raw_name),
+        );
+        metadata.insert(
+            "mcp_schema_digest".to_string(),
+            serde_json::json!(self.schema_digest),
+        );
+        metadata.insert("mcp_annotations".to_string(), self.annotations.clone());
         ToolSchema::new(
             self.name.clone(),
             self.description.clone(),
@@ -523,6 +811,7 @@ impl Tool for McpTool {
             timeout: Some(self.call_timeout),
             ..Default::default()
         })
+        .with_metadata(metadata)
     }
 
     /// Proxies a call: forwards arguments via `tools/call` and joins the
@@ -573,6 +862,457 @@ impl Tool for McpTool {
     }
 }
 
+/// Payload carried inside an [`EffectKind::Mcp`] request.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct McpCallPayload {
+    /// Target server id. Executors must resolve this against host-owned
+    /// client configuration, not against model-provided URLs or commands.
+    pub server_id: McpServerId,
+    /// Raw MCP tool name on the target server.
+    pub tool_name: String,
+    /// Provider-facing display name that produced the call.
+    pub display_name: String,
+    /// Tool arguments.
+    pub arguments: serde_json::Value,
+    /// Catalog schema digest observed at assembly time.
+    pub schema_digest: Option<String>,
+    /// MCP protocol version, when known.
+    pub protocol_version: Option<String>,
+    /// Multi-round tool-result input responses, when supported by the host.
+    pub input_responses: Option<serde_json::Value>,
+    /// Multi-round tool-result request state, when supported by the host.
+    pub request_state: Option<String>,
+    /// Host/application metadata.
+    pub metadata: RunMetadata,
+}
+
+impl McpCallPayload {
+    /// Constructs an MCP call payload.
+    pub fn new(
+        id: McpToolId,
+        display_name: impl Into<String>,
+        arguments: serde_json::Value,
+    ) -> Self {
+        Self {
+            server_id: id.server,
+            tool_name: id.raw_name,
+            display_name: display_name.into(),
+            arguments,
+            schema_digest: None,
+            protocol_version: None,
+            input_responses: None,
+            request_state: None,
+            metadata: RunMetadata::new(),
+        }
+    }
+
+    /// Sets the catalog schema digest.
+    pub fn with_schema_digest(mut self, digest: impl Into<String>) -> Self {
+        self.schema_digest = Some(digest.into());
+        self
+    }
+
+    /// Sets host/application metadata.
+    pub fn with_metadata(mut self, metadata: RunMetadata) -> Self {
+        self.metadata = metadata;
+        self
+    }
+
+    /// Converts this payload into a harness effect request.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`McpError::InvalidPayload`] if the payload cannot be
+    /// serialized.
+    pub fn into_effect(self) -> Result<EffectRequest, McpError> {
+        let description = format!(
+            "call MCP tool {} on server {}",
+            self.tool_name, self.server_id
+        );
+        let metadata = self.metadata.clone();
+        let request = EffectRequest::new(
+            EffectKind::Mcp,
+            description,
+            serde_json::to_value(&self).map_err(|e| McpError::InvalidPayload(e.to_string()))?,
+        )
+        .with_risk(RiskLevel::Medium)
+        .with_metadata(metadata);
+        Ok(request)
+    }
+
+    /// Decodes an MCP call payload from an effect request.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`McpError::InvalidPayload`] when the effect kind is not MCP or
+    /// the payload cannot be decoded.
+    pub fn from_effect(request: &EffectRequest) -> Result<Self, McpError> {
+        if request.kind != EffectKind::Mcp {
+            return Err(McpError::InvalidPayload(format!(
+                "expected EffectKind::Mcp, got {:?}",
+                request.kind
+            )));
+        }
+        serde_json::from_value(request.payload.clone())
+            .map_err(|e| McpError::InvalidPayload(e.to_string()))
+    }
+}
+
+/// MCP tool wrapper for harness-governed execution.
+///
+/// Calls to this tool do not contact the MCP server. They return
+/// [`ToolResult::Effect`] so an outer harness can apply policy, approval,
+/// network/sandbox limits, audit, and transcript recording before an
+/// [`McpEffectExecutor`] performs `tools/call`.
+#[cfg(feature = "harness")]
+#[derive(Debug, Clone)]
+pub struct McpEffectTool {
+    descriptor: McpToolDescriptor,
+    risk: RiskLevel,
+    timeout: Option<Duration>,
+}
+
+#[cfg(feature = "harness")]
+impl McpEffectTool {
+    /// Constructs a governed MCP effect tool from a catalog descriptor.
+    pub fn new(descriptor: McpToolDescriptor) -> Self {
+        Self {
+            descriptor,
+            risk: RiskLevel::Medium,
+            timeout: None,
+        }
+    }
+
+    /// Sets the request-declared risk for generated effects.
+    pub fn with_risk(mut self, risk: RiskLevel) -> Self {
+        self.risk = risk;
+        self
+    }
+
+    /// Sets the request timeout suggestion for generated effects.
+    pub fn with_timeout(mut self, timeout: Duration) -> Self {
+        self.timeout = Some(timeout);
+        self
+    }
+
+    /// Source metadata for registry source-aware registration.
+    pub fn source(&self) -> ToolSource {
+        self.descriptor.source(ToolTrustLevel::External)
+    }
+}
+
+#[cfg(feature = "harness")]
+#[async_trait::async_trait]
+impl Tool for McpEffectTool {
+    fn schema(&self) -> ToolSchema {
+        let mut metadata = self.descriptor.metadata.clone();
+        metadata.insert(
+            "mcp_server_id".to_string(),
+            serde_json::json!(self.descriptor.id.server.as_str()),
+        );
+        metadata.insert(
+            "mcp_raw_tool_name".to_string(),
+            serde_json::json!(self.descriptor.id.raw_name),
+        );
+        metadata.insert(
+            "mcp_schema_digest".to_string(),
+            serde_json::json!(self.descriptor.schema_digest),
+        );
+        ToolSchema::new(
+            self.descriptor.display_name.clone(),
+            self.descriptor.description.clone(),
+            self.descriptor.input_schema.clone(),
+        )
+        .with_policy(ToolPolicy {
+            side_effects: SideEffectLevel::External,
+            risk: self.risk,
+            timeout: self.timeout,
+            ..Default::default()
+        })
+        .with_metadata(metadata)
+    }
+
+    async fn call(
+        &self,
+        arguments: serde_json::Value,
+        context: ToolContext<'_>,
+    ) -> Result<ToolResult, ToolError> {
+        if !arguments.is_object() {
+            return Err(ToolError::InvalidArguments(
+                "mcp tool arguments must be a JSON object".into(),
+            ));
+        }
+        let mut metadata = self.descriptor.metadata.clone();
+        metadata.insert(
+            "source_tool_call_id".to_string(),
+            serde_json::json!(context.tool_call_id),
+        );
+        metadata.insert(
+            "source_tool_name".to_string(),
+            serde_json::json!(context.tool_name),
+        );
+        let payload = McpCallPayload::new(
+            self.descriptor.id.clone(),
+            self.descriptor.display_name.clone(),
+            arguments,
+        )
+        .with_schema_digest(self.descriptor.schema_digest.clone())
+        .with_metadata(metadata);
+        let mut request = payload
+            .into_effect()
+            .map_err(|e| ToolError::Execution(e.to_string()))?
+            .with_source(context.tool_call_id, context.tool_name)
+            .with_risk(self.risk);
+        if let Some(timeout) = self.timeout {
+            request = request.with_timeout(timeout);
+        }
+        Ok(ToolResult::Effect(request))
+    }
+}
+
+/// Output returned by a host-owned MCP client provider.
+#[cfg(feature = "harness")]
+#[derive(Debug, Clone, PartialEq)]
+pub struct McpToolCallOutput {
+    /// Model-visible text content.
+    pub content: String,
+    /// Structured MCP content, when present.
+    pub structured_content: Option<serde_json::Value>,
+    /// Whether the MCP server reported a tool-level error.
+    pub is_error: bool,
+    /// Host/application metadata.
+    pub metadata: RunMetadata,
+}
+
+#[cfg(feature = "harness")]
+impl McpToolCallOutput {
+    /// Constructs a successful text MCP output.
+    pub fn text(content: impl Into<String>) -> Self {
+        Self {
+            content: content.into(),
+            structured_content: None,
+            is_error: false,
+            metadata: RunMetadata::new(),
+        }
+    }
+
+    /// Marks this output as a tool-level error.
+    pub fn into_error(mut self) -> Self {
+        self.is_error = true;
+        self
+    }
+}
+
+/// Host-owned MCP client provider used by [`McpEffectExecutor`].
+///
+/// Implementations resolve `server_id` against configured clients. They must
+/// not accept arbitrary URLs, commands, or credentials from
+/// [`McpCallPayload`].
+#[cfg(feature = "harness")]
+#[async_trait::async_trait]
+pub trait McpClientProvider: Send + Sync {
+    /// Calls one MCP tool under a timeout selected by the harness/executor.
+    async fn call_tool(
+        &self,
+        payload: &McpCallPayload,
+        timeout: Duration,
+        context: &RunContext,
+    ) -> Result<McpToolCallOutput, McpError>;
+}
+
+/// Effect executor for [`EffectKind::Mcp`] requests.
+#[cfg(feature = "harness")]
+#[derive(Debug, Clone)]
+pub struct McpEffectExecutor<C> {
+    clients: C,
+}
+
+#[cfg(feature = "harness")]
+impl<C> McpEffectExecutor<C> {
+    /// Constructs an MCP effect executor from a host-owned client provider.
+    pub fn new(clients: C) -> Self {
+        Self { clients }
+    }
+}
+
+#[cfg(feature = "harness")]
+#[async_trait::async_trait]
+impl<C> EffectExecutor for McpEffectExecutor<C>
+where
+    C: McpClientProvider,
+{
+    async fn execute(
+        &self,
+        request: &EffectRequest,
+        policy: &ExecutionPolicy,
+        context: &RunContext,
+    ) -> Result<RawEffectOutput, ExecutionError> {
+        let payload = McpCallPayload::from_effect(request)
+            .map_err(|e| ExecutionError::Failed(e.to_string()))?;
+        let timeout = policy.timeout.unwrap_or(DEFAULT_CALL_TIMEOUT);
+        let output = self
+            .clients
+            .call_tool(&payload, timeout, context)
+            .await
+            .map_err(|e| ExecutionError::Failed(e.to_string()))?;
+        let mut text = output.content;
+        if let Some(structured) = &output.structured_content {
+            let rendered = serde_json::to_string_pretty(structured)
+                .map_err(|e| ExecutionError::Failed(e.to_string()))?;
+            text = format!("{text}\n[structured]\n{rendered}");
+        }
+        if output.is_error {
+            return Err(ExecutionError::Failed(if text.is_empty() {
+                "mcp tool reported an error".to_string()
+            } else {
+                text
+            }));
+        }
+        Ok(RawEffectOutput::text(text)
+            .with_display(DisplayOutput::new(
+                DisplayFormat::PlainText,
+                "MCP tool call completed",
+            ))
+            .with_metadata(output.metadata))
+    }
+}
+
+/// Policy for one MCP server.
+#[cfg(feature = "harness")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct McpServerPolicy {
+    /// Server id.
+    pub server_id: McpServerId,
+    /// Server trust level.
+    pub trust: ToolTrustLevel,
+    /// Allowed raw tool names. `None` means all tools are allowed unless
+    /// denied explicitly.
+    pub allowed_tools: Option<Vec<String>>,
+    /// Denied raw tool names.
+    pub denied_tools: Vec<String>,
+    /// Minimum risk for this server.
+    pub default_risk: RiskLevel,
+    /// Whether every allowed call still requires approval.
+    pub require_approval: bool,
+    /// Network policy expected for this server.
+    pub network: NetworkPolicy,
+    /// Sandbox policy expected for this server.
+    pub sandbox: SandboxPolicy,
+}
+
+#[cfg(feature = "harness")]
+impl McpServerPolicy {
+    /// Constructs a policy that allows tools for one server with approval.
+    pub fn requiring_approval(server_id: impl Into<McpServerId>) -> Self {
+        Self {
+            server_id: server_id.into(),
+            trust: ToolTrustLevel::External,
+            allowed_tools: None,
+            denied_tools: Vec::new(),
+            default_risk: RiskLevel::Medium,
+            require_approval: true,
+            network: NetworkPolicy::Deny,
+            sandbox: SandboxPolicy::ReadOnly,
+        }
+    }
+
+    /// Constructs a policy that denies every tool for one server.
+    pub fn deny_all(server_id: impl Into<McpServerId>) -> Self {
+        Self {
+            allowed_tools: Some(Vec::new()),
+            ..Self::requiring_approval(server_id)
+        }
+    }
+}
+
+/// MCP permission bridge usable as a harness [`PolicyEngine`].
+#[cfg(feature = "harness")]
+#[derive(Debug, Clone)]
+pub struct McpPermissionBridge {
+    server_policies: HashMap<McpServerId, McpServerPolicy>,
+    default_policy: McpServerPolicy,
+}
+
+#[cfg(feature = "harness")]
+impl McpPermissionBridge {
+    /// Constructs a bridge with unknown servers denied by default.
+    pub fn new() -> Self {
+        Self {
+            server_policies: HashMap::new(),
+            default_policy: McpServerPolicy::deny_all("__unknown__"),
+        }
+    }
+
+    /// Adds or replaces one server policy.
+    pub fn with_server_policy(mut self, policy: McpServerPolicy) -> Self {
+        self.server_policies
+            .insert(policy.server_id.clone(), policy);
+        self
+    }
+
+    fn policy_for(&self, server_id: &McpServerId) -> &McpServerPolicy {
+        self.server_policies
+            .get(server_id)
+            .unwrap_or(&self.default_policy)
+    }
+}
+
+#[cfg(feature = "harness")]
+impl Default for McpPermissionBridge {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(feature = "harness")]
+#[async_trait::async_trait]
+impl PolicyEngine for McpPermissionBridge {
+    async fn evaluate(
+        &self,
+        effect: &ClassifiedEffect,
+        _context: &RunContext,
+    ) -> Result<PolicyDecision, crate::harness::HarnessError> {
+        if effect.request.kind != EffectKind::Mcp {
+            return Ok(PolicyDecision::Allow);
+        }
+        let payload = McpCallPayload::from_effect(&effect.request).map_err(|e| {
+            crate::harness::HarnessError::Policy(format!("invalid MCP payload: {e}"))
+        })?;
+        let policy = self.policy_for(&payload.server_id);
+        if policy.server_id != payload.server_id {
+            return Ok(PolicyDecision::Deny {
+                reason: format!("unknown MCP server: {}", payload.server_id),
+            });
+        }
+        if policy
+            .denied_tools
+            .iter()
+            .any(|tool| tool == &payload.tool_name)
+        {
+            return Ok(PolicyDecision::Deny {
+                reason: format!("MCP tool denied: {}", payload.tool_name),
+            });
+        }
+        if let Some(allowed) = &policy.allowed_tools
+            && !allowed.iter().any(|tool| tool == &payload.tool_name)
+        {
+            return Ok(PolicyDecision::Deny {
+                reason: format!("MCP tool not allowed: {}", payload.tool_name),
+            });
+        }
+        if policy.require_approval || risk_rank(effect.effective_risk) >= risk_rank(RiskLevel::High)
+        {
+            return Ok(PolicyDecision::RequireApproval {
+                reason: format!(
+                    "MCP call requires approval: {}::{}",
+                    payload.server_id, payload.tool_name
+                ),
+            });
+        }
+        Ok(PolicyDecision::Allow)
+    }
+}
+
 /// Assembly-time errors (connect / list tools); call-time errors go through
 /// [`ToolError::Execution`].
 ///
@@ -597,6 +1337,19 @@ pub enum McpError {
     ListTools {
         /// The target server name (the server_name passed at construction).
         server: String,
+        /// Failure reason.
+        message: String,
+    },
+    /// MCP effect payload is malformed or not an MCP request.
+    #[error("invalid mcp payload: {0}")]
+    InvalidPayload(String),
+    /// Calling an MCP tool failed at protocol/transport level.
+    #[error("mcp tool call failed (server {server}, tool {tool}): {message}")]
+    CallTool {
+        /// Target server id.
+        server: String,
+        /// Raw tool name.
+        tool: String,
         /// Failure reason.
         message: String,
     },
@@ -1070,6 +1823,162 @@ mod tests {
         assert_eq!(mapped.raw_name, "echo");
         assert_eq!(mapped.description, "description");
         assert_eq!(mapped.parameters, json!({ "type": "object" }));
+    }
+
+    #[test]
+    fn descriptor_keeps_server_scoped_identity_and_digest() {
+        let tool = RmcpTool::new(
+            "echo",
+            "description",
+            tool_schema(json!({ "type": "object" })),
+        );
+        let descriptor = descriptor_from_tool("fake", tool, true);
+
+        assert_eq!(descriptor.id.server, McpServerId::new("fake"));
+        assert_eq!(descriptor.id.raw_name, "echo");
+        assert_eq!(descriptor.display_name, "fake__echo");
+        assert!(descriptor.schema_digest.starts_with("fnv64:"));
+        assert_eq!(
+            descriptor.source(ToolTrustLevel::External).namespace,
+            ToolNamespace::mcp_server("fake")
+        );
+    }
+
+    #[cfg(feature = "harness")]
+    #[tokio::test]
+    async fn effect_tool_returns_mcp_effect_without_calling_server() {
+        let descriptor = descriptor_from_tool(
+            "fake",
+            RmcpTool::new(
+                "echo",
+                "description",
+                tool_schema(json!({ "type": "object" })),
+            ),
+            true,
+        );
+        let tool = McpEffectTool::new(descriptor.clone()).with_timeout(Duration::from_secs(5));
+        let run = crate::RunContext::new("mcp-effect-test");
+        let state = SharedState::new();
+        let result = tool
+            .call(
+                json!({ "text": "hello" }),
+                ToolContext::new(&run, &state, "call-1", "fake__echo"),
+            )
+            .await
+            .unwrap();
+
+        let ToolResult::Effect(request) = result else {
+            panic!("expected effect request");
+        };
+        assert_eq!(request.kind, EffectKind::Mcp);
+        assert_eq!(request.source.tool_call_id.as_deref(), Some("call-1"));
+        assert_eq!(request.timeout, Some(Duration::from_secs(5)));
+        let payload = McpCallPayload::from_effect(&request).unwrap();
+        assert_eq!(payload.server_id, descriptor.id.server);
+        assert_eq!(payload.tool_name, "echo");
+        assert_eq!(payload.display_name, "fake__echo");
+        assert_eq!(payload.arguments, json!({ "text": "hello" }));
+        assert_eq!(
+            payload.schema_digest.as_deref(),
+            Some(descriptor.schema_digest.as_str())
+        );
+    }
+
+    #[cfg(feature = "harness")]
+    #[derive(Debug)]
+    struct FakeMcpProvider {
+        output: McpToolCallOutput,
+    }
+
+    #[cfg(feature = "harness")]
+    #[async_trait::async_trait]
+    impl McpClientProvider for FakeMcpProvider {
+        async fn call_tool(
+            &self,
+            _payload: &McpCallPayload,
+            _timeout: Duration,
+            _context: &RunContext,
+        ) -> Result<McpToolCallOutput, McpError> {
+            Ok(self.output.clone())
+        }
+    }
+
+    #[cfg(feature = "harness")]
+    #[tokio::test]
+    async fn effect_executor_maps_success_and_tool_error() {
+        let payload = McpCallPayload::new(
+            McpToolId::new("fake", "echo"),
+            "fake__echo",
+            json!({ "text": "hello" }),
+        );
+        let request = payload.into_effect().unwrap();
+        let policy = ExecutionPolicy {
+            sandbox: SandboxPolicy::ReadOnly,
+            network: NetworkPolicy::Deny,
+            timeout: Some(Duration::from_secs(1)),
+            output_limit: crate::harness::OutputLimit::default(),
+        };
+        let run = RunContext::new("mcp-executor-test");
+
+        let executor = McpEffectExecutor::new(FakeMcpProvider {
+            output: McpToolCallOutput::text("hello"),
+        });
+        let raw = executor.execute(&request, &policy, &run).await.unwrap();
+        assert_eq!(raw.observation_for_model, "hello");
+
+        let executor = McpEffectExecutor::new(FakeMcpProvider {
+            output: McpToolCallOutput::text("boom").into_error(),
+        });
+        let err = executor.execute(&request, &policy, &run).await.unwrap_err();
+        assert!(matches!(err, ExecutionError::Failed(message) if message == "boom"));
+    }
+
+    #[cfg(feature = "harness")]
+    #[tokio::test]
+    async fn permission_bridge_denies_unknown_and_filters_tools() {
+        let bridge = McpPermissionBridge::new().with_server_policy(McpServerPolicy {
+            server_id: McpServerId::new("fake"),
+            trust: ToolTrustLevel::External,
+            allowed_tools: Some(vec!["echo".to_string()]),
+            denied_tools: vec!["delete".to_string()],
+            default_risk: RiskLevel::Medium,
+            require_approval: false,
+            network: NetworkPolicy::Deny,
+            sandbox: SandboxPolicy::ReadOnly,
+        });
+        let run = RunContext::new("mcp-policy-test");
+        let allowed = McpCallPayload::new(McpToolId::new("fake", "echo"), "fake__echo", json!({}))
+            .into_effect()
+            .unwrap();
+        let denied =
+            McpCallPayload::new(McpToolId::new("fake", "delete"), "fake__delete", json!({}))
+                .into_effect()
+                .unwrap();
+        let unknown = McpCallPayload::new(
+            McpToolId::new("unknown", "echo"),
+            "unknown__echo",
+            json!({}),
+        )
+        .into_effect()
+        .unwrap();
+
+        let decision = bridge.evaluate(&classified(allowed), &run).await.unwrap();
+        assert_eq!(decision, PolicyDecision::Allow);
+        let decision = bridge.evaluate(&classified(denied), &run).await.unwrap();
+        assert!(matches!(decision, PolicyDecision::Deny { .. }));
+        let decision = bridge.evaluate(&classified(unknown), &run).await.unwrap();
+        assert!(matches!(decision, PolicyDecision::Deny { .. }));
+    }
+
+    #[cfg(feature = "harness")]
+    fn classified(request: EffectRequest) -> ClassifiedEffect {
+        ClassifiedEffect {
+            request,
+            requested_risk: RiskLevel::Medium,
+            effective_risk: RiskLevel::Medium,
+            reasons: Vec::new(),
+            metadata: RunMetadata::new(),
+        }
     }
 
     // ---- End-to-end tests (the child process spawns itself as the MCP

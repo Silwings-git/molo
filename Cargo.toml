@@ -132,6 +132,10 @@ name = "mcp"
 required-features = ["mcp"]
 
 [[example]]
+name = "mcp_governed"
+required-features = ["mcp", "harness"]
+
+[[example]]
 name = "memory_agent"
 required-features = ["openai"]
 
@@ -157,6 +161,10 @@ required-features = ["openai"]
 
 [[example]]
 name = "skill"
+required-features = ["skills"]
+
+[[example]]
+name = "skill_layer"
 required-features = ["skills"]
 
 [[example]]

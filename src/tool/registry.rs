@@ -15,7 +15,9 @@ use std::fmt;
 use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
 
-use super::{SharedState, Tool, ToolContext, ToolError, ToolResult, ToolSchema};
+use super::{
+    SharedState, Tool, ToolContext, ToolError, ToolNamespace, ToolResult, ToolSchema, ToolSource,
+};
 use crate::message::ToolCall;
 use crate::run::RunContext;
 
@@ -101,7 +103,13 @@ fn panic_message(payload: &(dyn Any + Send)) -> String {
 ///   order, handy for debugging).
 #[derive(Clone, Default)]
 pub struct ToolRegistry {
-    tools: IndexMap<String, Arc<dyn Tool>>,
+    tools: IndexMap<String, RegisteredTool>,
+}
+
+#[derive(Clone)]
+struct RegisteredTool {
+    tool: Arc<dyn Tool>,
+    source: Option<ToolSource>,
 }
 
 impl ToolRegistry {
@@ -118,8 +126,59 @@ impl ToolRegistry {
     /// **replaces** the earlier (keeping its original position), which
     /// fits updating a registered tool with a new instance.
     pub fn register(&mut self, tool: impl Tool + 'static) -> &mut Self {
-        self.tools.insert(tool.schema().name, Arc::new(tool));
+        self.tools.insert(
+            tool.schema().name,
+            RegisteredTool {
+                tool: Arc::new(tool),
+                source: None,
+            },
+        );
         self
+    }
+
+    /// Register a tool with host-facing source metadata.
+    ///
+    /// Unlike [`register`](Self::register), this method rejects a same
+    /// provider-facing name coming from a different namespace. That prevents
+    /// accidental cross-extension shadowing while still allowing a host to
+    /// refresh tools inside the same namespace.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RegistryError::SourceNameMismatch`] when the source display
+    /// name does not match the tool schema name, and
+    /// [`RegistryError::NameCollision`] when another namespace already owns
+    /// the same provider-facing name.
+    pub fn register_with_source(
+        &mut self,
+        tool: impl Tool + 'static,
+        source: ToolSource,
+    ) -> Result<&mut Self, RegistryError> {
+        let name = tool.schema().name;
+        if source.display_name != name {
+            return Err(RegistryError::SourceNameMismatch {
+                schema_name: name,
+                source_display_name: source.display_name,
+            });
+        }
+        if let Some(existing) = self.tools.get(&name) {
+            let existing_namespace = entry_namespace(existing);
+            if existing_namespace != source.namespace {
+                return Err(RegistryError::NameCollision {
+                    name,
+                    existing_namespace,
+                    new_namespace: source.namespace,
+                });
+            }
+        }
+        self.tools.insert(
+            name,
+            RegisteredTool {
+                tool: Arc::new(tool),
+                source: Some(source),
+            },
+        );
+        Ok(self)
     }
 
     /// Names of currently registered tools, in registration order
@@ -136,6 +195,46 @@ impl ToolRegistry {
     /// registration order.
     pub fn remove(&mut self, name: &str) -> bool {
         self.tools.shift_remove(name).is_some()
+    }
+
+    /// Source metadata for a registered tool.
+    ///
+    /// Tools registered with [`register`](Self::register) have no explicit
+    /// source metadata and return `None`.
+    pub fn source(&self, display_name: &str) -> Option<&ToolSource> {
+        self.tools
+            .get(display_name)
+            .and_then(|entry| entry.source.as_ref())
+    }
+
+    /// Names of tools that belong to a namespace.
+    ///
+    /// Tools without explicit source metadata are treated as local tools for
+    /// this query.
+    pub fn names_in_namespace(&self, namespace: &ToolNamespace) -> Vec<String> {
+        self.tools
+            .iter()
+            .filter(|(_, entry)| entry_matches_namespace(entry, namespace))
+            .map(|(name, _)| name.clone())
+            .collect()
+    }
+
+    /// Remove every tool in a namespace and return removed names in their
+    /// previous registration order.
+    ///
+    /// This is the source-aware unload path for extension layers such as MCP
+    /// server teardown.
+    pub fn remove_namespace(&mut self, namespace: &ToolNamespace) -> Vec<String> {
+        let mut removed = Vec::new();
+        self.tools.retain(|name, entry| {
+            if entry_matches_namespace(entry, namespace) {
+                removed.push(name.clone());
+                false
+            } else {
+                true
+            }
+        });
+        removed
     }
 
     /// Bulk-trim in place by name: removes tools whose names fail `keep`,
@@ -195,14 +294,14 @@ impl ToolRegistry {
     /// All tools' definitions for the model, in registration order (no
     /// duplicates, guaranteed at registration).
     pub fn schemas(&self) -> Vec<ToolSchema> {
-        self.tools.values().map(|t| t.schema()).collect()
+        self.tools.values().map(schema_with_source).collect()
     }
 
     /// Get a tool reference by name, bypassing the registry's JSON argument
     /// parsing to call [`Tool::call`] directly; returns `None` when not
     /// registered.
     pub fn get(&self, name: &str) -> Option<&dyn Tool> {
-        self.tools.get(name).map(|t| t.as_ref())
+        self.tools.get(name).map(|entry| entry.tool.as_ref())
     }
 
     /// Look up and dispatch a tool call.
@@ -238,7 +337,7 @@ impl ToolRegistry {
         run: &RunContext,
         state: &SharedState,
     ) -> Result<ToolResult, RegistryError> {
-        let Some(tool) = self.tools.get(&call.name) else {
+        let Some(entry) = self.tools.get(&call.name) else {
             return Err(RegistryError::NotFound(call.name.clone()));
         };
         let args = match serde_json::from_str(&call.arguments) {
@@ -249,7 +348,7 @@ impl ToolRegistry {
         // The tool is user code, and panics are inputs an LLM-generated
         // argument could trigger: catch them as execution errors passed
         // back to the model instead of letting panics escape the framework.
-        let result = AssertUnwindSafe(tool.call(args, context))
+        let result = AssertUnwindSafe(entry.tool.call(args, context))
             .catch_unwind()
             .await
             .map_err(|payload| {
@@ -324,10 +423,10 @@ impl ToolRegistry {
         let wanted: HashSet<&str> = names.iter().copied().collect();
         let mut tools = IndexMap::new();
         let mut found = HashSet::new();
-        for (name, tool) in &self.tools {
+        for (name, entry) in &self.tools {
             if wanted.contains(name.as_str()) {
                 found.insert(name.clone());
-                tools.insert(name.clone(), tool.clone());
+                tools.insert(name.clone(), entry.clone());
             }
         }
         let missing: Vec<String> = names
@@ -341,12 +440,57 @@ impl ToolRegistry {
             Err(MissingTools { names: missing })
         }
     }
+
+    /// Constructs a source-aware sub-registry for one namespace.
+    ///
+    /// The sub-registry shares tool instances with the main registry and
+    /// preserves the main registry's order.
+    ///
+    /// # Errors
+    ///
+    /// This method currently has no failure path. It returns `Result` to keep
+    /// the signature aligned with other subset APIs and leave room for future
+    /// namespace validation.
+    pub fn subset_by_namespace(
+        &self,
+        namespace: &ToolNamespace,
+    ) -> Result<ToolRegistry, RegistryError> {
+        let mut tools = IndexMap::new();
+        for (name, entry) in &self.tools {
+            if entry_matches_namespace(entry, namespace) {
+                tools.insert(name.clone(), entry.clone());
+            }
+        }
+        Ok(ToolRegistry { tools })
+    }
 }
 
 impl fmt::Debug for ToolRegistry {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_list().entries(self.names()).finish()
     }
+}
+
+fn entry_namespace(entry: &RegisteredTool) -> ToolNamespace {
+    entry
+        .source
+        .as_ref()
+        .map(|source| source.namespace.clone())
+        .unwrap_or_else(ToolNamespace::local)
+}
+
+fn entry_matches_namespace(entry: &RegisteredTool, namespace: &ToolNamespace) -> bool {
+    entry_namespace(entry) == *namespace
+}
+
+fn schema_with_source(entry: &RegisteredTool) -> ToolSchema {
+    let mut schema = entry.tool.schema();
+    if let Some(source) = &entry.source
+        && let Ok(value) = serde_json::to_value(source)
+    {
+        schema.metadata.insert("tool_source".to_string(), value);
+    }
+    schema
 }
 
 /// Tool names in a [`ToolRegistry::subset`] allowlist that do not exist in
@@ -396,6 +540,29 @@ pub enum RegistryError {
         #[source]
         source: ToolError,
     },
+    /// A source-aware registration tried to use a provider-facing name owned
+    /// by another namespace.
+    #[error(
+        "tool name collision: {name} already belongs to namespace {existing_namespace}, cannot register from namespace {new_namespace}"
+    )]
+    NameCollision {
+        /// Provider-facing tool name.
+        name: String,
+        /// Namespace that already owns the name.
+        existing_namespace: ToolNamespace,
+        /// Namespace attempting to register the same name.
+        new_namespace: ToolNamespace,
+    },
+    /// Source metadata display name does not match the tool schema name.
+    #[error(
+        "tool source display name mismatch: schema name {schema_name}, source display name {source_display_name}"
+    )]
+    SourceNameMismatch {
+        /// Name declared by the tool schema.
+        schema_name: String,
+        /// Name declared by the source metadata.
+        source_display_name: String,
+    },
 }
 
 impl MissingTools {
@@ -418,7 +585,7 @@ impl MissingTools {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tool::{ToolError, ToolOutput};
+    use crate::tool::{ToolError, ToolOutput, ToolSource, ToolTrustLevel};
     use std::error::Error;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -741,6 +908,116 @@ mod tests {
         let mut r = registry();
         assert!(r.retain(|_| true).is_empty());
         assert_eq!(r.names(), ["search", "calculator"]);
+    }
+
+    #[test]
+    fn register_with_source_tracks_namespace_and_metadata() {
+        let mut r = ToolRegistry::new();
+        let namespace = ToolNamespace::mcp_server("filesystem");
+        let source = ToolSource::new(namespace.clone(), "read_file", "filesystem__read_file")
+            .with_trust(ToolTrustLevel::External);
+        r.register_with_source(echo("filesystem__read_file"), source.clone())
+            .unwrap();
+
+        assert_eq!(r.source("filesystem__read_file"), Some(&source));
+        assert_eq!(
+            r.names_in_namespace(&namespace),
+            vec!["filesystem__read_file"]
+        );
+
+        let schema = r.schemas().remove(0);
+        assert_eq!(
+            schema.metadata["tool_source"]["namespace"]["id"],
+            serde_json::json!("filesystem")
+        );
+        assert_eq!(
+            schema.metadata["tool_source"]["raw_name"],
+            serde_json::json!("read_file")
+        );
+    }
+
+    #[test]
+    fn register_with_source_replaces_same_namespace_but_rejects_cross_namespace_collision() {
+        let mut r = ToolRegistry::new();
+        let first = ToolSource::new(ToolNamespace::mcp_server("one"), "search", "server__search");
+        let second_same =
+            ToolSource::new(ToolNamespace::mcp_server("one"), "search", "server__search");
+        let second_other =
+            ToolSource::new(ToolNamespace::mcp_server("two"), "search", "server__search");
+
+        r.register_with_source(echo("server__search"), first)
+            .unwrap();
+        r.register_with_source(
+            FakeTool {
+                name: "server__search",
+                output: "replacement",
+                fail: false,
+            },
+            second_same,
+        )
+        .unwrap();
+
+        let err = r
+            .register_with_source(echo("server__search"), second_other)
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            RegistryError::NameCollision {
+                name,
+                existing_namespace,
+                new_namespace,
+            } if name == "server__search"
+                && existing_namespace == ToolNamespace::mcp_server("one")
+                && new_namespace == ToolNamespace::mcp_server("two")
+        ));
+    }
+
+    #[test]
+    fn source_display_name_must_match_schema_name() {
+        let mut r = ToolRegistry::new();
+        let err = r
+            .register_with_source(
+                echo("actual"),
+                ToolSource::new(ToolNamespace::mcp_server("fs"), "raw", "different"),
+            )
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            RegistryError::SourceNameMismatch {
+                schema_name,
+                source_display_name,
+            } if schema_name == "actual" && source_display_name == "different"
+        ));
+    }
+
+    #[test]
+    fn remove_namespace_bulk_unloads_tools() {
+        let mut r = ToolRegistry::new();
+        let fs = ToolNamespace::mcp_server("fs");
+        let db = ToolNamespace::mcp_server("db");
+        r.register_with_source(
+            echo("fs__read"),
+            ToolSource::new(fs.clone(), "read", "fs__read"),
+        )
+        .unwrap()
+        .register_with_source(
+            echo("fs__write"),
+            ToolSource::new(fs.clone(), "write", "fs__write"),
+        )
+        .unwrap()
+        .register_with_source(
+            echo("db__query"),
+            ToolSource::new(db.clone(), "query", "db__query"),
+        )
+        .unwrap();
+
+        let sub = r.subset_by_namespace(&fs).unwrap();
+        assert_eq!(sub.names(), ["fs__read", "fs__write"]);
+
+        let removed = r.remove_namespace(&fs);
+        assert_eq!(removed, ["fs__read", "fs__write"]);
+        assert_eq!(r.names(), ["db__query"]);
+        assert_eq!(r.names_in_namespace(&db), ["db__query"]);
     }
 
     #[test]

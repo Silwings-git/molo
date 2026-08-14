@@ -50,7 +50,8 @@ use std::sync::{Arc, RwLock};
 use tokio::io::AsyncReadExt;
 
 use crate::tool::{
-    Tool, ToolContext, ToolError, ToolMemoryPolicy, ToolOutput, ToolPolicy, ToolResult, ToolSchema,
+    Tool, ToolContext, ToolError, ToolMemoryPolicy, ToolNamespace, ToolOutput, ToolPolicy,
+    ToolResult, ToolSchema, ToolSource, ToolTrustLevel,
 };
 
 /// SKILL.md read limit (bytes): prevents a malicious skill package from
@@ -61,6 +62,166 @@ const MAX_SKILL_FILE_BYTES: u64 = 1024 * 1024;
 /// context via protected tool output, so a single skill must not grow
 /// unbounded.
 const MAX_SKILL_BODY_CHARS: usize = 256 * 1024;
+
+/// Skill assembly mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum SkillMode {
+    /// Progressive disclosure: inject a menu and expose `load_skill`.
+    Progressive,
+    /// Inline skill bodies directly into the prompt.
+    Inline,
+    /// Do not automatically inject prompt text or tools.
+    Manual,
+}
+
+/// Trust assigned by the host to skill packages.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum SkillSourceTrust {
+    /// Project-local skill.
+    Project,
+    /// User-installed skill.
+    UserInstalled,
+    /// Untrusted skill source.
+    Untrusted,
+}
+
+impl From<SkillSourceTrust> for ToolTrustLevel {
+    fn from(value: SkillSourceTrust) -> Self {
+        match value {
+            SkillSourceTrust::Project => ToolTrustLevel::Project,
+            SkillSourceTrust::UserInstalled => ToolTrustLevel::UserInstalled,
+            SkillSourceTrust::Untrusted => ToolTrustLevel::Untrusted,
+        }
+    }
+}
+
+/// Configuration for [`SkillLayer`] assembly.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SkillLayerConfig {
+    /// Maximum menu characters emitted into the prompt.
+    pub max_menu_chars: usize,
+    /// Maximum body characters emitted into the prompt.
+    pub max_body_chars: usize,
+    /// Maximum reference bytes returned by reference loading tools.
+    pub max_reference_bytes: usize,
+    /// Whether allowed-tools should be treated as a strict policy hint.
+    pub strict_allowed_tools: bool,
+    /// Trust assigned to tools exposed by this skill layer.
+    pub source_trust: SkillSourceTrust,
+}
+
+impl Default for SkillLayerConfig {
+    fn default() -> Self {
+        Self {
+            max_menu_chars: 32 * 1024,
+            max_body_chars: MAX_SKILL_BODY_CHARS,
+            max_reference_bytes: 256 * 1024,
+            strict_allowed_tools: false,
+            source_trust: SkillSourceTrust::Project,
+        }
+    }
+}
+
+/// Session activation state for a skill layer.
+///
+/// Loaded skills are remembered to avoid duplicate body disclosure. Pinned
+/// skills are explicit host activations whose bodies are injected into the
+/// prompt by [`SkillLayer`].
+#[derive(Clone, Default)]
+pub struct SkillActivationState {
+    loaded: Arc<RwLock<HashSet<String>>>,
+    pinned: Arc<RwLock<Vec<String>>>,
+}
+
+impl SkillActivationState {
+    /// Constructs empty activation state.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Marks a skill as loaded through progressive disclosure.
+    ///
+    /// Returns `true` when this call newly loaded the skill.
+    pub fn mark_loaded(&self, name: &str) -> bool {
+        self.loaded
+            .write()
+            .expect("SkillActivationState loaded lock poisoned")
+            .insert(name.to_string())
+    }
+
+    /// Pins a skill for prompt injection.
+    ///
+    /// Returns `true` when the skill was newly pinned.
+    pub fn pin(&self, name: &str) -> bool {
+        let mut pinned = self
+            .pinned
+            .write()
+            .expect("SkillActivationState pinned lock poisoned");
+        if pinned.iter().any(|existing| existing == name) {
+            false
+        } else {
+            pinned.push(name.to_string());
+            true
+        }
+    }
+
+    /// Unpins a skill from prompt injection.
+    pub fn unpin(&self, name: &str) -> bool {
+        let mut pinned = self
+            .pinned
+            .write()
+            .expect("SkillActivationState pinned lock poisoned");
+        if let Some(pos) = pinned.iter().position(|existing| existing == name) {
+            pinned.remove(pos);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Whether the skill has been loaded or pinned in this session.
+    pub fn is_active(&self, name: &str) -> bool {
+        self.loaded
+            .read()
+            .expect("SkillActivationState loaded lock poisoned")
+            .contains(name)
+            || self
+                .pinned
+                .read()
+                .expect("SkillActivationState pinned lock poisoned")
+                .iter()
+                .any(|existing| existing == name)
+    }
+
+    /// Loaded skill names.
+    pub fn loaded(&self) -> Vec<String> {
+        self.loaded
+            .read()
+            .expect("SkillActivationState loaded lock poisoned")
+            .iter()
+            .cloned()
+            .collect()
+    }
+
+    /// Pinned skill names in activation order.
+    pub fn pinned(&self) -> Vec<String> {
+        self.pinned
+            .read()
+            .expect("SkillActivationState pinned lock poisoned")
+            .clone()
+    }
+}
+
+impl std::fmt::Debug for SkillActivationState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SkillActivationState")
+            .field("loaded", &self.loaded())
+            .field("pinned", &self.pinned())
+            .finish()
+    }
+}
 
 /// Tool dependencies declared by a skill: tool name + optional scope
 /// (execution belongs to the application layer; this struct only parses
@@ -669,6 +830,269 @@ impl std::fmt::Debug for SkillRegistry {
     }
 }
 
+/// Assembled output of a [`SkillLayer`].
+#[derive(Debug, Clone)]
+pub struct SkillLayerAssembly {
+    /// Prompt fragment to append to the host's system prompt.
+    pub prompt_fragment: String,
+    /// Progressive disclosure loader tool, when this mode exposes one.
+    pub load_skill_tool: Option<LoadSkillTool>,
+    /// Assembly manifest for transcript/debug use.
+    pub manifest: SkillLayerManifest,
+}
+
+/// Skill layer manifest for transcript/debug use.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SkillLayerManifest {
+    /// Layer id.
+    pub layer_id: String,
+    /// Assembly mode.
+    pub mode: SkillMode,
+    /// Visible skill names.
+    pub visible_skills: Vec<String>,
+    /// Active skill names.
+    pub active_skills: Vec<String>,
+}
+
+/// Optional Agent Skills extension layer.
+///
+/// The layer assembles progressive-disclosure prompt text and tools without
+/// making [`ReActAgent`](crate::ReActAgent) own skill policy or execution.
+/// Skill scripts are never executed by this layer.
+#[derive(Debug, Clone)]
+pub struct SkillLayer {
+    registry: Arc<SkillRegistry>,
+    enabled: Option<Arc<HashSet<String>>>,
+    mode: SkillMode,
+    activation: SkillActivationState,
+    config: SkillLayerConfig,
+    layer_id: String,
+}
+
+impl SkillLayer {
+    /// Constructs a progressive skill layer over a registry.
+    pub fn new(registry: Arc<SkillRegistry>) -> Self {
+        Self {
+            registry,
+            enabled: None,
+            mode: SkillMode::Progressive,
+            activation: SkillActivationState::new(),
+            config: SkillLayerConfig::default(),
+            layer_id: "skills".to_string(),
+        }
+    }
+
+    /// Restricts visible skills by name.
+    pub fn with_enabled_skills(mut self, names: &[&str]) -> Self {
+        self.enabled = Some(Arc::new(
+            names.iter().map(|name| name.to_string()).collect(),
+        ));
+        self
+    }
+
+    /// Restricts visible skills using a shared allowlist.
+    pub fn with_enabled_set(mut self, enabled: Option<Arc<HashSet<String>>>) -> Self {
+        self.enabled = enabled;
+        self
+    }
+
+    /// Sets assembly mode.
+    pub fn with_mode(mut self, mode: SkillMode) -> Self {
+        self.mode = mode;
+        self
+    }
+
+    /// Sets assembly configuration.
+    pub fn with_config(mut self, config: SkillLayerConfig) -> Self {
+        self.config = config;
+        self
+    }
+
+    /// Sets the layer id used in source metadata.
+    pub fn with_layer_id(mut self, layer_id: impl Into<String>) -> Self {
+        self.layer_id = layer_id.into();
+        self
+    }
+
+    /// Returns the shared activation state.
+    pub fn activation_state(&self) -> SkillActivationState {
+        self.activation.clone()
+    }
+
+    /// Returns the registry backing this layer.
+    pub fn registry(&self) -> Arc<SkillRegistry> {
+        Arc::clone(&self.registry)
+    }
+
+    /// Returns the assembly mode.
+    pub fn mode(&self) -> SkillMode {
+        self.mode
+    }
+
+    /// Whether a skill is visible in this layer.
+    pub fn is_enabled(&self, name: &str) -> bool {
+        match &self.enabled {
+            None => true,
+            Some(enabled) => enabled.contains(name),
+        }
+    }
+
+    /// Pins a skill into the prompt.
+    pub fn activate_skill(&self, name: &str) -> bool {
+        if self.mode != SkillMode::Progressive {
+            return false;
+        }
+        if !self.is_enabled(name) || self.registry.get(name).is_none() {
+            return false;
+        }
+        self.activation.pin(name);
+        true
+    }
+
+    /// Removes a pinned skill from the prompt.
+    pub fn deactivate_skill(&self, name: &str) -> bool {
+        if self.mode != SkillMode::Progressive {
+            return false;
+        }
+        self.activation.unpin(name)
+    }
+
+    /// Assembles prompt text and tools for the current registry snapshot.
+    pub fn assemble(&self) -> SkillLayerAssembly {
+        let visible = self.visible_skills();
+        let prompt_fragment = match self.mode {
+            SkillMode::Manual => String::new(),
+            SkillMode::Progressive => self.progressive_prompt(&visible),
+            SkillMode::Inline => self.inline_prompt(&visible),
+        };
+        let load_skill_tool = if self.mode == SkillMode::Progressive {
+            Some(LoadSkillTool::with_activation(
+                Arc::clone(&self.registry),
+                self.enabled.clone(),
+                self.activation.clone(),
+            ))
+        } else {
+            None
+        };
+        SkillLayerAssembly {
+            prompt_fragment,
+            load_skill_tool,
+            manifest: SkillLayerManifest {
+                layer_id: self.layer_id.clone(),
+                mode: self.mode,
+                visible_skills: visible
+                    .iter()
+                    .map(|skill| skill.name().to_string())
+                    .collect(),
+                active_skills: {
+                    let mut active = self.activation.loaded();
+                    for pinned in self.activation.pinned() {
+                        if !active.contains(&pinned) {
+                            active.push(pinned);
+                        }
+                    }
+                    active
+                },
+            },
+        }
+    }
+
+    fn visible_skills(&self) -> Vec<Skill> {
+        self.registry
+            .skills()
+            .into_iter()
+            .filter(|skill| self.is_enabled(skill.name()))
+            .collect()
+    }
+
+    fn progressive_prompt(&self, visible: &[Skill]) -> String {
+        let menu: Vec<String> = visible
+            .iter()
+            .filter(|skill| !self.activation.is_active(skill.name()))
+            .map(|skill| format!("- {}: {}", skill.name(), skill.description()))
+            .collect();
+        let mut out = join_limited_sections(menu, self.config.max_menu_chars);
+        let pinned: Vec<String> = self
+            .activation
+            .pinned()
+            .into_iter()
+            .filter_map(|name| self.registry.get(&name))
+            .map(|skill| {
+                format!(
+                    "[Skill {}]\n{}",
+                    skill.name(),
+                    limit_chars(skill.body(), self.config.max_body_chars)
+                )
+            })
+            .collect();
+        append_sections(&mut out, &pinned);
+        out
+    }
+
+    fn inline_prompt(&self, visible: &[Skill]) -> String {
+        let bodies = visible.iter().map(|skill| {
+            format!(
+                "[Skill {}]\n{}",
+                skill.name(),
+                limit_chars(skill.body(), self.config.max_body_chars)
+            )
+        });
+        join_limited_sections(
+            bodies,
+            self.config.max_body_chars.saturating_mul(visible.len()),
+        )
+    }
+
+    /// Source metadata for the `load_skill` tool produced by this layer.
+    pub fn load_skill_source(&self) -> ToolSource {
+        LoadSkillTool::source(self.layer_id.clone(), self.config.source_trust.into())
+    }
+}
+
+fn append_sections(out: &mut String, sections: &[String]) {
+    for section in sections {
+        if section.is_empty() {
+            continue;
+        }
+        if !out.is_empty() {
+            out.push_str("\n\n");
+        }
+        out.push_str(section);
+    }
+}
+
+fn join_limited_sections(sections: impl IntoIterator<Item = String>, max_chars: usize) -> String {
+    let mut out = String::new();
+    for section in sections {
+        if section.is_empty() {
+            continue;
+        }
+        let separator = if out.is_empty() { "" } else { "\n" };
+        let next_len = out.chars().count() + separator.chars().count() + section.chars().count();
+        if next_len > max_chars {
+            if !out.is_empty() {
+                out.push_str("\n[truncated]");
+            }
+            break;
+        }
+        out.push_str(separator);
+        out.push_str(&section);
+    }
+    out
+}
+
+fn limit_chars(text: &str, max_chars: usize) -> String {
+    let mut out = String::new();
+    for (idx, ch) in text.chars().enumerate() {
+        if idx >= max_chars {
+            out.push_str("\n[truncated]");
+            return out;
+        }
+        out.push(ch);
+    }
+    out
+}
+
 /// Skill loading tool: reads the SKILL.md body by name; the second step of
 /// progressive disclosure.
 ///
@@ -710,9 +1134,8 @@ impl std::fmt::Debug for SkillRegistry {
 pub struct LoadSkillTool {
     registry: Arc<SkillRegistry>,
     enabled: Option<Arc<HashSet<String>>>,
-    /// Skills activated in this session (dedup): created and owned by this
-    /// tool at construction, not dependent on assembly-layer state.
-    activated: Arc<RwLock<HashSet<String>>>,
+    /// Skills activated in this session (dedup).
+    activated: SkillActivationState,
 }
 
 impl LoadSkillTool {
@@ -722,8 +1145,31 @@ impl LoadSkillTool {
         Self {
             registry,
             enabled,
-            activated: Arc::new(RwLock::new(HashSet::new())),
+            activated: SkillActivationState::new(),
         }
+    }
+
+    /// Construct with shared activation state.
+    pub fn with_activation(
+        registry: Arc<SkillRegistry>,
+        enabled: Option<Arc<HashSet<String>>>,
+        activated: SkillActivationState,
+    ) -> Self {
+        Self {
+            registry,
+            enabled,
+            activated,
+        }
+    }
+
+    /// Source metadata for source-aware tool registration.
+    pub fn source(layer_id: impl Into<String>, trust: ToolTrustLevel) -> ToolSource {
+        ToolSource::new(
+            ToolNamespace::skill_layer(layer_id),
+            "load_skill",
+            "load_skill",
+        )
+        .with_trust(trust)
     }
 }
 
@@ -779,18 +1225,13 @@ impl Tool for LoadSkillTool {
         // In-session dedup: the body is protected and resident, so
         // already activated skills are not re-injected (the notice lets
         // the model know it is "already loaded" and not to call again).
-        let mut activated = self
-            .activated
-            .write()
-            .expect("LoadSkillTool internal lock poisoned");
-        if activated.contains(&name) {
+        if !self.activated.mark_loaded(&name) {
             return Ok(ToolOutput::text(format!(
                 "skill '{name}' is already active in this conversation"
             ))
             .with_memory_policy(ToolMemoryPolicy::Protected)
             .into());
         }
-        activated.insert(name);
         Ok(ToolOutput::text(format_skill_content(&skill))
             .with_memory_policy(ToolMemoryPolicy::Protected)
             .into())
@@ -815,6 +1256,135 @@ impl LoadSkillTool {
             None => true,
             Some(enabled) => enabled.contains(name),
         }
+    }
+}
+
+/// Skill resource loading limits.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SkillResourceStore {
+    /// Maximum bytes returned from a reference resource.
+    pub max_reference_bytes: usize,
+}
+
+impl Default for SkillResourceStore {
+    fn default() -> Self {
+        Self {
+            max_reference_bytes: 256 * 1024,
+        }
+    }
+}
+
+/// Tool that loads text references for already active skills.
+///
+/// Only `references/` paths are accepted. Absolute paths, parent traversal,
+/// symlink escape, and inactive skills are rejected.
+#[derive(Debug, Clone)]
+pub struct LoadSkillReferenceTool {
+    registry: Arc<SkillRegistry>,
+    enabled: Option<Arc<HashSet<String>>>,
+    activated: SkillActivationState,
+    store: SkillResourceStore,
+}
+
+impl LoadSkillReferenceTool {
+    /// Constructs a reference loader.
+    pub fn new(
+        registry: Arc<SkillRegistry>,
+        enabled: Option<Arc<HashSet<String>>>,
+        activated: SkillActivationState,
+        store: SkillResourceStore,
+    ) -> Self {
+        Self {
+            registry,
+            enabled,
+            activated,
+            store,
+        }
+    }
+
+    /// Source metadata for source-aware tool registration.
+    pub fn source(layer_id: impl Into<String>, trust: ToolTrustLevel) -> ToolSource {
+        ToolSource::new(
+            ToolNamespace::skill_layer(layer_id),
+            "load_skill_reference",
+            "load_skill_reference",
+        )
+        .with_trust(trust)
+    }
+
+    fn is_enabled(&self, name: &str) -> bool {
+        match &self.enabled {
+            None => true,
+            Some(enabled) => enabled.contains(name),
+        }
+    }
+}
+
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+struct LoadSkillReferenceArgs {
+    /// Skill name.
+    skill: String,
+    /// Root-relative path under references/.
+    path: String,
+}
+
+#[async_trait::async_trait]
+impl Tool for LoadSkillReferenceTool {
+    fn schema(&self) -> ToolSchema {
+        let parameters = serde_json::to_value(schemars::schema_for!(LoadSkillReferenceArgs))
+            .expect("LoadSkillReferenceArgs JSON Schema serialization must not fail");
+        ToolSchema::new(
+            "load_skill_reference",
+            "Load a text reference file for an already active skill. The path must be under references/.",
+            parameters,
+        )
+        .with_policy(ToolPolicy {
+            memory_policy: ToolMemoryPolicy::Protected,
+            ..Default::default()
+        })
+    }
+
+    async fn call(
+        &self,
+        arguments: serde_json::Value,
+        _context: ToolContext<'_>,
+    ) -> Result<ToolResult, ToolError> {
+        let args =
+            serde_json::from_value::<LoadSkillReferenceArgs>(arguments).map_err(ToolError::from)?;
+        if !self.is_enabled(&args.skill) {
+            return Err(ToolError::Execution(format!(
+                "skill '{}' is not enabled",
+                args.skill
+            )));
+        }
+        if !self.activated.is_active(&args.skill) {
+            return Err(ToolError::Execution(format!(
+                "skill '{}' is not active",
+                args.skill
+            )));
+        }
+        if !args.path.starts_with("references/") {
+            return Err(ToolError::InvalidArguments(
+                "skill reference path must be under references/".into(),
+            ));
+        }
+        let skill = self
+            .registry
+            .get(&args.skill)
+            .ok_or_else(|| ToolError::Execution(format!("skill '{}' not found", args.skill)))?;
+        let content = skill
+            .load_reference(&args.path)
+            .await
+            .map_err(|e| ToolError::Execution(e.to_string()))?;
+        if content.len() > self.store.max_reference_bytes {
+            return Err(ToolError::Execution(format!(
+                "skill reference exceeds size limit ({} bytes)",
+                self.store.max_reference_bytes
+            )));
+        }
+        Ok(ToolOutput::text(content)
+            .with_memory_policy(ToolMemoryPolicy::Protected)
+            .into())
     }
 }
 
@@ -1234,7 +1804,10 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
 
-    use super::{AllowedTool, LoadSkillTool, Skill, SkillError, SkillRegistry};
+    use super::{
+        AllowedTool, LoadSkillReferenceTool, LoadSkillTool, Skill, SkillActivationState,
+        SkillError, SkillLayer, SkillMode, SkillRegistry, SkillResourceStore,
+    };
     use crate::tool::Tool;
     use std::collections::HashSet;
 
@@ -2041,5 +2614,108 @@ Review steps.
             .await
             .unwrap_err();
         assert!(matches!(err, crate::tool::ToolError::InvalidArguments(_)));
+    }
+
+    #[test]
+    fn skill_layer_progressive_assembles_menu_and_loader() {
+        let registry: Arc<SkillRegistry> = Arc::new(SkillRegistry::new());
+        registry.add(minimal("a")).add(minimal("b"));
+        let layer = SkillLayer::new(Arc::clone(&registry)).with_enabled_skills(&["a"]);
+
+        let assembly = layer.assemble();
+        assert!(assembly.prompt_fragment.contains("- a: description"));
+        assert!(!assembly.prompt_fragment.contains("- b:"));
+        assert!(assembly.load_skill_tool.is_some());
+        assert_eq!(assembly.manifest.visible_skills, vec!["a"]);
+        assert_eq!(layer.load_skill_source().display_name, "load_skill");
+    }
+
+    #[test]
+    fn skill_layer_inline_embeds_bodies_without_loader() {
+        let registry: Arc<SkillRegistry> = Arc::new(SkillRegistry::new());
+        registry.add(minimal("a"));
+        let layer = SkillLayer::new(registry).with_mode(SkillMode::Inline);
+
+        let assembly = layer.assemble();
+        assert!(assembly.prompt_fragment.contains("[Skill a]\nbody"));
+        assert!(assembly.load_skill_tool.is_none());
+    }
+
+    #[tokio::test]
+    async fn skill_layer_shared_activation_deduplicates_loader_and_menu() {
+        let registry: Arc<SkillRegistry> = Arc::new(SkillRegistry::new());
+        registry.add(minimal("a"));
+        let layer = SkillLayer::new(Arc::clone(&registry));
+        let tool = layer.assemble().load_skill_tool.unwrap();
+        let state = crate::SharedState::new();
+
+        let body = call_load_skill(&tool, serde_json::json!({ "name": "a" }), &state)
+            .await
+            .unwrap();
+        assert!(body.contains("body"));
+        assert!(!layer.assemble().prompt_fragment.contains("- a:"));
+        assert!(layer.activation_state().is_active("a"));
+    }
+
+    async fn call_reference_tool(
+        tool: &LoadSkillReferenceTool,
+        arguments: serde_json::Value,
+    ) -> Result<String, crate::tool::ToolError> {
+        let run = crate::RunContext::new("load-skill-reference-test");
+        let state = crate::SharedState::new();
+        let result = tool
+            .call(
+                arguments,
+                crate::ToolContext::new(&run, &state, "call-ref", "load_skill_reference"),
+            )
+            .await?;
+        Ok(result.to_string())
+    }
+
+    #[tokio::test]
+    async fn load_skill_reference_requires_active_skill_and_references_path() {
+        let dir = temp_dir("load-skill-reference");
+        let skill_dir = write_skill(&dir, "a", "description", "body");
+        std::fs::create_dir_all(skill_dir.join("references")).unwrap();
+        std::fs::write(skill_dir.join("references/style.md"), "style").unwrap();
+        let skill = Skill::from_dir(&skill_dir).await.unwrap();
+
+        let registry: Arc<SkillRegistry> = Arc::new(SkillRegistry::new());
+        registry.add(skill);
+        let activation = SkillActivationState::new();
+        let tool = LoadSkillReferenceTool::new(
+            Arc::clone(&registry),
+            None,
+            activation.clone(),
+            SkillResourceStore::default(),
+        );
+
+        let inactive = call_reference_tool(
+            &tool,
+            serde_json::json!({ "skill": "a", "path": "references/style.md" }),
+        )
+        .await
+        .unwrap_err();
+        assert!(inactive.to_string().contains("not active"));
+
+        activation.mark_loaded("a");
+        let invalid = call_reference_tool(
+            &tool,
+            serde_json::json!({ "skill": "a", "path": "scripts/run.sh" }),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(
+            invalid,
+            crate::tool::ToolError::InvalidArguments(_)
+        ));
+
+        let content = call_reference_tool(
+            &tool,
+            serde_json::json!({ "skill": "a", "path": "references/style.md" }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(content, "style");
     }
 }

@@ -163,8 +163,8 @@ root re-exports each module's core items, so `use molo::...` covers most cases:
 | Effect | side-effect boundary | `EffectRequest`, `EffectObservation`, `EffectKind`, `RiskLevel` |
 | Harness | governed effect execution | `HarnessRuntime`, `Harness`, `BasicHarness`, `EffectExecutor`, `PolicyEngine`, `ApprovalBroker`, `AuditSink`, `TranscriptStore` with `harness` |
 | Coding | coding-workload primitives | `LocalWorkspace`, `WorkspacePath`, `CodingEffectExecutor`, `CommandExecutor`, `GitInspector`, `RepoSearcher`, `InstructionResolver`, `CodingContextProvider` with `coding` |
-| Skill | capability packs (Agent Skills protocol) | `Skill`, `SkillRegistry`, `LoadSkillTool` with `skills` |
-| MCP | external tool servers | `McpClient`, `McpTool` with `mcp` |
+| Skill | capability packs (Agent Skills protocol) | `Skill`, `SkillRegistry`, `SkillLayer`, `LoadSkillTool` with `skills` |
+| MCP | external tool servers | `McpClient`, `McpDirectTool` with `mcp`; `McpEffectTool`, `McpEffectExecutor` with `mcp,harness` |
 | Message | conversation model | `Message`, `ContentBlock`, `ToolCall` |
 | MessageChannel | external conversation (human/agents) | `MpscChannel`, `BroadcastChannel`, `WatchChannel`; `CliMessageChannel` with `cli-channel` |
 | EventChannel | observation of a run | `BroadcastEventChannel`, `MpscEventChannel` |
@@ -265,15 +265,21 @@ println!("{}°C, {}", weather.temperature, weather.condition);
 Requires `features = ["mcp"]`.
 
 Bring tools exposed by external MCP servers into the agent. `McpClient`
-supports the stdio child-process and Streamable HTTP transports (via `rmcp`):
+supports the stdio child-process and Streamable HTTP transports (via `rmcp`).
+The direct path is convenient for prototypes and low-risk servers:
 
 ```rust
-let mut client = McpClient::from_command("filesystem", ["/path/to/server"]);
+let mut client = McpClient::from_command("filesystem", "mcp-filesystem", ["/workspace"]);
 let mut registry = ToolRegistry::new();
 for tool in client.tools().await? {
-    registry.register(tool);
+    registry.register_with_source(tool.clone(), tool.source())?;
 }
 ```
+
+For production external side effects, enable `features = ["mcp", "harness"]`
+and use `McpEffectTool` + `McpEffectExecutor`; the model-visible tool returns
+`EffectKind::Mcp`, and the harness owns policy, approval, network/sandbox,
+audit, and transcript.
 
 ### Skills (Agent Skills open protocol)
 
@@ -283,7 +289,11 @@ A skill is a directory containing `SKILL.md` (YAML frontmatter + Markdown).
 The core mechanism is **progressive disclosure**: the model first sees only a
 one-line menu of name + description; when a task matches, it reads the body via
 the `load_skill` tool. Skills declare their tool dependencies with
-`allowed-tools`.
+`allowed-tools`, which is a policy hint or upper bound, not an authorization
+grant. `SkillLayer` assembles the prompt fragment and loader tool explicitly;
+`ReActAgent::with_skills` remains a convenience wrapper over that layer.
+Skill scripts are not executed by the skill loader; script execution must be
+converted into a harness-governed command/coding effect by the host.
 
 ### Sub-agents
 
@@ -338,6 +348,7 @@ Self-contained examples (no real API needed) are marked ✦.
 | ✦ `coding_harness` | `cargo run --example coding_harness --features coding` | Typed coding effects executed through `BasicHarness` |
 | ✦ `shared_state` | `cargo run --example shared_state` | Three ways to use `SharedState` |
 | ✦ `mcp` | `cargo run --example mcp --features mcp` | MCP client adapter, self-contained fake server |
+| ✦ `mcp_governed` | `cargo run --example mcp_governed --features mcp,harness` | MCP tool as a governed harness effect |
 
 ### Provider
 
@@ -378,6 +389,7 @@ Self-contained examples (no real API needed) are marked ✦.
 | --- | --- | --- |
 | ✦ `structured` | `cargo run --example structured --features structured` | Typed output with `run_typed` and JSON Schema validation |
 | ✦ `skill` | `cargo run --example skill --features skills` | Skills: discovery, progressive disclosure, activation |
+| ✦ `skill_layer` | `cargo run --example skill_layer --features skills` | SkillLayer prompt/tool assembly without ReActAgent internals |
 | ✦ `cancellation` | `cargo run --example cancellation` | Cooperative cancellation mid-reply, then continue |
 
 ## ⚙️ Configuration

@@ -41,7 +41,7 @@ use crate::provider::{
 use crate::run::TypedRunOutput;
 use crate::run::{Artifact, RunContext, RunMetadata, RunOutput, RunRequest};
 #[cfg(feature = "skills")]
-use crate::skill::{LoadSkillTool, SkillRegistry};
+use crate::skill::{SkillLayer, SkillMode, SkillRegistry};
 use crate::tool::{SharedState, ToolMemoryPolicy, ToolOutput, ToolRegistry, ToolResult};
 use futures::StreamExt;
 use futures::stream::BoxStream;
@@ -248,36 +248,12 @@ pub struct ReActAgent {
     /// effective in dynamic mode).
     #[cfg(feature = "skills")]
     enabled_skills: Option<Arc<HashSet<String>>>,
-    /// Pre-activated skill names, in activation order (bodies join the
-    /// system prompt without the model's involvement).
+    /// Optional skill extension layer. Legacy `with_skills*` methods are thin
+    /// wrappers around this layer.
     #[cfg(feature = "skills")]
-    activated_skills: Vec<String>,
-    /// Skill assembly mode (none / dynamic progressive disclosure / static
-    /// inlining).
-    #[cfg(feature = "skills")]
-    skill_mode: SkillMode,
+    skill_layer: Option<SkillLayer>,
     /// Step-wise kernel state. `None` means no `AgentKernel` run is active.
     kernel_state: Option<ReActKernelState>,
-}
-
-/// Skill assembly mode: how skills enter the system prompt.
-///
-/// - [`Dynamic`](SkillMode::Dynamic): progressive disclosure — the menu
-///   stays in the system prompt, and the
-///   [`load_skill`](crate::skill::LoadSkillTool) tool reads bodies on
-///   demand;
-/// - [`Inline`](SkillMode::Inline): static inlining — all bodies stay in
-///   the system prompt, and load_skill is not registered.
-#[cfg(feature = "skills")]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SkillMode {
-    /// No skills assembled.
-    None,
-    /// Dynamic progressive disclosure (the protocol's primary form).
-    Dynamic,
-    /// Static inlining (a quick form for small skill sets /
-    /// deterministic scenarios).
-    Inline,
 }
 
 /// Per-round reply text accumulation limit (4 MiB, shared by streaming and
@@ -334,9 +310,7 @@ impl ReActAgent {
             #[cfg(feature = "skills")]
             enabled_skills: None,
             #[cfg(feature = "skills")]
-            activated_skills: Vec::new(),
-            #[cfg(feature = "skills")]
-            skill_mode: SkillMode::None,
+            skill_layer: None,
             kernel_state: None,
         }
     }
@@ -591,10 +565,17 @@ impl ReActAgent {
     #[cfg(feature = "skills")]
     pub fn with_skills(mut self, registry: SkillRegistry) -> Self {
         self.skills = Arc::new(registry);
-        self.skill_mode = SkillMode::Dynamic;
-        let enabled = self.enabled_skills.clone();
-        self.registry
-            .register(LoadSkillTool::new(self.skills.clone(), enabled));
+        self.registry.remove("load_skill");
+        let layer = SkillLayer::new(Arc::clone(&self.skills))
+            .with_enabled_set(self.enabled_skills.clone())
+            .with_mode(SkillMode::Progressive);
+        let assembly = layer.assemble();
+        if let Some(tool) = assembly.load_skill_tool {
+            self.registry
+                .register_with_source(tool, layer.load_skill_source())
+                .expect("SkillLayer load_skill source must match tool schema");
+        }
+        self.skill_layer = Some(layer);
         self
     }
 
@@ -615,7 +596,11 @@ impl ReActAgent {
         // If switching from dynamic mode: remove load_skill, to avoid
         // leaving a loader tool with no menu to guide it.
         self.registry.remove("load_skill");
-        self.skill_mode = SkillMode::Inline;
+        self.skill_layer = Some(
+            SkillLayer::new(Arc::clone(&self.skills))
+                .with_enabled_set(self.enabled_skills.clone())
+                .with_mode(SkillMode::Inline),
+        );
         self
     }
 
@@ -642,10 +627,19 @@ impl ReActAgent {
         self.enabled_skills = Some(Arc::new(set));
         // Dynamic mode: re-register load_skill (same-name replacement) so
         // the allowlist takes effect immediately.
-        if self.skill_mode == SkillMode::Dynamic {
-            let enabled = self.enabled_skills.clone();
-            self.registry
-                .register(LoadSkillTool::new(self.skills.clone(), enabled));
+        if let Some(layer) = self.skill_layer.take() {
+            let mode = layer.mode();
+            let layer = layer.with_enabled_set(self.enabled_skills.clone());
+            self.registry.remove("load_skill");
+            if mode == SkillMode::Progressive {
+                let assembly = layer.assemble();
+                if let Some(tool) = assembly.load_skill_tool {
+                    self.registry
+                        .register_with_source(tool, layer.load_skill_source())
+                        .expect("SkillLayer load_skill source must match tool schema");
+                }
+            }
+            self.skill_layer = Some(layer);
         }
         self
     }
@@ -672,17 +666,9 @@ impl ReActAgent {
     /// allowlist, or the mode is inline → `false`.
     #[cfg(feature = "skills")]
     pub fn activate_skill(&mut self, name: &str) -> bool {
-        if self.skill_mode != SkillMode::Dynamic {
-            return false;
-        }
-        if !self.skill_visible(name) || self.skills.get(name).is_none() {
-            return false;
-        }
-        if self.is_activated(name) {
-            return true;
-        }
-        self.activated_skills.push(name.to_string());
-        true
+        self.skill_layer
+            .as_ref()
+            .is_some_and(|layer| layer.activate_skill(name))
     }
 
     /// Deactivate a pre-activated skill: the body leaves the system prompt
@@ -706,31 +692,9 @@ impl ReActAgent {
     /// ```
     #[cfg(feature = "skills")]
     pub fn deactivate_skill(&mut self, name: &str) -> bool {
-        if self.skill_mode != SkillMode::Dynamic {
-            return false;
-        }
-        if let Some(pos) = self.activated_skills.iter().position(|n| n == name) {
-            self.activated_skills.remove(pos);
-            true
-        } else {
-            false
-        }
-    }
-
-    /// Whether the skill is in the session allowlist (no allowlist set =
-    /// everything visible).
-    #[cfg(feature = "skills")]
-    fn skill_visible(&self, name: &str) -> bool {
-        match &self.enabled_skills {
-            None => true,
-            Some(enabled) => enabled.contains(name),
-        }
-    }
-
-    /// Whether the skill is pre-activated.
-    #[cfg(feature = "skills")]
-    fn is_activated(&self, name: &str) -> bool {
-        self.activated_skills.iter().any(|n| n == name)
+        self.skill_layer
+            .as_ref()
+            .is_some_and(|layer| layer.deactivate_skill(name))
     }
 
     /// Publish an event (no-op when no channel is attached). Takes a
@@ -989,39 +953,12 @@ impl ReActAgent {
         #[cfg(feature = "skills")]
         {
             let base = self.system_prompt.as_str();
-            let skills = self.skills.skills();
-            if skills.is_empty() {
-                return base.to_string();
-            }
             let mut out = String::new();
             out.push_str(base);
-            match self.skill_mode {
-                SkillMode::None => {}
-                SkillMode::Dynamic => {
-                    // Menu: skills in the allowlist that are not activated, in
-                    // registration order.
-                    let menu: Vec<String> = skills
-                        .iter()
-                        .filter(|s| self.skill_visible(s.name()) && !self.is_activated(s.name()))
-                        .map(|s| format!("- {}: {}", s.name(), s.description()))
-                        .collect();
-                    append_sections(&mut out, &menu);
-                    // Pre-activated bodies: in activation order; skills already
-                    // removed are skipped when get misses.
-                    let activated: Vec<String> = self
-                        .activated_skills
-                        .iter()
-                        .filter_map(|n| self.skills.get(n))
-                        .map(|s| format!("[Skill {}]\n{}", s.name(), s.body()))
-                        .collect();
-                    append_sections(&mut out, &activated);
-                }
-                SkillMode::Inline => {
-                    let bodies: Vec<String> = skills
-                        .iter()
-                        .map(|s| format!("[Skill {}]\n{}", s.name(), s.body()))
-                        .collect();
-                    append_sections(&mut out, &bodies);
+            if let Some(layer) = &self.skill_layer {
+                let assembly = layer.assemble();
+                if !assembly.prompt_fragment.is_empty() {
+                    append_sections(&mut out, &[assembly.prompt_fragment]);
                 }
             }
             out

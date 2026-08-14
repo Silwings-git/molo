@@ -214,7 +214,15 @@ pub use harness::{
     VecTranscriptStore,
 };
 #[cfg(feature = "mcp")]
-pub use mcp::{McpClient, McpError, McpTool};
+pub use mcp::{
+    McpCacheHint, McpClient, McpDirectTool, McpError, McpServerId, McpTool, McpToolCatalog,
+    McpToolDescriptor, McpToolId, McpToolMode,
+};
+#[cfg(all(feature = "mcp", feature = "harness"))]
+pub use mcp::{
+    McpCallPayload, McpClientProvider, McpEffectExecutor, McpEffectTool, McpPermissionBridge,
+    McpServerPolicy, McpToolCallOutput,
+};
 pub use memory::{
     Budget, CharTokenCounter, InMemoryMemory, Memory, MemoryError, SummarizeStrategy, TokenCounter,
     TrimResult, TrimStrategy, WindowDrop, WindowMemory,
@@ -236,10 +244,15 @@ pub use provider::{OpenAiProvider, StructuredOutputMode};
 pub use run::TypedRunOutput;
 pub use run::{Artifact, RunContext, RunMetadata, RunOutput, RunRequest, RunSummary, UserInput};
 #[cfg(feature = "skills")]
-pub use skill::{AllowedTool, LoadSkillTool, Skill, SkillError, SkillRegistry};
+pub use skill::{
+    AllowedTool, LoadSkillReferenceTool, LoadSkillTool, Skill, SkillActivationState, SkillError,
+    SkillLayer, SkillLayerAssembly, SkillLayerConfig, SkillLayerManifest, SkillMode, SkillRegistry,
+    SkillResourceStore, SkillSourceTrust,
+};
 pub use tool::{
     MissingTools, RegistryError, SharedState, SideEffectLevel, Tool, ToolContext, ToolError,
-    ToolMemoryPolicy, ToolOutput, ToolPolicy, ToolRegistry, ToolResult, ToolSchema,
+    ToolMemoryPolicy, ToolNamespace, ToolNamespaceKind, ToolOutput, ToolPolicy, ToolRegistry,
+    ToolResult, ToolSchema, ToolSource, ToolTrustLevel,
 };
 
 // Cooperative cancellation primitive (a standard tokio-util component):
