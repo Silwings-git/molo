@@ -47,6 +47,9 @@ pub struct CliTaskState {
     pub changed_files: Vec<String>,
     /// Verification summaries.
     pub verification: Vec<String>,
+    /// Warnings that should be shown in final summaries.
+    #[serde(default)]
+    pub warnings: Vec<String>,
     /// Approval summaries.
     pub approvals: Vec<CliApprovalSummary>,
     /// Interruptions.
@@ -63,6 +66,7 @@ impl CliTaskState {
             plan: Vec::new(),
             changed_files: Vec::new(),
             verification: Vec::new(),
+            warnings: Vec::new(),
             approvals: Vec::new(),
             interruptions: Vec::new(),
             last_error: None,
@@ -443,6 +447,7 @@ mod tests {
                 policy: crate::config::PolicyConfig {
                     sandbox: molo::SandboxPolicy::WorkspaceWrite,
                     network: molo::NetworkPolicy::Deny,
+                    advisory_local_executor: true,
                     approval: crate::args::ApprovalMode::Ask,
                     command_timeout: std::time::Duration::from_secs(30),
                 },

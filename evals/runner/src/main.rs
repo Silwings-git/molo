@@ -1,9 +1,10 @@
 use molo::{
-    ApplyPatchPayload, BasicHarness, CliGitInspector, CodingEffectExecutor, CommandPayload,
-    CommandRequest, CommandStatus, CommandTestRunner, DefaultPolicyEngine, EffectObservation,
-    EffectStatus, ExecutionPolicy, FilePatch, FileWriteContent, GitChangedFilesRequest,
-    GitInspector, Harness, HarnessConfig, LocalCommandExecutor, LocalWorkspace, NetworkPolicy,
-    OutputLimit, Patch, PatchHunk, PatchOperation, PatternRedactor, ReadFilePayload, RunContext,
+    ApplyPatchPayload, BasicHarness, CliGitInspector, CodingEffectExecutor, CodingExecutorConfig,
+    CodingPolicyEngine, CommandOutput, CommandPayload, CommandRequest, CommandStatus,
+    CommandTestRunner, EffectObservation, EffectStatus, ExecutionPolicy, FilePatch,
+    FileWriteContent, GitChangedFilesRequest, GitInspector, Harness, HarnessConfig,
+    LocalCommandExecutor, LocalWorkspace, NetworkPolicy, OutputLimit, Patch, PatchHunk,
+    PatchOperation, PatternRedactor, PolicyCapabilityMode, ReadFilePayload, RunContext,
     RunMetadata, SandboxPolicy, StaticApprovalBroker, TestRunRequest, TestRunner, VecAuditSink,
     VecTranscriptStore, WorkspacePath, WorkspaceSearcher, WriteFilePayload,
 };
@@ -359,6 +360,9 @@ struct EvalCommandSummary {
     stderr_digest: Option<String>,
     stdout_bytes: Option<usize>,
     stderr_bytes: Option<usize>,
+    sandbox_status: Option<String>,
+    network_status: Option<String>,
+    advisory_warnings: Vec<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -404,16 +408,20 @@ async fn run_case(
 
     let pre_existing_dirty_files = apply_dirty_setup(&workspace_root, &case.setup)?;
     let workspace = LocalWorkspace::new(&workspace_root).map_err(|error| error.to_string())?;
-    let commands = LocalCommandExecutor::new(workspace.clone());
+    let commands = LocalCommandExecutor::new(workspace.clone()).with_advisory_policy(true);
     let git = CliGitInspector::new(commands.clone());
     let searcher = WorkspaceSearcher::new(workspace.clone());
     let audit = VecAuditSink::new();
     let transcript = VecTranscriptStore::new();
     let executor =
-        CodingEffectExecutor::new(workspace.clone(), commands.clone(), git.clone(), searcher);
+        CodingEffectExecutor::new(workspace.clone(), commands.clone(), git.clone(), searcher)
+            .with_config(
+                CodingExecutorConfig::default()
+                    .with_command_policy_capability_mode(PolicyCapabilityMode::AllowAdvisory),
+            );
     let harness = BasicHarness::new(
         executor,
-        DefaultPolicyEngine,
+        CodingPolicyEngine::conservative(),
         StaticApprovalBroker::new(case.policy.approval.decision()),
         audit.clone(),
         transcript.clone(),
@@ -673,15 +681,35 @@ async fn execute_action<H: Harness>(
                 .execute(effect, context)
                 .await
                 .map_err(|error| error.to_string())?;
+            let command_output = command_output_from_observation(&observation);
             execution.commands.push(EvalCommandSummary {
                 name: "action".to_string(),
                 argv_digest: digest_value(&serde_json::json!(argv)),
-                status: format!("{:?}", observation.status),
-                exit_code: None,
-                stdout_digest: None,
-                stderr_digest: None,
-                stdout_bytes: None,
-                stderr_bytes: None,
+                status: command_output
+                    .as_ref()
+                    .map(|output| format!("{:?}", output.status))
+                    .unwrap_or_else(|| format!("{:?}", observation.status)),
+                exit_code: command_output
+                    .as_ref()
+                    .and_then(|output| exit_code(&output.status)),
+                stdout_digest: command_output
+                    .as_ref()
+                    .map(|output| digest_bytes(output.stdout.text.as_bytes())),
+                stderr_digest: command_output
+                    .as_ref()
+                    .map(|output| digest_bytes(output.stderr.text.as_bytes())),
+                stdout_bytes: command_output.as_ref().map(|output| output.stdout.bytes),
+                stderr_bytes: command_output.as_ref().map(|output| output.stderr.bytes),
+                sandbox_status: command_output
+                    .as_ref()
+                    .map(|output| format!("{:?}", output.policy_enforcement.sandbox_status)),
+                network_status: command_output
+                    .as_ref()
+                    .map(|output| format!("{:?}", output.policy_enforcement.network_status)),
+                advisory_warnings: command_output
+                    .as_ref()
+                    .map(|output| output.policy_enforcement.warnings.clone())
+                    .unwrap_or_default(),
             });
             record_effect_observation(execution, &observation, *expect);
         }
@@ -779,6 +807,11 @@ async fn run_verification(
         });
     }
     Ok(results)
+}
+
+fn command_output_from_observation(observation: &EffectObservation) -> Option<CommandOutput> {
+    let (_, json) = observation.output.observation_for_model.split_once('\n')?;
+    serde_json::from_str(json).ok()
 }
 
 fn approval_summary(events: &[molo::AuditEvent]) -> EvalApprovalSummary {

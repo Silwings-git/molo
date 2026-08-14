@@ -19,6 +19,8 @@ pub struct FinalDiffSummary {
     pub pre_existing_dirty_files: Vec<String>,
     /// Verification results.
     pub verification: Vec<VerificationResult>,
+    /// Non-fatal warnings about reference CLI execution.
+    pub warnings: Vec<String>,
     /// Approval summaries.
     pub approvals: Vec<CliApprovalSummary>,
     /// Denied effects.
@@ -68,6 +70,12 @@ pub fn print_final_summary(
         println!("denied effects:");
         for effect in &summary.denied_effects {
             println!("  {effect}");
+        }
+    }
+    if !summary.warnings.is_empty() {
+        println!("warnings:");
+        for warning in &summary.warnings {
+            println!("  {warning}");
         }
     }
     if !summary.model_answer.trim().is_empty() {

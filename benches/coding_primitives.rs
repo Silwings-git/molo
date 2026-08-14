@@ -114,7 +114,7 @@ fn bench_command_output_truncation(c: &mut Criterion) {
             command_fixture,
             |(root, workspace, request)| {
                 runtime.block_on(async {
-                    let executor = LocalCommandExecutor::new(workspace);
+                    let executor = LocalCommandExecutor::new(workspace).with_advisory_policy(true);
                     let output = executor
                         .execute(
                             request,

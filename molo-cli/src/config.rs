@@ -40,6 +40,8 @@ pub struct PolicyConfig {
     pub sandbox: SandboxPolicy,
     /// Network policy for command effects.
     pub network: NetworkPolicy,
+    /// Whether the reference CLI uses advisory local command execution.
+    pub advisory_local_executor: bool,
     /// Approval mode.
     pub approval: ApprovalMode,
     /// Command timeout.
@@ -116,6 +118,7 @@ impl CliConfig {
             policy: PolicyConfig {
                 sandbox: SandboxPolicy::WorkspaceWrite,
                 network: NetworkPolicy::Deny,
+                advisory_local_executor: true,
                 approval: args.global.approval,
                 command_timeout: Duration::from_secs(args.global.command_timeout_secs),
             },

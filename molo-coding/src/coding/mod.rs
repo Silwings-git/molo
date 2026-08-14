@@ -16,15 +16,18 @@ mod error;
 mod git;
 mod instructions;
 mod payload;
+mod policy;
 mod search;
 mod test_runner;
 mod tools;
 mod workspace;
 
 pub use command::{
-    CommandError, CommandExecutor, CommandExecutorCapabilities, CommandOutput, CommandOutputLimit,
-    CommandRequest, CommandStatus, EnvPolicy, LocalCommandExecutor, OutputText,
-    PolicyEnforcementReport, PtyMode,
+    CommandError, CommandExecutor, CommandExecutorBackend, CommandExecutorCapabilities,
+    CommandExecutorIdentity, CommandOutput, CommandOutputLimit, CommandRequest, CommandStatus,
+    EnvPolicy, LocalCommandExecutor, OutputText, PolicyCapabilityMode, PolicyEnforcementReport,
+    PolicyEnforcementStatus, PtyMode, validate_command_capabilities,
+    validate_policy_enforcement_report,
 };
 pub use context::{
     CodingContextBundle, CodingContextError, CodingContextInclude, CodingContextProvider,
@@ -43,6 +46,9 @@ pub use instructions::{
 pub use payload::{
     ApplyPatchPayload, CommandPayload, GitPayload, ListFilesPayload, ReadFilePayload,
     SearchPayload, WriteFilePayload,
+};
+pub use policy::{
+    CodingPolicyClass, CodingPolicyEngine, CodingPolicyInput, CommandPattern, CommandTaxonomy,
 };
 pub use search::{
     RepoSearchRequest, RepoSearchResults, RepoSearcher, RipgrepSearcher, SearchError, SearchMatch,

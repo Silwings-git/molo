@@ -25,6 +25,8 @@ pub struct CodingExecutorConfig {
     pub(crate) default_read_max_bytes: usize,
     /// Default search matches when payload omits it.
     pub(crate) default_search_max_matches: usize,
+    /// Command policy/capability mismatch behavior.
+    pub(crate) command_policy_capability_mode: super::command::PolicyCapabilityMode,
 }
 
 impl Default for CodingExecutorConfig {
@@ -33,6 +35,7 @@ impl Default for CodingExecutorConfig {
             allow_write_in_read_only_policy: false,
             default_read_max_bytes: 64 * 1024,
             default_search_max_matches: 100,
+            command_policy_capability_mode: super::command::PolicyCapabilityMode::RequireEnforced,
         }
     }
 }
@@ -76,6 +79,20 @@ impl CodingExecutorConfig {
     /// Returns a config with an updated default search match cap.
     pub fn with_default_search_max_matches(mut self, default_search_max_matches: usize) -> Self {
         self.default_search_max_matches = default_search_max_matches;
+        self
+    }
+
+    /// Command policy/capability mismatch behavior.
+    pub fn command_policy_capability_mode(&self) -> super::command::PolicyCapabilityMode {
+        self.command_policy_capability_mode
+    }
+
+    /// Returns a config with updated command policy/capability behavior.
+    pub fn with_command_policy_capability_mode(
+        mut self,
+        command_policy_capability_mode: super::command::PolicyCapabilityMode,
+    ) -> Self {
+        self.command_policy_capability_mode = command_policy_capability_mode;
         self
     }
 }
@@ -290,11 +307,25 @@ where
         context: &RunContext,
     ) -> Result<RawEffectOutput, ExecutionError> {
         let payload = CommandPayload::from_effect(request)?;
+        let capabilities = self.commands.capabilities();
+        super::command::validate_command_capabilities(
+            &capabilities,
+            &payload.request,
+            policy,
+            self.config.command_policy_capability_mode,
+        )
+        .map_err(CodingError::from)?;
         let output = self
             .commands
             .execute(payload.request, policy, context)
             .await
             .map_err(CodingError::from)?;
+        super::command::validate_policy_enforcement_report(
+            &capabilities,
+            &output.policy_enforcement,
+            self.config.command_policy_capability_mode,
+        )
+        .map_err(CodingError::from)?;
         raw_json(
             format!(
                 "command status={:?}, stdout_bytes={}, stderr_bytes={}, truncated={}",
@@ -383,8 +414,8 @@ where
 mod tests {
     use super::*;
     use crate::coding::{
-        LocalCommandExecutor, LocalWorkspace, ReadFilePayload, WorkspacePath, WorkspaceSearcher,
-        WriteFilePayload,
+        CommandPayload, LocalCommandExecutor, LocalWorkspace, PolicyCapabilityMode,
+        ReadFilePayload, WorkspacePath, WorkspaceSearcher, WriteFilePayload,
     };
     use crate::harness::{NetworkPolicy, SandboxPolicy};
     use std::time::Duration;
@@ -463,11 +494,73 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
+    #[tokio::test]
+    async fn command_effect_denies_capability_mismatch_by_default() {
+        let root = temp_dir("command-mismatch");
+        let workspace = LocalWorkspace::new(&root).unwrap();
+        let commands = LocalCommandExecutor::new(workspace.clone());
+        let git = crate::coding::CliGitInspector::new(commands.clone());
+        let searcher = WorkspaceSearcher::new(workspace.clone());
+        let executor = CodingEffectExecutor::new(workspace, commands, git, searcher);
+        let effect = CommandPayload {
+            request: crate::coding::CommandRequest::new(["printf", "ok"]),
+        }
+        .into_effect()
+        .unwrap();
+
+        let error = executor
+            .execute(
+                &effect,
+                &policy(SandboxPolicy::ReadOnly),
+                &crate::RunContext::new("coding-exec"),
+            )
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, ExecutionError::Denied(_)));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn command_effect_can_run_in_explicit_advisory_mode() {
+        let root = temp_dir("command-advisory");
+        let workspace = LocalWorkspace::new(&root).unwrap();
+        let commands = LocalCommandExecutor::new(workspace.clone()).with_advisory_policy(true);
+        let git = crate::coding::CliGitInspector::new(commands.clone());
+        let searcher = WorkspaceSearcher::new(workspace.clone());
+        let executor = CodingEffectExecutor::new(workspace, commands, git, searcher).with_config(
+            CodingExecutorConfig::default()
+                .with_command_policy_capability_mode(PolicyCapabilityMode::AllowAdvisory),
+        );
+        let effect = CommandPayload {
+            request: crate::coding::CommandRequest::new(["printf", "ok"]),
+        }
+        .into_effect()
+        .unwrap();
+
+        let output = executor
+            .execute(
+                &effect,
+                &policy(SandboxPolicy::ReadOnly),
+                &crate::RunContext::new("coding-exec"),
+            )
+            .await
+            .unwrap();
+
+        assert!(output.observation_for_model.contains("command status"));
+        assert!(output.debug.unwrap().contains("Advisory"));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
     #[test]
     fn config_default_is_conservative() {
         let config = CodingExecutorConfig::default();
         assert!(!config.allow_write_in_read_only_policy);
         assert!(config.default_read_max_bytes > 0);
         assert!(config.default_search_max_matches > 0);
+        assert_eq!(
+            config.command_policy_capability_mode(),
+            super::super::command::PolicyCapabilityMode::RequireEnforced
+        );
     }
 }

@@ -1327,21 +1327,60 @@ impl Workspace for LocalWorkspace {
             })
             .await?;
         let mut conflicts = Vec::new();
-        let mut writes: BTreeMap<WorkspacePath, Vec<u8>> = BTreeMap::new();
-        let mut deletes: BTreeSet<WorkspacePath> = BTreeSet::new();
+        let mut writes: BTreeMap<WorkspacePath, PlannedWrite> = BTreeMap::new();
+        let mut deletes: BTreeMap<WorkspacePath, FileVersion> = BTreeMap::new();
 
         for file_patch in &request.patch.files {
             match validate_file_patch(self, file_patch).await {
                 Ok(plan) => match plan {
                     PatchPlan::Write { path, bytes } => {
-                        writes.insert(path, bytes);
+                        writes.insert(
+                            path,
+                            PlannedWrite {
+                                bytes,
+                                expected_version: None,
+                                create: true,
+                                overwrite: false,
+                            },
+                        );
                     }
-                    PatchPlan::Delete { path } => {
-                        deletes.insert(path);
+                    PatchPlan::Modify {
+                        path,
+                        bytes,
+                        expected_version,
+                    } => {
+                        writes.insert(
+                            path,
+                            PlannedWrite {
+                                bytes,
+                                expected_version: Some(expected_version),
+                                create: false,
+                                overwrite: true,
+                            },
+                        );
                     }
-                    PatchPlan::Rename { from, to, bytes } => {
-                        deletes.insert(from);
-                        writes.insert(to, bytes);
+                    PatchPlan::Delete {
+                        path,
+                        expected_version,
+                    } => {
+                        deletes.insert(path, expected_version);
+                    }
+                    PatchPlan::Rename {
+                        from,
+                        to,
+                        bytes,
+                        expected_version,
+                    } => {
+                        deletes.insert(from, expected_version);
+                        writes.insert(
+                            to,
+                            PlannedWrite {
+                                bytes,
+                                expected_version: None,
+                                create: true,
+                                overwrite: false,
+                            },
+                        );
                     }
                 },
                 Err(conflict) => conflicts.push(conflict),
@@ -1350,7 +1389,7 @@ impl Workspace for LocalWorkspace {
 
         let changed_files: Vec<_> = writes
             .keys()
-            .chain(deletes.iter())
+            .chain(deletes.keys())
             .cloned()
             .collect::<BTreeSet<_>>()
             .into_iter()
@@ -1377,27 +1416,37 @@ impl Workspace for LocalWorkspace {
             });
         }
 
-        for path in deletes {
+        for (path, expected_version) in deletes {
             let resolved = self.resolve(&path, WorkspaceAccess::Delete).await?;
+            let actual_version = self.version_for_absolute(&path, &resolved.absolute).await?;
+            if actual_version != expected_version {
+                return Err(WorkspaceError::Conflict {
+                    conflict: Box::new(PatchConflict {
+                        path,
+                        message: "stale file version before delete".to_string(),
+                        expected_version: Some(expected_version),
+                        actual_version: Some(actual_version),
+                    }),
+                });
+            }
             tokio::fs::remove_file(&resolved.absolute)
                 .await
                 .map_err(|error| WorkspaceError::Io {
                     message: format!("failed to delete file: {error}"),
                 })?;
-            self.changes.record(path, None, None);
+            self.changes.record(path, Some(expected_version), None);
         }
-        for (path, bytes) in writes {
-            let text = match String::from_utf8(bytes.clone()) {
+        for (path, planned) in writes {
+            let text = match String::from_utf8(planned.bytes.clone()) {
                 Ok(text) => FileWriteContent::Text(text),
-                Err(_) => FileWriteContent::Bytes(bytes),
+                Err(_) => FileWriteContent::Bytes(planned.bytes),
             };
-            let exists = std::fs::symlink_metadata(self.root.join(&path)).is_ok();
             self.write_file(WriteFileRequest {
                 path,
                 content: text,
-                expected_version: None,
-                create: !exists,
-                overwrite: exists,
+                expected_version: planned.expected_version,
+                create: planned.create,
+                overwrite: planned.overwrite,
             })
             .await?;
         }
@@ -1427,14 +1476,29 @@ enum PatchPlan {
         path: WorkspacePath,
         bytes: Vec<u8>,
     },
+    Modify {
+        path: WorkspacePath,
+        bytes: Vec<u8>,
+        expected_version: FileVersion,
+    },
     Delete {
         path: WorkspacePath,
+        expected_version: FileVersion,
     },
     Rename {
         from: WorkspacePath,
         to: WorkspacePath,
         bytes: Vec<u8>,
+        expected_version: FileVersion,
     },
+}
+
+#[derive(Debug)]
+struct PlannedWrite {
+    bytes: Vec<u8>,
+    expected_version: Option<FileVersion>,
+    create: bool,
+    overwrite: bool,
 }
 
 async fn validate_file_patch(
@@ -1501,14 +1565,32 @@ async fn validate_file_patch(
                 };
                 text.replace_range(index..index + hunk.old_text.len(), &hunk.new_text);
             }
-            Ok(PatchPlan::Write {
+            Ok(PatchPlan::Modify {
                 path: file_patch.path.clone(),
                 bytes: text.into_bytes(),
+                expected_version: version,
             })
         }
         PatchOperation::Delete => {
+            let resolved = workspace
+                .resolve(&file_patch.path, WorkspaceAccess::Delete)
+                .await
+                .map_err(|error| PatchConflict {
+                    path: file_patch.path.clone(),
+                    message: error.to_string(),
+                    expected_version: file_patch.expected_version.clone(),
+                    actual_version: None,
+                })?;
+            if resolved.kind != ResolvedPathKind::File {
+                return Err(PatchConflict {
+                    path: file_patch.path.clone(),
+                    message: "delete target is not a regular file".to_string(),
+                    expected_version: file_patch.expected_version.clone(),
+                    actual_version: None,
+                });
+            }
             let version = workspace
-                .version_for_absolute(&file_patch.path, &workspace.root.join(&file_patch.path))
+                .version_for_absolute(&file_patch.path, &resolved.absolute)
                 .await
                 .map_err(|error| PatchConflict {
                     path: file_patch.path.clone(),
@@ -1528,6 +1610,7 @@ async fn validate_file_patch(
             }
             Ok(PatchPlan::Delete {
                 path: file_patch.path.clone(),
+                expected_version: version,
             })
         }
         PatchOperation::Rename { from } => {
@@ -1575,6 +1658,7 @@ async fn validate_file_patch(
                 from: from.clone(),
                 to: file_patch.path.clone(),
                 bytes: new_text.into_bytes(),
+                expected_version: version,
             })
         }
     }

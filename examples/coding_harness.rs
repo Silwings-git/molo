@@ -1,7 +1,8 @@
 use molo::{
-    AlwaysAllowApprovalBroker, BasicHarness, CodingEffectExecutor, GitChangedFilesRequest,
-    GitOperation, GitPayload, LocalCommandExecutor, LocalWorkspace, ReadFilePayload, RunContext,
-    SearchPayload, WorkspacePath, WorkspaceSearcher,
+    AlwaysAllowApprovalBroker, BasicHarness, CodingEffectExecutor, CodingExecutorConfig,
+    CodingPolicyEngine, GitChangedFilesRequest, GitOperation, GitPayload, LocalCommandExecutor,
+    LocalWorkspace, PolicyCapabilityMode, ReadFilePayload, RunContext, SearchPayload,
+    WorkspacePath, WorkspaceSearcher,
 };
 
 #[tokio::main(flavor = "current_thread")]
@@ -10,10 +11,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let commands = LocalCommandExecutor::new(workspace.clone()).with_advisory_policy(true);
     let git = molo::CliGitInspector::new(commands.clone());
     let searcher = WorkspaceSearcher::new(workspace.clone());
-    let executor = CodingEffectExecutor::new(workspace, commands, git, searcher);
+    let executor = CodingEffectExecutor::new(workspace, commands, git, searcher).with_config(
+        CodingExecutorConfig::default()
+            .with_command_policy_capability_mode(PolicyCapabilityMode::AllowAdvisory),
+    );
     let harness = BasicHarness::new(
         executor,
-        molo::DefaultPolicyEngine,
+        CodingPolicyEngine::conservative(),
         AlwaysAllowApprovalBroker,
         molo::NoopAuditSink,
         molo::NoopTranscriptStore,

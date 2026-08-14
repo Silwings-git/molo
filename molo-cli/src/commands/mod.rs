@@ -10,17 +10,20 @@ use crate::session::{
 use futures::StreamExt;
 use molo::{
     Agent, ApplyPatchTool, BasicHarness, CliGitInspector, CodingContextProvider,
-    CodingContextRequest, CodingEffectExecutor, CommandRequest, DefaultCodingContextProvider,
-    DefaultInstructionResolver, DefaultPolicyEngine, DiffRequest, GitChangedFilesRequest,
-    GitInspector, GitStatusTool, HarnessConfig, HarnessRuntime, ListFilesTool,
-    LocalCommandExecutor, LocalWorkspace, MessageChunk, NetworkPolicy, Provider, ReActAgent,
-    ReadFileTool, RunCommandTool, RunContext, RunMetadata, RunRequest, SandboxPolicy,
-    SearchRepoTool, SnapshotRequest, ToolCall, ToolRegistry, Workspace, WorkspacePath,
-    WorkspaceSearcher,
+    CodingContextRequest, CodingEffectExecutor, CodingExecutorConfig, CodingPolicyEngine,
+    CommandRequest, DefaultCodingContextProvider, DefaultInstructionResolver, DiffRequest,
+    GitChangedFilesRequest, GitInspector, GitStatusTool, HarnessConfig, HarnessRuntime,
+    ListFilesTool, LocalCommandExecutor, LocalWorkspace, MessageChunk, NetworkPolicy,
+    PolicyCapabilityMode, Provider, ReActAgent, ReadFileTool, RunCommandTool, RunContext,
+    RunMetadata, RunRequest, SandboxPolicy, SearchRepoTool, SnapshotRequest, ToolCall,
+    ToolRegistry, Workspace, WorkspacePath, WorkspaceSearcher,
 };
 use serde_json::json;
 use std::io::Read;
 use std::time::Duration;
+
+const ADVISORY_LOCAL_EXECUTOR_WARNING: &str =
+    "LocalCommandExecutor is advisory: no OS sandbox or network isolation was applied";
 
 /// Dispatches one parsed command.
 pub async fn dispatch(command: Command, config: CliConfig) -> Result<(), CliError> {
@@ -166,6 +169,7 @@ async fn code(config: CliConfig, task: String, json_output: bool) -> Result<(), 
         config.snapshot(),
         None,
     );
+    add_advisory_warning(&mut session, &config);
     store.save(&session)?;
 
     let run_context = run_context(&session.session_id, config.policy.command_timeout);
@@ -176,6 +180,7 @@ async fn code(config: CliConfig, task: String, json_output: bool) -> Result<(), 
         "run_started",
         json!({}),
     )?;
+    append_advisory_event(&store, &session.session_id, &run_context, &config)?;
 
     let context_provider = DefaultCodingContextProvider::new(
         workspace.clone(),
@@ -186,11 +191,10 @@ async fn code(config: CliConfig, task: String, json_output: bool) -> Result<(), 
     let system_prompt = context_system_prompt(&context_provider, &task, &run_context).await?;
     let provider = provider_for_code(&config, &task)?;
     let approval = CliApprovalBroker::new(config.policy.approval, config.non_interactive);
-    let executor =
-        CodingEffectExecutor::new(workspace.clone(), commands.clone(), git.clone(), searcher);
+    let executor = coding_executor(workspace.clone(), commands.clone(), git.clone(), searcher);
     let harness = BasicHarness::new(
         executor,
-        DefaultPolicyEngine,
+        CodingPolicyEngine::conservative(),
         approval.clone(),
         JsonlAuditSink::new(store.clone(), session.session_id.clone()),
         JsonlTranscriptStore::new(store.clone(), session.session_id.clone()),
@@ -295,6 +299,7 @@ async fn review(
         config.snapshot(),
         None,
     );
+    add_advisory_warning(&mut session, &config);
     store.save(&session)?;
     let run_context = run_context(&session.session_id, config.policy.command_timeout);
     append_cli_event(
@@ -304,6 +309,7 @@ async fn review(
         "run_started",
         json!({}),
     )?;
+    append_advisory_event(&store, &session.session_id, &run_context, &config)?;
 
     let context_provider = DefaultCodingContextProvider::new(
         workspace.clone(),
@@ -317,11 +323,10 @@ async fn review(
         context_prompt_from_bundle(context_provider.gather(request, &run_context).await?);
     let provider = provider_for_review(&config)?;
     let approval = CliApprovalBroker::new(config.policy.approval, config.non_interactive);
-    let executor =
-        CodingEffectExecutor::new(workspace.clone(), commands.clone(), git.clone(), searcher);
+    let executor = coding_executor(workspace.clone(), commands.clone(), git.clone(), searcher);
     let harness = BasicHarness::new(
         executor,
-        DefaultPolicyEngine,
+        CodingPolicyEngine::conservative(),
         approval.clone(),
         JsonlAuditSink::new(store.clone(), session.session_id.clone()),
         JsonlTranscriptStore::new(store.clone(), session.session_id.clone()),
@@ -406,6 +411,7 @@ async fn resume(
         config.snapshot(),
         Some(previous.session_id.clone()),
     );
+    add_advisory_warning(&mut session, &config);
     store.save(&session)?;
     let run_context = run_context(&session.session_id, config.policy.command_timeout);
     append_cli_event(
@@ -416,8 +422,10 @@ async fn resume(
         json!({
             "parent_session_id": previous.session_id,
             "dirty_baseline_changed": dirty_changed,
+            "resume_mode": "summary",
         }),
     )?;
+    append_advisory_event(&store, &session.session_id, &run_context, &config)?;
 
     let transcript_summary = store
         .transcript_text(&session_id)?
@@ -441,11 +449,10 @@ async fn resume(
     );
     let provider = provider_for_code(&config, &task)?;
     let approval = CliApprovalBroker::new(config.policy.approval, config.non_interactive);
-    let executor =
-        CodingEffectExecutor::new(workspace.clone(), commands.clone(), git.clone(), searcher);
+    let executor = coding_executor(workspace.clone(), commands.clone(), git.clone(), searcher);
     let harness = BasicHarness::new(
         executor,
-        DefaultPolicyEngine,
+        CodingPolicyEngine::conservative(),
         approval.clone(),
         JsonlAuditSink::new(store.clone(), session.session_id.clone()),
         JsonlTranscriptStore::new(store.clone(), session.session_id.clone()),
@@ -516,6 +523,10 @@ fn config_check(config: CliConfig, json_output: bool) -> Result<(), CliError> {
         println!("api_key_env: {}", snapshot.provider.api_key_env);
         println!("sandbox: {:?}", snapshot.policy.sandbox);
         println!("network: {:?}", snapshot.policy.network);
+        println!(
+            "advisory_local_executor: {}",
+            snapshot.policy.advisory_local_executor
+        );
         println!("approval: {:?}", snapshot.policy.approval);
         println!("non_interactive: {}", snapshot.non_interactive);
     }
@@ -646,11 +657,65 @@ type WorkspaceStack = (
 
 fn workspace_stack(config: &CliConfig) -> Result<WorkspaceStack, CliError> {
     let workspace = LocalWorkspace::new(&config.workspace_root)?;
-    let commands = LocalCommandExecutor::new(workspace.clone()).with_advisory_policy(false);
+    let commands = LocalCommandExecutor::new(workspace.clone())
+        .with_advisory_policy(config.policy.advisory_local_executor);
     let git = CliGitInspector::new(commands.clone());
     let searcher = WorkspaceSearcher::new(workspace.clone());
     let instructions = DefaultInstructionResolver::new(workspace.clone());
     Ok((workspace, commands, git, searcher, instructions))
+}
+
+type LocalCliCommandExecutor = LocalCommandExecutor<LocalWorkspace>;
+type LocalCliGitInspector = CliGitInspector<LocalCliCommandExecutor>;
+type LocalCliSearcher = WorkspaceSearcher<LocalWorkspace>;
+type LocalCliCodingExecutor = CodingEffectExecutor<
+    LocalWorkspace,
+    LocalCliCommandExecutor,
+    LocalCliGitInspector,
+    LocalCliSearcher,
+>;
+
+fn coding_executor(
+    workspace: LocalWorkspace,
+    commands: LocalCliCommandExecutor,
+    git: LocalCliGitInspector,
+    searcher: LocalCliSearcher,
+) -> LocalCliCodingExecutor {
+    CodingEffectExecutor::new(workspace, commands, git, searcher).with_config(
+        CodingExecutorConfig::default()
+            .with_command_policy_capability_mode(PolicyCapabilityMode::AllowAdvisory),
+    )
+}
+
+fn add_advisory_warning(session: &mut CliSessionEnvelope, config: &CliConfig) {
+    if config.policy.advisory_local_executor {
+        session
+            .task_state
+            .warnings
+            .push(ADVISORY_LOCAL_EXECUTOR_WARNING.to_string());
+    }
+}
+
+fn append_advisory_event(
+    store: &CliSessionStore,
+    session_id: &str,
+    context: &RunContext,
+    config: &CliConfig,
+) -> Result<(), CliError> {
+    if !config.policy.advisory_local_executor {
+        return Ok(());
+    }
+    append_cli_event(
+        store,
+        session_id,
+        context,
+        "advisory_local_executor",
+        json!({
+            "message": ADVISORY_LOCAL_EXECUTOR_WARNING,
+            "sandbox_enforced": false,
+            "network_enforced": false,
+        }),
+    )
 }
 
 async fn workspace_fingerprint<G>(git: &G, context: &RunContext) -> WorkspaceFingerprint
@@ -817,6 +882,7 @@ where
         changed_files,
         pre_existing_dirty_files: input.pre_existing_dirty_files,
         verification: Vec::new(),
+        warnings: input.session.task_state.warnings.clone(),
         approvals: input.session.task_state.approvals.clone(),
         denied_effects,
         truncated: workspace_diff.truncated,
@@ -862,6 +928,7 @@ mod tests {
             policy: PolicyConfig {
                 sandbox: SandboxPolicy::WorkspaceWrite,
                 network: NetworkPolicy::Deny,
+                advisory_local_executor: true,
                 approval: ApprovalMode::Deny,
                 command_timeout: Duration::from_secs(5),
             },

@@ -29,6 +29,7 @@ use crate::effect::{
 use crate::provider::{Provider, ProviderError, ProviderRequestContext};
 use crate::run::{Artifact, RunContext, RunMetadata, RunOutput, RunRequest};
 use async_trait::async_trait;
+use futures::stream::{FuturesUnordered, StreamExt};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
 use std::fmt;
@@ -56,14 +57,10 @@ pub struct HarnessRuntime<P, H> {
 pub struct HarnessRuntimeConfig {
     /// Maximum number of agent actions before the runtime fails the run.
     pub(crate) max_agent_steps: usize,
-    /// Intended upper bound for batch effect concurrency.
-    ///
-    /// The default [`Harness::execute_batch`] is sequential. Custom harness
-    /// implementations can read their own configuration to use this value's
-    /// semantic equivalent.
+    /// Upper bound for [`AgentAction::RequestEffects`] execution concurrency.
     pub(crate) max_effect_batch_concurrency: usize,
-    /// Whether a batch effect runtime should fail the whole run on the first
-    /// harness error.
+    /// Whether a batch effect runtime should stop on the first harness
+    /// infrastructure error.
     ///
     /// Effect-level denied/failed/timed-out results should normally be
     /// represented as [`EffectObservation`] values, not as runtime errors.
@@ -97,12 +94,12 @@ impl HarnessRuntimeConfig {
         self
     }
 
-    /// Intended upper bound for batch effect concurrency.
+    /// Upper bound for `RequestEffects` execution concurrency.
     pub fn max_effect_batch_concurrency(&self) -> usize {
         self.max_effect_batch_concurrency
     }
 
-    /// Returns a config with an updated batch effect concurrency hint.
+    /// Returns a config with an updated batch effect concurrency limit.
     pub fn with_max_effect_batch_concurrency(
         mut self,
         max_effect_batch_concurrency: usize,
@@ -175,7 +172,7 @@ where
                     Observation::Effect(observation)
                 }
                 AgentAction::RequestEffects { requests } => {
-                    let observations = self.harness.execute_batch(requests, &context).await?;
+                    let observations = self.execute_effect_batch(requests, &context).await?;
                     Observation::Effects(observations)
                 }
                 _ => {
@@ -191,6 +188,80 @@ where
         ))
     }
 
+    async fn execute_effect_batch(
+        &self,
+        requests: Vec<EffectRequest>,
+        context: &RunContext,
+    ) -> Result<Vec<EffectObservation>, HarnessError> {
+        check_run_context(context)?;
+        if requests.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let concurrency = self.config.max_effect_batch_concurrency.max(1);
+        if concurrency == 1 {
+            let mut observations = Vec::with_capacity(requests.len());
+            for request in requests {
+                let effect_id = request.id.clone();
+                match self.harness.execute(request, context).await {
+                    Ok(observation) => observations.push(observation),
+                    Err(error) if self.config.fail_fast_effect_batches => return Err(error),
+                    Err(error) if is_terminal_context_error(&error) => return Err(error),
+                    Err(error) => {
+                        observations.push(observation_from_harness_error(effect_id, error))
+                    }
+                }
+            }
+            return Ok(observations);
+        }
+
+        let request_count = requests.len();
+        let mut pending = requests.into_iter().enumerate();
+        let mut in_flight = FuturesUnordered::new();
+        let mut observations: Vec<Option<EffectObservation>> = std::iter::repeat_with(|| None)
+            .take(request_count)
+            .collect();
+
+        for _ in 0..concurrency {
+            let Some((index, request)) = pending.next() else {
+                break;
+            };
+            in_flight.push(execute_indexed_effect(
+                &self.harness,
+                index,
+                request,
+                context,
+            ));
+        }
+
+        while let Some((index, effect_id, result)) = in_flight.next().await {
+            match result {
+                Ok(observation) => observations[index] = Some(observation),
+                Err(error) if self.config.fail_fast_effect_batches => return Err(error),
+                Err(error) if is_terminal_context_error(&error) => return Err(error),
+                Err(error) => {
+                    observations[index] = Some(observation_from_harness_error(effect_id, error))
+                }
+            }
+
+            if let Some((next_index, request)) = pending.next() {
+                in_flight.push(execute_indexed_effect(
+                    &self.harness,
+                    next_index,
+                    request,
+                    context,
+                ));
+            }
+        }
+
+        Ok(observations
+            .into_iter()
+            .map(|observation| {
+                observation.expect("batch scheduler must fill every requested observation")
+            })
+            .collect())
+    }
+
     async fn execute_model_request(
         &self,
         request: ModelRequest,
@@ -204,6 +275,20 @@ where
             .await?;
         Ok(ModelObservation::new(request_id, response))
     }
+}
+
+async fn execute_indexed_effect<'a, H>(
+    harness: &'a H,
+    index: usize,
+    request: EffectRequest,
+    context: &'a RunContext,
+) -> (usize, String, Result<EffectObservation, HarnessError>)
+where
+    H: Harness,
+{
+    let effect_id = request.id.clone();
+    let result = harness.execute(request, context).await;
+    (index, effect_id, result)
 }
 
 /// Governs and executes one or more effect requests.
@@ -1119,6 +1204,77 @@ pub enum TranscriptRecord {
         /// Action summary.
         action: AgentActionSummary,
     },
+    /// Effect request lifecycle started.
+    EffectRequested {
+        /// Run id.
+        run_id: String,
+        /// Effect id.
+        effect_id: String,
+        /// Effect kind.
+        kind: EffectKind,
+        /// Redacted effect description.
+        description: String,
+        /// Requested risk.
+        risk: RiskLevel,
+    },
+    /// Effect risk classification summary.
+    EffectClassified {
+        /// Run id.
+        run_id: String,
+        /// Effect id.
+        effect_id: String,
+        /// Requested risk.
+        requested_risk: RiskLevel,
+        /// Effective risk.
+        effective_risk: RiskLevel,
+        /// Classification reasons.
+        reasons: Vec<String>,
+    },
+    /// Policy decision summary.
+    PolicyDecided {
+        /// Run id.
+        run_id: String,
+        /// Effect id.
+        effect_id: String,
+        /// Decision summary.
+        decision: String,
+    },
+    /// Approval was requested.
+    ApprovalRequested {
+        /// Run id.
+        run_id: String,
+        /// Effect id.
+        effect_id: String,
+        /// Approval reason.
+        reason: String,
+    },
+    /// Approval decision was made.
+    ApprovalDecided {
+        /// Run id.
+        run_id: String,
+        /// Effect id.
+        effect_id: String,
+        /// Decision summary.
+        decision: String,
+    },
+    /// Executor started.
+    ExecutorStarted {
+        /// Run id.
+        run_id: String,
+        /// Effect id.
+        effect_id: String,
+        /// Execution policy summary.
+        policy: ExecutionPolicySummary,
+    },
+    /// Executor reached a terminal status.
+    ExecutorCompleted {
+        /// Run id.
+        run_id: String,
+        /// Effect id.
+        effect_id: String,
+        /// Terminal status.
+        status: EffectStatus,
+    },
     /// Model observation summary.
     ModelObservation {
         /// Run id.
@@ -1508,6 +1664,17 @@ where
             context,
         )
         .await?;
+        self.transcript(
+            TranscriptRecord::EffectRequested {
+                run_id: context.run_id.clone(),
+                effect_id: request.id.clone(),
+                kind: request.kind.clone(),
+                description: request.description.clone(),
+                risk: request.risk,
+            },
+            context,
+        )
+        .await?;
 
         let classified = self.classifier.classify(request, context).await?;
         self.audit(
@@ -1520,13 +1687,34 @@ where
             context,
         )
         .await?;
+        self.transcript(
+            TranscriptRecord::EffectClassified {
+                run_id: context.run_id.clone(),
+                effect_id: classified.request.id.clone(),
+                requested_risk: classified.requested_risk,
+                effective_risk: classified.effective_risk,
+                reasons: classified.reasons.clone(),
+            },
+            context,
+        )
+        .await?;
 
         let execution_policy = self.execution_policy(&classified, context);
         let decision = self.policy.evaluate(&classified, context).await?;
+        let decision_summary = policy_decision_summary(&decision);
         self.audit(
             AuditEvent::PolicyDecided {
                 effect_id: classified.request.id.clone(),
-                decision: policy_decision_summary(&decision),
+                decision: decision_summary.clone(),
+            },
+            context,
+        )
+        .await?;
+        self.transcript(
+            TranscriptRecord::PolicyDecided {
+                run_id: context.run_id.clone(),
+                effect_id: classified.request.id.clone(),
+                decision: decision_summary,
             },
             context,
         )
@@ -1549,6 +1737,15 @@ where
                         context,
                     )
                     .await?;
+                    self.transcript(
+                        TranscriptRecord::ApprovalDecided {
+                            run_id: context.run_id.clone(),
+                            effect_id: classified.request.id.clone(),
+                            decision: "allow for session".to_string(),
+                        },
+                        context,
+                    )
+                    .await?;
                 } else {
                     let approval_request = ApprovalRequest {
                         run_id: context.run_id.clone(),
@@ -1565,16 +1762,35 @@ where
                     self.audit(
                         AuditEvent::ApprovalRequested {
                             effect_id: classified.request.id.clone(),
+                            reason: reason.clone(),
+                        },
+                        context,
+                    )
+                    .await?;
+                    self.transcript(
+                        TranscriptRecord::ApprovalRequested {
+                            run_id: context.run_id.clone(),
+                            effect_id: classified.request.id.clone(),
                             reason,
                         },
                         context,
                     )
                     .await?;
                     let approval = self.approval.approve(approval_request, context).await?;
+                    let approval_summary = approval_decision_summary(&approval);
                     self.audit(
                         AuditEvent::ApprovalDecided {
                             effect_id: classified.request.id.clone(),
-                            decision: approval_decision_summary(&approval),
+                            decision: approval_summary.clone(),
+                        },
+                        context,
+                    )
+                    .await?;
+                    self.transcript(
+                        TranscriptRecord::ApprovalDecided {
+                            run_id: context.run_id.clone(),
+                            effect_id: classified.request.id.clone(),
+                            decision: approval_summary,
                         },
                         context,
                     )
@@ -1599,6 +1815,15 @@ where
             context,
         )
         .await?;
+        self.transcript(
+            TranscriptRecord::ExecutorStarted {
+                run_id: context.run_id.clone(),
+                effect_id: classified.request.id.clone(),
+                policy: ExecutionPolicySummary::from_policy(&execution_policy),
+            },
+            context,
+        )
+        .await?;
         let effect_id = classified.request.id.clone();
         let execution = run_executor_with_context(
             &self.executor,
@@ -1615,6 +1840,15 @@ where
                     AuditEvent::EffectCompleted {
                         effect_id: effect_id.clone(),
                         truncated: limited.truncated,
+                    },
+                    context,
+                )
+                .await?;
+                self.transcript(
+                    TranscriptRecord::ExecutorCompleted {
+                        run_id: context.run_id.clone(),
+                        effect_id: effect_id.clone(),
+                        status: EffectStatus::Succeeded,
                     },
                     context,
                 )
@@ -1654,10 +1888,45 @@ where
                     context,
                 )
                 .await?;
+                self.transcript(
+                    TranscriptRecord::ExecutorCompleted {
+                        run_id: context.run_id.clone(),
+                        effect_id: effect_id.clone(),
+                        status: EffectStatus::TimedOut,
+                    },
+                    context,
+                )
+                .await?;
                 self.terminal_observation(
                     effect_id,
                     EffectStatus::TimedOut,
                     format!("effect timed out: {reason}"),
+                    context,
+                )
+                .await
+            }
+            Err(ExecutionError::Denied(reason)) => {
+                self.audit(
+                    AuditEvent::EffectDenied {
+                        effect_id: effect_id.clone(),
+                        reason: reason.clone(),
+                    },
+                    context,
+                )
+                .await?;
+                self.transcript(
+                    TranscriptRecord::ExecutorCompleted {
+                        run_id: context.run_id.clone(),
+                        effect_id: effect_id.clone(),
+                        status: EffectStatus::Denied,
+                    },
+                    context,
+                )
+                .await?;
+                self.terminal_observation(
+                    effect_id,
+                    EffectStatus::Denied,
+                    format!("effect denied: {reason}"),
                     context,
                 )
                 .await
@@ -1667,6 +1936,15 @@ where
                     AuditEvent::EffectCancelled {
                         effect_id: effect_id.clone(),
                         reason: reason.clone(),
+                    },
+                    context,
+                )
+                .await?;
+                self.transcript(
+                    TranscriptRecord::ExecutorCompleted {
+                        run_id: context.run_id.clone(),
+                        effect_id: effect_id.clone(),
+                        status: EffectStatus::Cancelled,
                     },
                     context,
                 )
@@ -1685,6 +1963,15 @@ where
                     AuditEvent::EffectFailed {
                         effect_id: effect_id.clone(),
                         reason: reason.clone(),
+                    },
+                    context,
+                )
+                .await?;
+                self.transcript(
+                    TranscriptRecord::ExecutorCompleted {
+                        run_id: context.run_id.clone(),
+                        effect_id: effect_id.clone(),
+                        status: EffectStatus::Failed,
                     },
                     context,
                 )
@@ -1862,6 +2149,9 @@ pub enum ExecutionError {
     /// Execution failed.
     #[error("failed: {0}")]
     Failed(String),
+    /// Execution was denied by executor-side policy or capability checks.
+    #[error("denied: {0}")]
+    Denied(String),
     /// Execution timed out.
     #[error("timed out: {0}")]
     TimedOut(String),
@@ -1971,6 +2261,24 @@ fn check_run_context(context: &RunContext) -> Result<(), HarnessError> {
         Err(HarnessError::DeadlineExceeded)
     } else {
         Ok(())
+    }
+}
+
+fn is_terminal_context_error(error: &HarnessError) -> bool {
+    matches!(
+        error,
+        HarnessError::Cancelled | HarnessError::DeadlineExceeded
+    )
+}
+
+fn observation_from_harness_error(effect_id: String, error: HarnessError) -> EffectObservation {
+    let mut metadata = RunMetadata::new();
+    metadata.insert("harness_error".to_string(), serde_json::json!(true));
+    EffectObservation {
+        effect_id,
+        status: EffectStatus::Failed,
+        output: EffectOutput::text(format!("effect failed: {error}")),
+        metadata,
     }
 }
 
@@ -2496,6 +2804,150 @@ mod tests {
         assert_eq!(observations[1].status, EffectStatus::Denied);
     }
 
+    #[derive(Debug, Clone)]
+    struct ConcurrencyHarness {
+        in_flight: Arc<std::sync::atomic::AtomicUsize>,
+        max_seen: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl Harness for ConcurrencyHarness {
+        async fn execute(
+            &self,
+            request: EffectRequest,
+            _context: &RunContext,
+        ) -> Result<EffectObservation, HarnessError> {
+            let current = self
+                .in_flight
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                + 1;
+            self.max_seen
+                .fetch_max(current, std::sync::atomic::Ordering::SeqCst);
+            let delay = if request.id == "effect-1" { 30 } else { 5 };
+            tokio::time::sleep(Duration::from_millis(delay)).await;
+            self.in_flight
+                .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(EffectObservation::succeeded(
+                request.id.clone(),
+                format!("done {}", request.id),
+            ))
+        }
+    }
+
+    #[tokio::test]
+    async fn runtime_batch_honors_concurrency_limit_and_request_order() {
+        let in_flight = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let max_seen = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let harness = ConcurrencyHarness {
+            in_flight,
+            max_seen: max_seen.clone(),
+        };
+        let runtime = HarnessRuntime::new(FakeProvider::new([]), harness)
+            .with_config(HarnessRuntimeConfig::default().with_max_effect_batch_concurrency(2));
+        let observations = runtime
+            .execute_effect_batch(
+                vec![
+                    EffectRequest::new(EffectKind::ReadFile, "one", json!({})).with_id("effect-1"),
+                    EffectRequest::new(EffectKind::ReadFile, "two", json!({})).with_id("effect-2"),
+                    EffectRequest::new(EffectKind::ReadFile, "three", json!({}))
+                        .with_id("effect-3"),
+                ],
+                &RunContext::new("run-batch-runtime"),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            observations
+                .iter()
+                .map(|observation| observation.effect_id.as_str())
+                .collect::<Vec<_>>(),
+            ["effect-1", "effect-2", "effect-3"]
+        );
+        assert_eq!(max_seen.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    #[derive(Debug, Clone)]
+    struct ErroringHarness {
+        seen: Arc<Mutex<Vec<String>>>,
+    }
+
+    #[async_trait]
+    impl Harness for ErroringHarness {
+        async fn execute(
+            &self,
+            request: EffectRequest,
+            _context: &RunContext,
+        ) -> Result<EffectObservation, HarnessError> {
+            self.seen
+                .lock()
+                .expect("seen lock poisoned")
+                .push(request.id.clone());
+            if request.id == "bad" {
+                return Err(HarnessError::Execution(ExecutionError::Failed(
+                    "boom".to_string(),
+                )));
+            }
+            Ok(EffectObservation::succeeded(request.id, "ok"))
+        }
+    }
+
+    #[tokio::test]
+    async fn runtime_batch_fail_fast_stops_after_first_harness_error() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let runtime = HarnessRuntime::new(
+            FakeProvider::new([]),
+            ErroringHarness { seen: seen.clone() },
+        )
+        .with_config(
+            HarnessRuntimeConfig::default()
+                .with_max_effect_batch_concurrency(1)
+                .with_fail_fast_effect_batches(true),
+        );
+        let error = runtime
+            .execute_effect_batch(
+                vec![
+                    EffectRequest::new(EffectKind::ReadFile, "bad", json!({})).with_id("bad"),
+                    EffectRequest::new(EffectKind::ReadFile, "later", json!({})).with_id("later"),
+                ],
+                &RunContext::new("run-batch-fail-fast"),
+            )
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, HarnessError::Execution(_)));
+        assert_eq!(seen.lock().expect("seen lock poisoned").as_slice(), ["bad"]);
+    }
+
+    #[tokio::test]
+    async fn runtime_batch_fail_open_collects_error_observation_and_continues() {
+        let runtime = HarnessRuntime::new(
+            FakeProvider::new([]),
+            ErroringHarness {
+                seen: Arc::new(Mutex::new(Vec::new())),
+            },
+        )
+        .with_config(
+            HarnessRuntimeConfig::default()
+                .with_max_effect_batch_concurrency(1)
+                .with_fail_fast_effect_batches(false),
+        );
+        let observations = runtime
+            .execute_effect_batch(
+                vec![
+                    EffectRequest::new(EffectKind::ReadFile, "bad", json!({})).with_id("bad"),
+                    EffectRequest::new(EffectKind::ReadFile, "later", json!({})).with_id("later"),
+                ],
+                &RunContext::new("run-batch-fail-open"),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(observations[0].effect_id, "bad");
+        assert_eq!(observations[0].status, EffectStatus::Failed);
+        assert_eq!(observations[1].status, EffectStatus::Succeeded);
+    }
+
     #[tokio::test]
     async fn approval_deny_becomes_denied_observation() {
         let harness = BasicHarness::new(
@@ -2607,6 +3059,35 @@ mod tests {
             .unwrap();
         assert_eq!(observation.status, EffectStatus::Failed);
         assert!(observation.output.observation_for_model.contains("boom"));
+    }
+
+    #[tokio::test]
+    async fn executor_denial_is_denied_observation() {
+        let harness = BasicHarness::new(
+            StaticEffectExecutor::new().with_error(
+                "effect-1",
+                ExecutionError::Denied("capability mismatch".to_string()),
+            ),
+            DefaultPolicyEngine,
+            AlwaysAllowApprovalBroker,
+            NoopAuditSink,
+            NoopTranscriptStore,
+        );
+        let observation = harness
+            .execute(
+                EffectRequest::new(EffectKind::ReadFile, "read", json!({})).with_id("effect-1"),
+                &RunContext::new("run-denied-by-executor"),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(observation.status, EffectStatus::Denied);
+        assert!(
+            observation
+                .output
+                .observation_for_model
+                .contains("capability mismatch")
+        );
     }
 
     #[derive(Debug, Default, Clone, Copy)]
@@ -2761,6 +3242,47 @@ mod tests {
         assert!(!audit_json.contains("secret-token"));
         let transcript_json = serde_json::to_string(&transcript.records()).unwrap();
         assert!(!transcript_json.contains("secret-token"));
+    }
+
+    #[tokio::test]
+    async fn transcript_records_effect_lifecycle() {
+        let transcript = VecTranscriptStore::new();
+        let harness = BasicHarness::new(
+            StaticEffectExecutor::new().with_output("effect-1", RawEffectOutput::text("ok")),
+            DefaultPolicyEngine,
+            AlwaysAllowApprovalBroker,
+            NoopAuditSink,
+            transcript.clone(),
+        );
+        let observation = harness
+            .execute(
+                EffectRequest::new(EffectKind::ReadFile, "read config", json!({}))
+                    .with_id("effect-1"),
+                &RunContext::new("run-transcript-lifecycle"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(observation.status, EffectStatus::Succeeded);
+
+        let records = transcript.records();
+        assert!(records.iter().any(
+            |record| matches!(record, TranscriptRecord::EffectRequested { effect_id, .. } if effect_id == "effect-1")
+        ));
+        assert!(records.iter().any(
+            |record| matches!(record, TranscriptRecord::EffectClassified { effect_id, .. } if effect_id == "effect-1")
+        ));
+        assert!(records.iter().any(
+            |record| matches!(record, TranscriptRecord::PolicyDecided { effect_id, .. } if effect_id == "effect-1")
+        ));
+        assert!(records.iter().any(
+            |record| matches!(record, TranscriptRecord::ExecutorStarted { effect_id, .. } if effect_id == "effect-1")
+        ));
+        assert!(records.iter().any(
+            |record| matches!(record, TranscriptRecord::ExecutorCompleted { effect_id, status, .. } if effect_id == "effect-1" && *status == EffectStatus::Succeeded)
+        ));
+        assert!(records.iter().any(
+            |record| matches!(record, TranscriptRecord::EffectObservation { effect_id, status, .. } if effect_id == "effect-1" && *status == EffectStatus::Succeeded)
+        ));
     }
 
     #[derive(Debug, Default, Clone, Copy)]

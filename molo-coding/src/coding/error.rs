@@ -71,6 +71,9 @@ impl From<CodingError> for ExecutionError {
             CodingError::Command(CommandError::Cancelled { message }) => {
                 ExecutionError::Cancelled(message)
             }
+            CodingError::Command(CommandError::UnsupportedPolicy { message }) => {
+                ExecutionError::Denied(message)
+            }
             CodingError::UnexpectedKind { message } => ExecutionError::Unsupported(message),
             other => ExecutionError::Failed(other.to_string()),
         }

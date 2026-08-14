@@ -136,26 +136,185 @@ impl CommandRequest {
     }
 }
 
+/// How strictly policy/capability mismatches are handled.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub enum PolicyCapabilityMode {
+    /// Required sandbox or network restrictions must be technically enforced.
+    #[default]
+    RequireEnforced,
+    /// Advisory execution may continue, but reports must say so explicitly.
+    AllowAdvisory,
+}
+
+impl PolicyCapabilityMode {
+    /// Returns true when advisory execution is explicitly allowed.
+    pub fn allows_advisory(self) -> bool {
+        matches!(self, Self::AllowAdvisory)
+    }
+}
+
+/// Structured enforcement status for a policy dimension.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub enum PolicyEnforcementStatus {
+    /// The requested policy was technically enforced by the executor backend.
+    Enforced,
+    /// The executor ran without technical enforcement and reported the downgrade.
+    Advisory,
+    /// The executor does not support this policy dimension.
+    Unsupported,
+    /// This policy dimension was not requested for the command.
+    NotRequested,
+    /// The executor could not determine whether enforcement happened.
+    Unknown,
+}
+
+impl PolicyEnforcementStatus {
+    /// Returns true when the status is [`PolicyEnforcementStatus::Enforced`].
+    pub fn is_enforced(self) -> bool {
+        matches!(self, Self::Enforced)
+    }
+
+    /// Returns true when the status is [`PolicyEnforcementStatus::Advisory`].
+    pub fn is_advisory(self) -> bool {
+        matches!(self, Self::Advisory)
+    }
+}
+
+/// Command executor backend family.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub enum CommandExecutorBackend {
+    /// Plain local process execution.
+    LocalProcess,
+    /// Host-provided backend outside molo's built-in executors.
+    HostProvided,
+    /// OS sandbox backend.
+    Sandbox,
+    /// Container backend.
+    Container,
+    /// Remote isolated worker backend.
+    Remote,
+    /// Application-specific backend kind.
+    Custom(String),
+}
+
+/// Executor identity included in capability and execution reports.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CommandExecutorIdentity {
+    /// Executor name.
+    pub name: String,
+    /// Executor version, when available.
+    pub version: Option<String>,
+    /// Backend kind.
+    pub backend: CommandExecutorBackend,
+    /// Platform summary.
+    pub platform: String,
+    /// Host-owned metadata.
+    pub metadata: RunMetadata,
+}
+
+impl CommandExecutorIdentity {
+    /// Constructs an executor identity.
+    pub fn new(name: impl Into<String>, backend: CommandExecutorBackend) -> Self {
+        Self {
+            name: name.into(),
+            version: None,
+            backend,
+            platform: format!("{}/{}", std::env::consts::OS, std::env::consts::ARCH),
+            metadata: RunMetadata::new(),
+        }
+    }
+
+    /// Constructs the identity for [`LocalCommandExecutor`].
+    pub fn local_process() -> Self {
+        Self::new(
+            "local-command-executor",
+            CommandExecutorBackend::LocalProcess,
+        )
+        .with_version(env!("CARGO_PKG_VERSION"))
+    }
+
+    /// Sets executor version.
+    pub fn with_version(mut self, version: impl Into<String>) -> Self {
+        self.version = Some(version.into());
+        self
+    }
+
+    /// Sets host-owned metadata.
+    pub fn with_metadata(mut self, metadata: RunMetadata) -> Self {
+        self.metadata = metadata;
+        self
+    }
+}
+
 /// Executor capability report.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CommandExecutorCapabilities {
+    /// Executor identity.
+    pub identity: CommandExecutorIdentity,
     /// Whether non-PTY one-shot command execution is supported.
     pub one_shot: bool,
     /// Whether PTY command execution is supported.
     pub pty: bool,
     /// Whether the executor can technically enforce sandbox policy.
+    ///
+    /// Prefer [`CommandExecutorCapabilities::sandbox`] for new code.
     pub sandbox_enforcement: bool,
     /// Whether the executor can technically enforce network policy.
+    ///
+    /// Prefer [`CommandExecutorCapabilities::network`] for new code.
     pub network_enforcement: bool,
+    /// Sandbox capability status for restrictive sandbox policies.
+    pub sandbox: PolicyEnforcementStatus,
+    /// Network capability status for restrictive network policies.
+    pub network: PolicyEnforcementStatus,
+    /// Whether timeout/cancellation can clean up the full process tree.
+    pub process_cleanup: PolicyEnforcementStatus,
+    /// Resource limit enforcement status beyond wall-time/output limits.
+    pub resource_limits: PolicyEnforcementStatus,
+    /// Host-owned capability metadata.
+    pub metadata: RunMetadata,
 }
 
 impl Default for CommandExecutorCapabilities {
     fn default() -> Self {
+        Self::local_process()
+    }
+}
+
+impl CommandExecutorCapabilities {
+    /// Capability report for the built-in local executor.
+    pub fn local_process() -> Self {
         Self {
+            identity: CommandExecutorIdentity::local_process(),
             one_shot: true,
             pty: false,
             sandbox_enforcement: false,
             network_enforcement: false,
+            sandbox: PolicyEnforcementStatus::Advisory,
+            network: PolicyEnforcementStatus::Advisory,
+            process_cleanup: PolicyEnforcementStatus::Advisory,
+            resource_limits: PolicyEnforcementStatus::Unsupported,
+            metadata: RunMetadata::new(),
+        }
+    }
+
+    /// Capability report for a host executor that enforces sandbox and network
+    /// restrictions.
+    pub fn enforced(identity: CommandExecutorIdentity) -> Self {
+        Self {
+            identity,
+            one_shot: true,
+            pty: false,
+            sandbox_enforcement: true,
+            network_enforcement: true,
+            sandbox: PolicyEnforcementStatus::Enforced,
+            network: PolicyEnforcementStatus::Enforced,
+            process_cleanup: PolicyEnforcementStatus::Enforced,
+            resource_limits: PolicyEnforcementStatus::Unknown,
+            metadata: RunMetadata::new(),
         }
     }
 }
@@ -194,6 +353,8 @@ pub enum CommandStatus {
 /// Report describing which policies were enforced by the command executor.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PolicyEnforcementReport {
+    /// Executor identity.
+    pub executor: CommandExecutorIdentity,
     /// Sandbox policy requested by the harness.
     pub sandbox: SandboxPolicy,
     /// Network policy requested by the harness.
@@ -202,8 +363,18 @@ pub struct PolicyEnforcementReport {
     pub sandbox_enforced: bool,
     /// Whether the network policy was technically enforced.
     pub network_enforced: bool,
+    /// Structured sandbox enforcement status.
+    pub sandbox_status: PolicyEnforcementStatus,
+    /// Structured network enforcement status.
+    pub network_status: PolicyEnforcementStatus,
+    /// Process tree cleanup status after timeout/cancellation.
+    pub process_cleanup_status: PolicyEnforcementStatus,
+    /// Resource limit enforcement status.
+    pub resource_limit_status: PolicyEnforcementStatus,
     /// Warnings about advisory or unsupported policy.
     pub warnings: Vec<String>,
+    /// Host-owned enforcement metadata.
+    pub metadata: RunMetadata,
 }
 
 /// Command output.
@@ -240,11 +411,68 @@ pub trait CommandExecutor: Send + Sync {
     ) -> Result<CommandOutput, CommandError>;
 }
 
+/// Validates that executor capabilities can satisfy a command policy before
+/// execution starts.
+///
+/// # Errors
+///
+/// Returns [`CommandError::UnsupportedPolicy`] when required sandbox or
+/// network enforcement is missing and advisory mode is not enabled.
+pub fn validate_command_capabilities(
+    capabilities: &CommandExecutorCapabilities,
+    request: &CommandRequest,
+    policy: &ExecutionPolicy,
+    mode: PolicyCapabilityMode,
+) -> Result<(), CommandError> {
+    let sandbox = requested_sandbox(request, policy);
+    let network = requested_network(request, policy);
+    validate_required_status(
+        "sandbox",
+        sandbox_requires_enforcement(&sandbox),
+        capabilities.sandbox,
+        mode,
+    )?;
+    validate_required_status(
+        "network",
+        network_requires_enforcement(&network),
+        capabilities.network,
+        mode,
+    )
+}
+
+/// Validates that an executor's post-run report matches requested policy and
+/// declared capabilities.
+///
+/// # Errors
+///
+/// Returns [`CommandError::UnsupportedPolicy`] when the report downgrades or
+/// contradicts required enforcement.
+pub fn validate_policy_enforcement_report(
+    capabilities: &CommandExecutorCapabilities,
+    report: &PolicyEnforcementReport,
+    mode: PolicyCapabilityMode,
+) -> Result<(), CommandError> {
+    validate_report_status(
+        "sandbox",
+        sandbox_requires_enforcement(&report.sandbox),
+        capabilities.sandbox,
+        report.sandbox_status,
+        mode,
+    )?;
+    validate_report_status(
+        "network",
+        network_requires_enforcement(&report.network),
+        capabilities.network,
+        report.network_status,
+        mode,
+    )
+}
+
 /// Local one-shot command executor.
 #[derive(Debug, Clone)]
 pub struct LocalCommandExecutor<W> {
     workspace: W,
-    allow_advisory_policy: bool,
+    policy_capability_mode: PolicyCapabilityMode,
 }
 
 impl<W> LocalCommandExecutor<W> {
@@ -252,14 +480,24 @@ impl<W> LocalCommandExecutor<W> {
     pub fn new(workspace: W) -> Self {
         Self {
             workspace,
-            allow_advisory_policy: false,
+            policy_capability_mode: PolicyCapabilityMode::RequireEnforced,
         }
     }
 
     /// Allows policy modes that cannot be technically enforced locally to be
     /// reported as advisory instead of failing closed.
     pub fn with_advisory_policy(mut self, allow: bool) -> Self {
-        self.allow_advisory_policy = allow;
+        self.policy_capability_mode = if allow {
+            PolicyCapabilityMode::AllowAdvisory
+        } else {
+            PolicyCapabilityMode::RequireEnforced
+        };
+        self
+    }
+
+    /// Sets how this executor handles policy/capability mismatches.
+    pub fn with_policy_capability_mode(mut self, mode: PolicyCapabilityMode) -> Self {
+        self.policy_capability_mode = mode;
         self
     }
 }
@@ -270,7 +508,7 @@ where
     W: Workspace,
 {
     fn capabilities(&self) -> CommandExecutorCapabilities {
-        CommandExecutorCapabilities::default()
+        CommandExecutorCapabilities::local_process()
     }
 
     async fn execute(
@@ -298,25 +536,16 @@ where
             .requested_network
             .clone()
             .unwrap_or_else(|| policy.network().clone());
-        let mut warnings = Vec::new();
-        if !self.allow_advisory_policy
-            && !matches!(
-                sandbox,
-                SandboxPolicy::ReadOnly | SandboxPolicy::WorkspaceWrite
-            )
-        {
-            return Err(CommandError::UnsupportedPolicy {
-                message: format!("unsupported sandbox policy: {sandbox:?}"),
-            });
-        }
-        if !self.allow_advisory_policy && !matches!(network, NetworkPolicy::Deny) {
-            return Err(CommandError::UnsupportedPolicy {
-                message: format!("unsupported network policy: {network:?}"),
-            });
-        }
-        if self.allow_advisory_policy {
-            warnings.push("sandbox/network policy reported as advisory".to_string());
-        }
+        let capabilities = self.capabilities();
+        validate_command_capabilities(
+            &capabilities,
+            &request,
+            policy,
+            self.policy_capability_mode,
+        )?;
+        let sandbox_status = requested_sandbox_status(&sandbox, capabilities.sandbox);
+        let network_status = requested_network_status(&network, capabilities.network);
+        let mut warnings = advisory_warnings(sandbox_status, network_status);
 
         let cwd = self
             .workspace
@@ -385,12 +614,19 @@ where
         let status = tokio::select! {
             _ = context.cancellation.cancelled() => {
                 let _ = child.kill().await;
+                warnings.push("process tree cleanup is advisory for LocalCommandExecutor".to_string());
                 return Ok(terminal_output(
                     CommandStatus::Cancelled,
                     started.elapsed(),
-                    sandbox,
-                    network,
-                    warnings,
+                    TerminalPolicyReportInput {
+                        executor: capabilities.identity.clone(),
+                        sandbox,
+                        network,
+                        sandbox_status,
+                        network_status,
+                        process_cleanup_status: PolicyEnforcementStatus::Advisory,
+                        warnings,
+                    },
                     &request,
                 ));
             }
@@ -401,12 +637,19 @@ where
                     })?,
                     Err(_) => {
                         let _ = child.kill().await;
+                        warnings.push("process tree cleanup is advisory for LocalCommandExecutor".to_string());
                         return Ok(terminal_output(
                             CommandStatus::TimedOut,
                             started.elapsed(),
-                            sandbox,
-                            network,
-                            warnings,
+                            TerminalPolicyReportInput {
+                                executor: capabilities.identity.clone(),
+                                sandbox,
+                                network,
+                                sandbox_status,
+                                network_status,
+                                process_cleanup_status: PolicyEnforcementStatus::Advisory,
+                                warnings,
+                            },
                             &request,
                         ));
                     }
@@ -432,11 +675,17 @@ where
             duration: started.elapsed(),
             truncated,
             policy_enforcement: PolicyEnforcementReport {
+                executor: capabilities.identity,
                 sandbox,
                 network,
-                sandbox_enforced: false,
-                network_enforced: false,
+                sandbox_enforced: sandbox_status.is_enforced(),
+                network_enforced: network_status.is_enforced(),
+                sandbox_status,
+                network_status,
+                process_cleanup_status: PolicyEnforcementStatus::NotRequested,
+                resource_limit_status: PolicyEnforcementStatus::Unsupported,
                 warnings,
+                metadata: RunMetadata::new(),
             },
             metadata: command_metadata(&request),
         })
@@ -480,6 +729,127 @@ fn choose_timeout(
         .reduce(|left, right| left.min(right))
 }
 
+fn requested_sandbox(request: &CommandRequest, policy: &ExecutionPolicy) -> SandboxPolicy {
+    request
+        .requested_sandbox
+        .clone()
+        .unwrap_or_else(|| policy.sandbox().clone())
+}
+
+fn requested_network(request: &CommandRequest, policy: &ExecutionPolicy) -> NetworkPolicy {
+    request
+        .requested_network
+        .clone()
+        .unwrap_or_else(|| policy.network().clone())
+}
+
+fn sandbox_requires_enforcement(sandbox: &SandboxPolicy) -> bool {
+    matches!(
+        sandbox,
+        SandboxPolicy::ReadOnly | SandboxPolicy::WorkspaceWrite | SandboxPolicy::Custom(_)
+    )
+}
+
+fn network_requires_enforcement(network: &NetworkPolicy) -> bool {
+    matches!(
+        network,
+        NetworkPolicy::Deny | NetworkPolicy::AllowListed(_) | NetworkPolicy::Custom(_)
+    )
+}
+
+fn requested_sandbox_status(
+    sandbox: &SandboxPolicy,
+    capability: PolicyEnforcementStatus,
+) -> PolicyEnforcementStatus {
+    if sandbox_requires_enforcement(sandbox) {
+        capability
+    } else {
+        PolicyEnforcementStatus::NotRequested
+    }
+}
+
+fn requested_network_status(
+    network: &NetworkPolicy,
+    capability: PolicyEnforcementStatus,
+) -> PolicyEnforcementStatus {
+    if network_requires_enforcement(network) {
+        capability
+    } else {
+        PolicyEnforcementStatus::NotRequested
+    }
+}
+
+fn validate_required_status(
+    dimension: &str,
+    requires_enforcement: bool,
+    status: PolicyEnforcementStatus,
+    mode: PolicyCapabilityMode,
+) -> Result<(), CommandError> {
+    if !requires_enforcement {
+        return Ok(());
+    }
+    match status {
+        PolicyEnforcementStatus::Enforced => Ok(()),
+        PolicyEnforcementStatus::Advisory if mode.allows_advisory() => Ok(()),
+        PolicyEnforcementStatus::Advisory => Err(CommandError::UnsupportedPolicy {
+            message: format!(
+                "{dimension} policy requires technical enforcement; executor only supports advisory mode"
+            ),
+        }),
+        PolicyEnforcementStatus::Unsupported => Err(CommandError::UnsupportedPolicy {
+            message: format!("{dimension} policy is unsupported by executor"),
+        }),
+        PolicyEnforcementStatus::NotRequested | PolicyEnforcementStatus::Unknown => {
+            Err(CommandError::UnsupportedPolicy {
+                message: format!("{dimension} policy enforcement status is {status:?}"),
+            })
+        }
+    }
+}
+
+fn validate_report_status(
+    dimension: &str,
+    requires_enforcement: bool,
+    capability: PolicyEnforcementStatus,
+    reported: PolicyEnforcementStatus,
+    mode: PolicyCapabilityMode,
+) -> Result<(), CommandError> {
+    if reported == PolicyEnforcementStatus::Enforced
+        && capability != PolicyEnforcementStatus::Enforced
+    {
+        return Err(CommandError::UnsupportedPolicy {
+            message: format!(
+                "{dimension} report claims enforced but capabilities report {capability:?}"
+            ),
+        });
+    }
+    if capability == PolicyEnforcementStatus::Enforced
+        && requires_enforcement
+        && reported != PolicyEnforcementStatus::Enforced
+    {
+        return Err(CommandError::UnsupportedPolicy {
+            message: format!(
+                "{dimension} capabilities require enforced report but executor returned {reported:?}"
+            ),
+        });
+    }
+    validate_required_status(dimension, requires_enforcement, reported, mode)
+}
+
+fn advisory_warnings(
+    sandbox_status: PolicyEnforcementStatus,
+    network_status: PolicyEnforcementStatus,
+) -> Vec<String> {
+    let mut warnings = Vec::new();
+    if sandbox_status.is_advisory() {
+        warnings.push("sandbox policy is advisory; no OS sandbox was applied".to_string());
+    }
+    if network_status.is_advisory() {
+        warnings.push("network policy is advisory; no network isolation was applied".to_string());
+    }
+    warnings
+}
+
 fn truncate_bytes(bytes: &[u8], max: usize) -> OutputText {
     let truncated = bytes.len() > max;
     let mut selected = bytes.to_vec();
@@ -508,12 +878,20 @@ async fn join_reader(
         })
 }
 
+struct TerminalPolicyReportInput {
+    executor: CommandExecutorIdentity,
+    sandbox: SandboxPolicy,
+    network: NetworkPolicy,
+    sandbox_status: PolicyEnforcementStatus,
+    network_status: PolicyEnforcementStatus,
+    process_cleanup_status: PolicyEnforcementStatus,
+    warnings: Vec<String>,
+}
+
 fn terminal_output(
     status: CommandStatus,
     duration: Duration,
-    sandbox: SandboxPolicy,
-    network: NetworkPolicy,
-    warnings: Vec<String>,
+    policy_report: TerminalPolicyReportInput,
     request: &CommandRequest,
 ) -> CommandOutput {
     CommandOutput {
@@ -523,11 +901,17 @@ fn terminal_output(
         duration,
         truncated: false,
         policy_enforcement: PolicyEnforcementReport {
-            sandbox,
-            network,
-            sandbox_enforced: false,
-            network_enforced: false,
-            warnings,
+            executor: policy_report.executor,
+            sandbox: policy_report.sandbox,
+            network: policy_report.network,
+            sandbox_enforced: policy_report.sandbox_status.is_enforced(),
+            network_enforced: policy_report.network_status.is_enforced(),
+            sandbox_status: policy_report.sandbox_status,
+            network_status: policy_report.network_status,
+            process_cleanup_status: policy_report.process_cleanup_status,
+            resource_limit_status: PolicyEnforcementStatus::Unsupported,
+            warnings: policy_report.warnings,
+            metadata: RunMetadata::new(),
         },
         metadata: command_metadata(request),
     }
@@ -619,7 +1003,7 @@ mod tests {
     async fn local_command_executes_without_shell_parsing() {
         let root = temp_dir("argv");
         let workspace = LocalWorkspace::new(&root).unwrap();
-        let executor = LocalCommandExecutor::new(workspace);
+        let executor = LocalCommandExecutor::new(workspace).with_advisory_policy(true);
         let output = executor
             .execute(
                 CommandRequest::new(["printf", "%s", "a;b"]),
@@ -630,6 +1014,28 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(output.stdout.text, "a;b");
+        assert_eq!(
+            output.policy_enforcement.network_status,
+            PolicyEnforcementStatus::Advisory
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn local_command_fails_closed_without_advisory_policy() {
+        let root = temp_dir("fail-closed");
+        let workspace = LocalWorkspace::new(&root).unwrap();
+        let executor = LocalCommandExecutor::new(workspace);
+        let error = executor
+            .execute(
+                CommandRequest::new(["printf", "ok"]),
+                &ExecutionPolicy::new(SandboxPolicy::ReadOnly, NetworkPolicy::Deny)
+                    .with_timeout(Some(Duration::from_secs(5))),
+                &RunContext::new("cmd"),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(error, CommandError::UnsupportedPolicy { .. }));
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -637,7 +1043,7 @@ mod tests {
     async fn local_command_truncates_stdout_and_stderr_separately() {
         let root = temp_dir("truncate");
         let workspace = LocalWorkspace::new(&root).unwrap();
-        let executor = LocalCommandExecutor::new(workspace);
+        let executor = LocalCommandExecutor::new(workspace).with_advisory_policy(true);
         let mut request = CommandRequest::new(["sh", "-c", "printf 12345; printf abcde >&2"]);
         request.output_limit = CommandOutputLimit {
             stdout_bytes: 3,
@@ -662,7 +1068,7 @@ mod tests {
     async fn local_command_truncation_handles_utf8_boundary() {
         let root = temp_dir("truncate-utf8");
         let workspace = LocalWorkspace::new(&root).unwrap();
-        let executor = LocalCommandExecutor::new(workspace);
+        let executor = LocalCommandExecutor::new(workspace).with_advisory_policy(true);
         let mut request = CommandRequest::new(["printf", "éé"]);
         request.output_limit = CommandOutputLimit {
             stdout_bytes: 3,
