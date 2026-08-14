@@ -659,8 +659,7 @@ mod tests {
         ) -> Result<RunOutput, AgentError> {
             if !self.failed_once {
                 self.failed_once = true;
-                return Err(AgentError::Provider(ProviderError::Api {
-                    status: 0,
+                return Err(AgentError::Provider(ProviderError::Protocol {
                     message: "boom".into(),
                 }));
             }

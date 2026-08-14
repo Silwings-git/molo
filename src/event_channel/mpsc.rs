@@ -14,9 +14,10 @@
 //! For a comparison with [`BroadcastEventChannel`](crate::event_channel::BroadcastEventChannel),
 //! see the [event channel module](crate::event_channel).
 
-use super::{AgentEvent, EventChannel, EventReceiver};
+use super::{AgentEvent, EventChannel, EventChannelStats, EventReceiver};
 use futures::future::BoxFuture;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 /// A single-queue event channel: one subscriber, strictly ordered and lossless within capacity,
 /// dropping new events when full.
@@ -62,6 +63,16 @@ use std::sync::Arc;
 pub struct MpscEventChannel {
     tx: tokio::sync::mpsc::Sender<Arc<dyn AgentEvent>>,
     rx: std::sync::Mutex<Option<tokio::sync::mpsc::Receiver<Arc<dyn AgentEvent>>>>,
+    stats: Arc<MpscStats>,
+}
+
+#[derive(Debug, Default)]
+struct MpscStats {
+    published: AtomicU64,
+    delivered: AtomicU64,
+    dropped_no_subscribers: AtomicU64,
+    dropped_full: AtomicU64,
+    subscribed: AtomicBool,
 }
 
 impl Default for MpscEventChannel {
@@ -84,15 +95,29 @@ impl MpscEventChannel {
         Self {
             tx,
             rx: std::sync::Mutex::new(Some(rx)),
+            stats: Arc::new(MpscStats::default()),
         }
     }
 }
 
 impl EventChannel for MpscEventChannel {
     fn publish(&self, event: Arc<dyn AgentEvent>) {
-        // Full / channel closed → silently drop: observation semantics; the publish side never blocks
+        self.stats.published.fetch_add(1, Ordering::Relaxed);
+        // Full / channel closed -> silently drop: observation semantics; the publish side never blocks
         // and never errors.
-        let _ = self.tx.try_send(event);
+        match self.tx.try_send(event) {
+            Ok(()) => {
+                self.stats.delivered.fetch_add(1, Ordering::Relaxed);
+            }
+            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                self.stats.dropped_full.fetch_add(1, Ordering::Relaxed);
+            }
+            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                self.stats
+                    .dropped_no_subscribers
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+        }
     }
 
     /// Subscribes to the event stream (single consumer).
@@ -113,7 +138,21 @@ impl EventChannel for MpscEventChannel {
         let rx = guard
             .take()
             .expect("MpscEventChannel is single-consumer; subscribe may only be called once");
+        self.stats.subscribed.store(true, Ordering::Relaxed);
         Box::new(MpscEventReceiver { rx })
+    }
+
+    fn stats(&self) -> EventChannelStats {
+        EventChannelStats {
+            published: self.stats.published.load(Ordering::Relaxed),
+            delivered: self.stats.delivered.load(Ordering::Relaxed),
+            dropped_no_subscribers: self.stats.dropped_no_subscribers.load(Ordering::Relaxed),
+            dropped_full: self.stats.dropped_full.load(Ordering::Relaxed),
+            lagged: 0,
+            subscribers: usize::from(
+                self.stats.subscribed.load(Ordering::Relaxed) && !self.tx.is_closed(),
+            ),
+        }
     }
 }
 
@@ -179,10 +218,15 @@ mod tests {
         ch.publish(ev("1"));
         ch.publish(ev("2"));
         ch.publish(ev("3")); // full, dropped
+        let stats = ch.stats();
+        assert_eq!(stats.published, 3);
+        assert_eq!(stats.delivered, 2);
+        assert_eq!(stats.dropped_full, 1);
         let mut rx = ch.subscribe();
         assert_eq!(input_of(&*rx.recv().await.unwrap()), "1");
         assert_eq!(input_of(&*rx.recv().await.unwrap()), "2");
         assert!(rx.recv().now_or_never().is_none()); // the 3rd was dropped; queue empty
+        assert_eq!(ch.stats().subscribers, 1);
     }
 
     /// The stream ends after all senders are dropped (buffered events are still receivable).

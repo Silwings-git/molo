@@ -35,7 +35,8 @@ use crate::message::{Message, ToolCall};
 #[cfg(feature = "harness")]
 use crate::provider::FakeProvider;
 use crate::provider::{
-    ChatRequest, FinishReason, ModelOptions, Provider, ProviderError, StreamEvent, Usage,
+    ChatRequest, FinishReason, ModelOptions, Provider, ProviderError, ProviderRequestContext,
+    StreamEvent, Usage,
 };
 #[cfg(feature = "structured")]
 use crate::run::TypedRunOutput;
@@ -771,11 +772,17 @@ impl ReActAgent {
                 // hand-written schema in the config — endpoint-side
                 // constraint and framework-side validation use the same
                 // one.
-                let chat = self.provider.chat(ChatRequest {
-                    messages: self.assemble_messages(self.memory.context().await?),
-                    tools: schemas.clone(),
-                    options: options.clone(),
-                });
+                let model_request_id = format!("{run_id}-model-{}", counters.rounds);
+                let provider_context =
+                    ProviderRequestContext::from_run_context(model_request_id, context);
+                let chat = self.provider.chat_with_context(
+                    ChatRequest {
+                        messages: self.assemble_messages(self.memory.context().await?),
+                        tools: schemas.clone(),
+                        options: options.clone(),
+                    },
+                    &provider_context,
+                );
                 let response =
                     match run_until_context(context, instrument(chat, llm_span.clone())).await {
                         Ok(Ok(response)) => response,
@@ -808,8 +815,7 @@ impl ReActAgent {
                     // non-Assistant message; the library boundary responds
                     // to expected inputs with an error (same rigor as tool
                     // panic catching, see the registry).
-                    return Err(AgentError::Provider(ProviderError::Api {
-                        status: 0,
+                    return Err(AgentError::Provider(ProviderError::Protocol {
                         message: "provider returned a non-assistant message".into(),
                     }));
                 };
@@ -819,9 +825,8 @@ impl ReActAgent {
                 // sharing the same constant as the streaming path; reasoning
                 // counts toward it too).
                 if content.len() + reasoning.as_deref().map_or(0, str::len) > MAX_ROUND_TEXT {
-                    return Err(AgentError::Provider(ProviderError::Api {
-                        status: 0,
-                        message: format!("round text exceeds size limit ({MAX_ROUND_TEXT} bytes)"),
+                    return Err(AgentError::Provider(ProviderError::ResponseTooLarge {
+                        limit_bytes: MAX_ROUND_TEXT,
                     }));
                 }
 
@@ -1598,16 +1603,14 @@ impl ReActAgent {
         } = response.message
         else {
             self.kernel_state = Some(state);
-            return Err(AgentError::Provider(ProviderError::Api {
-                status: 0,
+            return Err(AgentError::Provider(ProviderError::Protocol {
                 message: "provider returned a non-assistant message".into(),
             }));
         };
         if content.len() + reasoning.as_deref().map_or(0, str::len) > MAX_ROUND_TEXT {
             self.kernel_state = Some(state);
-            return Err(AgentError::Provider(ProviderError::Api {
-                status: 0,
-                message: format!("round text exceeds size limit ({MAX_ROUND_TEXT} bytes)"),
+            return Err(AgentError::Provider(ProviderError::ResponseTooLarge {
+                limit_bytes: MAX_ROUND_TEXT,
             }));
         }
 
@@ -1712,9 +1715,8 @@ impl ReActAgent {
 
         if observation.output.observation_for_model.len() > MAX_ROUND_TEXT {
             self.kernel_state = Some(state);
-            return Err(AgentError::Provider(ProviderError::Api {
-                status: 0,
-                message: format!("effect observation exceeds size limit ({MAX_ROUND_TEXT} bytes)"),
+            return Err(AgentError::Provider(ProviderError::ResponseTooLarge {
+                limit_bytes: MAX_ROUND_TEXT,
             }));
         }
         let recorded = Self::mark_pending_effect_observed(
@@ -1764,11 +1766,8 @@ impl ReActAgent {
         for observation in observations {
             if observation.output.observation_for_model.len() > MAX_ROUND_TEXT {
                 self.kernel_state = Some(state);
-                return Err(AgentError::Provider(ProviderError::Api {
-                    status: 0,
-                    message: format!(
-                        "effect observation exceeds size limit ({MAX_ROUND_TEXT} bytes)"
-                    ),
+                return Err(AgentError::Provider(ProviderError::ResponseTooLarge {
+                    limit_bytes: MAX_ROUND_TEXT,
                 }));
             }
             if !expected_ids.contains(&observation.effect_id) {
@@ -2413,11 +2412,17 @@ impl ReActAgent {
                 // while the run is on the stack (SpanStream enters on every
                 // poll), so the hierarchy is correct automatically.
                 let llm_span = span_llm(&run_id, rounds);
-                let stream_chat = self.provider.stream_chat(ChatRequest {
+                let model_request_id = format!("{run_id}-model-{rounds}");
+                let provider_context =
+                    ProviderRequestContext::from_run_context(model_request_id, &context);
+                let stream_chat = self.provider.stream_chat_with_context(
+                    ChatRequest {
                     messages: self.assemble_messages(messages),
                     tools: schemas.clone(),
                     options: options.clone(),
-                });
+                    },
+                    &provider_context,
+                );
                 let mut provider_stream = match run_until_context(
                     &context,
                     instrument(stream_chat, llm_span.clone()),
@@ -2517,11 +2522,8 @@ impl ReActAgent {
                                     provider_model.clone(),
                                 );
                                 yield stream_end(&self.events, &run_span, summary,
-                                    AgentError::Provider(ProviderError::Api {
-                                        status: 0,
-                                        message: format!(
-                                            "round text exceeds size limit ({MAX_ROUND_TEXT} bytes)"
-                                        ),
+                                    AgentError::Provider(ProviderError::ResponseTooLarge {
+                                        limit_bytes: MAX_ROUND_TEXT,
                                     }));
                                 break 'rounds;
                             }
@@ -2542,11 +2544,8 @@ impl ReActAgent {
                                     provider_model.clone(),
                                 );
                                 yield stream_end(&self.events, &run_span, summary,
-                                    AgentError::Provider(ProviderError::Api {
-                                        status: 0,
-                                        message: format!(
-                                            "round reasoning exceeds size limit ({MAX_ROUND_TEXT} bytes)"
-                                        ),
+                                    AgentError::Provider(ProviderError::ResponseTooLarge {
+                                        limit_bytes: MAX_ROUND_TEXT,
                                     }));
                                 break 'rounds;
                             }
@@ -3982,8 +3981,7 @@ mod tests {
             {
                 Ok(Box::pin(futures::stream::iter(vec![
                     Ok(StreamEvent::Delta("hi".into())),
-                    Err(ProviderError::Api {
-                        status: 0,
+                    Err(ProviderError::Protocol {
                         message: "boom".into(),
                     }),
                 ])))
@@ -3999,12 +3997,12 @@ mod tests {
         );
         assert!(matches!(
             stream.next().await.unwrap(),
-            Err(AgentError::Provider(ProviderError::Api { message: m, .. })) if m == "boom"
+            Err(AgentError::Provider(ProviderError::Protocol { message: m })) if m == "boom"
         ));
         assert!(stream.next().await.is_none()); // terminated, no Done
     }
 
-    /// Script exhausted (one extra round): Err(ProviderError::Api("script
+    /// Script exhausted (one extra round): Err(ProviderError::Protocol("script
     /// exhausted")).
     #[tokio::test]
     async fn script_exhausted_fails_explicitly() {
@@ -4014,7 +4012,7 @@ mod tests {
 
         let err = agent.run("two").await.unwrap_err();
         assert!(
-            matches!(err, AgentError::Provider(ProviderError::Api { message: m, .. }) if m.contains("exhausted"))
+            matches!(err, AgentError::Provider(ProviderError::Protocol { message: m }) if m.contains("exhausted"))
         );
     }
 
@@ -6037,8 +6035,7 @@ mod tests {
                 {
                     Ok(Box::pin(futures::stream::iter(vec![
                         Ok(StreamEvent::Delta("hi".into())),
-                        Err(ProviderError::Api {
-                            status: 0,
+                        Err(ProviderError::Protocol {
                             message: "boom".into(),
                         }),
                     ])))

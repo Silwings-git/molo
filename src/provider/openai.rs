@@ -6,8 +6,8 @@
 
 use crate::message::{ContentBlock, Message, ToolCall};
 use crate::provider::{
-    ChatRequest, ChatResponse, FinishReason, ModelOptions, Provider, ProviderError, StreamEvent,
-    TimeoutStage, Usage,
+    ChatRequest, ChatResponse, FinishReason, ModelOptions, Provider, ProviderCapabilities,
+    ProviderError, ProviderRequestContext, StreamEvent, TimeoutStage, Usage,
 };
 use crate::tool::ToolSchema;
 use async_trait::async_trait;
@@ -248,6 +248,19 @@ impl Provider for OpenAiProvider {
         Some(&self.model)
     }
 
+    fn capabilities(&self) -> ProviderCapabilities {
+        ProviderCapabilities {
+            streaming: true,
+            reasoning: true,
+            tool_calls: true,
+            parallel_tool_calls: true,
+            structured_output: !matches!(self.structured_mode, StructuredOutputMode::Off),
+            usage: true,
+            context_cancellation: true,
+            context_deadline: true,
+        }
+    }
+
     async fn chat(&self, request: ChatRequest) -> Result<ChatResponse, ProviderError> {
         let wire = OpenAiChatRequest {
             model: self.model.clone(),
@@ -295,6 +308,14 @@ impl Provider for OpenAiProvider {
         }
 
         parse_response(&body)
+    }
+
+    async fn chat_with_context(
+        &self,
+        request: ChatRequest,
+        context: &ProviderRequestContext,
+    ) -> Result<ChatResponse, ProviderError> {
+        run_with_context(context, self.chat(request)).await
     }
 
     async fn stream_chat(
@@ -356,6 +377,99 @@ impl Provider for OpenAiProvider {
             aggregator,
         )))
     }
+
+    async fn stream_chat_with_context(
+        &self,
+        request: ChatRequest,
+        context: &ProviderRequestContext,
+    ) -> Result<BoxStream<'static, Result<StreamEvent, ProviderError>>, ProviderError> {
+        let stream = run_with_context(context, self.stream_chat(request)).await?;
+        Ok(Box::pin(stream_with_context(stream, context.clone())))
+    }
+}
+
+async fn run_with_context<T, F>(
+    context: &ProviderRequestContext,
+    future: F,
+) -> Result<T, ProviderError>
+where
+    F: std::future::Future<Output = Result<T, ProviderError>>,
+{
+    check_provider_context(context)?;
+    match context.remaining() {
+        Some(remaining) if remaining.is_zero() => {
+            Err(ProviderError::Timeout(TimeoutStage::Request))
+        }
+        Some(remaining) => {
+            tokio::select! {
+                _ = context.cancellation.cancelled() => Err(ProviderError::Cancelled),
+                _ = tokio::time::sleep(remaining) => Err(ProviderError::Timeout(TimeoutStage::Request)),
+                output = future => output,
+            }
+        }
+        None => {
+            tokio::select! {
+                _ = context.cancellation.cancelled() => Err(ProviderError::Cancelled),
+                output = future => output,
+            }
+        }
+    }
+}
+
+fn stream_with_context(
+    mut stream: BoxStream<'static, Result<StreamEvent, ProviderError>>,
+    context: ProviderRequestContext,
+) -> impl futures::Stream<Item = Result<StreamEvent, ProviderError>> {
+    async_stream::stream! {
+        loop {
+            if let Err(error) = check_provider_context(&context) {
+                yield Err(error);
+                break;
+            }
+            let next = match context.remaining() {
+                Some(remaining) if remaining.is_zero() => {
+                    yield Err(ProviderError::Timeout(TimeoutStage::StreamTotal));
+                    break;
+                }
+                Some(remaining) => {
+                    tokio::select! {
+                        _ = context.cancellation.cancelled() => {
+                            yield Err(ProviderError::Cancelled);
+                            break;
+                        }
+                        _ = tokio::time::sleep(remaining) => {
+                            yield Err(ProviderError::Timeout(TimeoutStage::StreamTotal));
+                            break;
+                        }
+                        next = stream.next() => next,
+                    }
+                }
+                None => {
+                    tokio::select! {
+                        _ = context.cancellation.cancelled() => {
+                            yield Err(ProviderError::Cancelled);
+                            break;
+                        }
+                        next = stream.next() => next,
+                    }
+                }
+            };
+            match next {
+                Some(event) => yield event,
+                None => break,
+            }
+        }
+    }
+}
+
+fn check_provider_context(context: &ProviderRequestContext) -> Result<(), ProviderError> {
+    if context.is_cancelled() {
+        Err(ProviderError::Cancelled)
+    } else if context.is_expired() {
+        Err(ProviderError::Timeout(TimeoutStage::Request))
+    } else {
+        Ok(())
+    }
 }
 
 /// Non-streaming response-body reading: Content-Length pre-check + streaming
@@ -363,7 +477,7 @@ impl Provider for OpenAiProvider {
 ///
 /// An endpoint may lie about content-length or omit it entirely, so the read
 /// still accumulates and checks ([`MAX_RESPONSE_BODY`]); exceeding the limit
-/// produces a [`ProviderError::Api`] (status 0) and terminates. The total
+/// produces [`ProviderError::ResponseTooLarge`] and terminates. The total
 /// timeout is [`RESPONSE_BODY_TIMEOUT`] — when an error response body drips
 /// data at a very low rate, streaming requests have no per-request total
 /// timeout to fall back on, so without it the call would hang forever.
@@ -372,14 +486,14 @@ async fn read_response_body(resp: reqwest::Response) -> Result<String, ProviderE
         if let Some(len) = resp.content_length()
             && len > MAX_RESPONSE_BODY as u64
         {
-            return Err(limit_error("response body exceeds size limit"));
+            return Err(limit_error(MAX_RESPONSE_BODY));
         }
         let mut stream = resp.bytes_stream();
         let mut buf = Vec::new();
         while let Some(chunk) = stream.next().await {
             let chunk = chunk.map_err(map_network_error)?;
             if buf.len() + chunk.len() > MAX_RESPONSE_BODY {
-                return Err(limit_error("response body exceeds size limit"));
+                return Err(limit_error(MAX_RESPONSE_BODY));
             }
             buf.extend_from_slice(&chunk);
         }
@@ -526,12 +640,8 @@ fn sse_lines(
                     Some(Ok(bytes)) => {
                         if buf.len() + bytes.as_ref().len() > MAX_SSE_LINE {
                             return Some((
-                                Err(ProviderError::Api {
-                                    status: 0,
-                                    message: format!(
-                                        "stream line exceeds size limit ({} bytes)",
-                                        MAX_SSE_LINE
-                                    ),
+                                Err(ProviderError::ResponseTooLarge {
+                                    limit_bytes: MAX_SSE_LINE,
                                 }),
                                 (chunks, buf, true, deadline),
                             ));
@@ -629,11 +739,9 @@ fn parse_sse_line(
     let chunk = match serde_json::from_str::<OpenAiStreamChunk>(data) {
         Ok(chunk) => chunk,
         Err(_) => {
-            // A parse failure is not an HTTP source; status counts as 0.
             return line_error(
                 tool_calls,
-                ProviderError::Api {
-                    status: 0,
+                ProviderError::Decode {
                     message: format!("invalid stream event: {}", extract_error_message(data)),
                 },
             );
@@ -645,8 +753,7 @@ fn parse_sse_line(
     if let Some(error) = chunk.error {
         return line_error(
             tool_calls,
-            ProviderError::Api {
-                status: 0,
+            ProviderError::Protocol {
                 message: format!("provider stream error: {}", error.message),
             },
         );
@@ -761,13 +868,9 @@ const MAX_TOOL_CALLS: usize = 64;
 /// produces an error and terminates the stream.
 const MAX_ACCUMULATED_TEXT: usize = 1 << 20;
 
-/// Unified error for size-limit violations (non-HTTP source; status counts
-/// as 0).
-fn limit_error(message: &str) -> ProviderError {
-    ProviderError::Api {
-        status: 0,
-        message: message.into(),
-    }
+/// Unified error for size-limit violations.
+fn limit_error(limit_bytes: usize) -> ProviderError {
+    ProviderError::ResponseTooLarge { limit_bytes }
 }
 
 /// In-line parse error: produce an error event and **set the errored latch**
@@ -813,7 +916,7 @@ impl ToolCallAggregator {
                 call.name = name;
             }
             if call.arguments.len() + arguments.len() > MAX_ACCUMULATED_TEXT {
-                return Err(limit_error("tool arguments exceed size limit"));
+                return Err(limit_error(MAX_ACCUMULATED_TEXT));
             }
             call.arguments.push_str(&arguments);
         } else {
@@ -822,12 +925,14 @@ impl ToolCallAggregator {
             // the 64th call exactly hits the limit, its continuations can
             // still be appended).
             if self.calls.len() >= MAX_TOOL_CALLS {
-                return Err(limit_error("tool call count exceeds limit"));
+                return Err(ProviderError::Protocol {
+                    message: "tool call count exceeds limit".to_string(),
+                });
             }
             // The first fragment of a new call is also subject to the text
             // limit (a soft limit not backed by the line limit).
             if arguments.len() > MAX_ACCUMULATED_TEXT {
-                return Err(limit_error("tool arguments exceed size limit"));
+                return Err(limit_error(MAX_ACCUMULATED_TEXT));
             }
             self.calls.push(AccumulatedCall {
                 index: chunk.index,
@@ -879,8 +984,7 @@ impl ToolCallAggregator {
             return Vec::new();
         }
         let Some(reason) = self.done_reason.take() else {
-            return vec![Err(ProviderError::Api {
-                status: 0,
+            return vec![Err(ProviderError::Protocol {
                 message: "stream ended without finish_reason".into(),
             })];
         };
@@ -937,7 +1041,11 @@ fn map_status_error(
             retry_after: extract_retry_after(headers),
         }
     } else {
-        ProviderError::Api { status, message }
+        ProviderError::Api {
+            status,
+            code: None,
+            message,
+        }
     }
 }
 
@@ -971,18 +1079,15 @@ fn extract_error_message(body: &str) -> String {
 /// vendor wire structure; splitting it apart would break conversation-history
 /// validation at vendors like DeepSeek.
 fn parse_response(body: &str) -> Result<ChatResponse, ProviderError> {
-    // A parse failure is not an HTTP source; status counts as 0.
     let parsed: OpenAiChatResponse =
-        serde_json::from_str(body).map_err(|e| ProviderError::Api {
-            status: 0,
+        serde_json::from_str(body).map_err(|e| ProviderError::Decode {
             message: format!("invalid provider response: {e}"),
         })?;
     let choice = parsed
         .choices
         .into_iter()
         .next()
-        .ok_or_else(|| ProviderError::Api {
-            status: 0,
+        .ok_or_else(|| ProviderError::Protocol {
             message: "provider returned empty choices".to_string(),
         })?;
 
@@ -999,8 +1104,7 @@ fn parse_response(body: &str) -> Result<ChatResponse, ProviderError> {
     // endpoint could pack a huge response body with massive tool calls, each
     // executing user code.
     if raw_tool_calls.len() > MAX_TOOL_CALLS {
-        return Err(ProviderError::Api {
-            status: 0,
+        return Err(ProviderError::Protocol {
             message: format!("too many tool calls ({})", raw_tool_calls.len()),
         });
     }
@@ -2205,10 +2309,7 @@ mod tests {
         // [DONE] without finish_reason = truncation error (EOF strictness).
         let events = parse_sse_line("data: [DONE]", &mut aggregator);
         assert_eq!(events.len(), 1);
-        assert!(matches!(
-            events[0],
-            Err(ProviderError::Api { status: 0, .. })
-        ));
+        assert!(matches!(events[0], Err(ProviderError::Protocol { .. })));
         assert!(parse_sse_line(r#"data: {"choices":[]}"#, &mut aggregator).is_empty());
         assert!(
             parse_sse_line(
@@ -2224,10 +2325,10 @@ mod tests {
         let line = "data: not-json";
         let events = parse_sse_line(line, &mut ToolCallAggregator::default());
         match events.as_slice() {
-            [Err(ProviderError::Api { status: 0, message })] => {
+            [Err(ProviderError::Decode { message })] => {
                 assert_eq!(message, "invalid stream event: not-json")
             }
-            _ => panic!("expected single api error, got {events:?}"),
+            _ => panic!("expected single decode error, got {events:?}"),
         }
     }
 
@@ -2493,8 +2594,9 @@ mod tests {
         assert_eq!(first, ": keep-alive");
     }
 
-    /// Line-buffer over-limit: the stream terminates after Err(Api) (nothing
-    /// more is produced; the buffer is dropped).
+    /// Line-buffer over-limit: the stream terminates after
+    /// Err(ResponseTooLarge) (nothing more is produced; the buffer is
+    /// dropped).
     #[tokio::test]
     async fn sse_lines_over_limit_terminates_stream() {
         let mut stream = Box::pin(sse_lines(
@@ -2503,7 +2605,12 @@ mod tests {
             Duration::from_secs(60),
         ));
         let first = stream.next().await.unwrap();
-        assert!(matches!(first, Err(ProviderError::Api { status: 0, .. })));
+        assert!(matches!(
+            first,
+            Err(ProviderError::ResponseTooLarge {
+                limit_bytes: MAX_SSE_LINE
+            })
+        ));
         assert!(
             stream.next().await.is_none(),
             "stream must terminate after exceeding the limit"
@@ -2521,10 +2628,7 @@ mod tests {
         let bad = "data: not-json";
         let events = parse_sse_line(bad, &mut aggregator);
         assert_eq!(events.len(), 1);
-        assert!(matches!(
-            events[0],
-            Err(ProviderError::Api { status: 0, .. })
-        ));
+        assert!(matches!(events[0], Err(ProviderError::Decode { .. })));
 
         // After the bad line, [DONE] no longer flushes a Done (the stash was
         // dropped).
@@ -2550,10 +2654,7 @@ mod tests {
         let over = r#"data: {"choices":[{"delta":{"tool_calls":[{"index":64,"id":"c64","function":{"name":"f","arguments":"{}"}}]},"finish_reason":null}]}"#;
         let events = parse_sse_line(over, &mut aggregator);
         assert_eq!(events.len(), 1);
-        assert!(matches!(
-            events[0],
-            Err(ProviderError::Api { status: 0, .. })
-        ));
+        assert!(matches!(events[0], Err(ProviderError::Protocol { .. })));
         // Continuations of existing indices can still be appended (find comes
         // before the count check).
         let cont = r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"more\":true}"}}]},"finish_reason":null}]}"#;
@@ -2574,7 +2675,9 @@ mod tests {
         assert_eq!(events.len(), 1);
         assert!(matches!(
             events[0],
-            Err(ProviderError::Api { status: 0, .. })
+            Err(ProviderError::ResponseTooLarge {
+                limit_bytes: MAX_ACCUMULATED_TEXT
+            })
         ));
     }
 
@@ -2611,7 +2714,9 @@ mod tests {
         assert_eq!(events.len(), 1);
         assert!(matches!(
             events[0],
-            Err(ProviderError::Api { status: 0, .. })
+            Err(ProviderError::ResponseTooLarge {
+                limit_bytes: MAX_ACCUMULATED_TEXT
+            })
         ));
     }
 
@@ -2623,10 +2728,7 @@ mod tests {
         // Bad line: set the latch.
         let events = parse_sse_line("data: not-json", &mut aggregator);
         assert_eq!(events.len(), 1);
-        assert!(matches!(
-            events[0],
-            Err(ProviderError::Api { status: 0, .. })
-        ));
+        assert!(matches!(events[0], Err(ProviderError::Decode { .. })));
         // A malicious endpoint resends finish_reason: set_done_reason is a
         // no-op.
         let finish = r#"data: {"choices":[{"delta":{},"finish_reason":"stop"}]}"#;
@@ -2703,10 +2805,7 @@ mod tests {
         ));
         let events: Vec<Result<StreamEvent, ProviderError>> = stream.by_ref().collect().await;
         assert_eq!(events.len(), 1);
-        assert!(matches!(
-            events[0],
-            Err(ProviderError::Api { status: 0, .. })
-        ));
+        assert!(matches!(events[0], Err(ProviderError::Decode { .. })));
     }
 
     /// HTTP integration: a minimal local TcpListener server verifies the wire
@@ -2836,7 +2935,7 @@ mod tests {
         assert_eq!(events.len(), 1);
         assert!(matches!(
             events[0],
-            Err(ProviderError::Api { status: 0, ref message }) if message.contains("without finish_reason")
+            Err(ProviderError::Protocol { ref message }) if message.contains("without finish_reason")
         ));
     }
 

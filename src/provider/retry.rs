@@ -28,7 +28,10 @@
 //! # }
 //! ```
 
-use super::{ChatRequest, ChatResponse, Provider, ProviderError, StreamEvent};
+use super::{
+    ChatRequest, ChatResponse, Provider, ProviderCapabilities, ProviderError,
+    ProviderRequestContext, StreamEvent, TimeoutStage,
+};
 use async_trait::async_trait;
 use futures::stream::BoxStream;
 use std::sync::Arc;
@@ -176,7 +179,7 @@ fn random01() -> f64 {
 /// hand-written (a closure only prints its variant name).
 #[derive(Clone)]
 pub enum Retryable {
-    /// Default: Network / Timeout / RateLimited / Api (status ≥ 500);
+    /// Default: Network / Timeout / RateLimited / Api (status >= 500);
     /// 4xx (auth / invalid arguments / quota exhausted) are not retried —
     /// retrying would not change the outcome.
     Default,
@@ -338,6 +341,10 @@ impl<I: Provider + Send + Sync> Provider for RetryProvider<I> {
         self.inner.model()
     }
 
+    fn capabilities(&self) -> ProviderCapabilities {
+        self.inner.capabilities()
+    }
+
     async fn chat(&self, request: ChatRequest) -> Result<ChatResponse, ProviderError> {
         let mut attempts = 0usize;
         loop {
@@ -346,6 +353,27 @@ impl<I: Provider + Send + Sync> Provider for RetryProvider<I> {
                 Err(error) => match self.retry_decision(&error, attempts) {
                     Some(delay) => {
                         tokio::time::sleep(delay).await;
+                        attempts += 1;
+                    }
+                    None => return Err(error),
+                },
+            }
+        }
+    }
+
+    async fn chat_with_context(
+        &self,
+        request: ChatRequest,
+        context: &ProviderRequestContext,
+    ) -> Result<ChatResponse, ProviderError> {
+        let mut attempts = 0usize;
+        loop {
+            check_context(context)?;
+            match self.inner.chat_with_context(request.clone(), context).await {
+                Ok(response) => return Ok(response),
+                Err(error) => match self.retry_decision(&error, attempts) {
+                    Some(delay) => {
+                        sleep_with_context(delay, context).await?;
                         attempts += 1;
                     }
                     None => return Err(error),
@@ -374,6 +402,66 @@ impl<I: Provider + Send + Sync> Provider for RetryProvider<I> {
             }
         }
     }
+
+    async fn stream_chat_with_context(
+        &self,
+        request: ChatRequest,
+        context: &ProviderRequestContext,
+    ) -> Result<BoxStream<'static, Result<StreamEvent, ProviderError>>, ProviderError> {
+        let mut attempts = 0usize;
+        loop {
+            check_context(context)?;
+            match self
+                .inner
+                .stream_chat_with_context(request.clone(), context)
+                .await
+            {
+                Ok(stream) => return Ok(stream),
+                Err(error) => match self.retry_decision(&error, attempts) {
+                    Some(delay) => {
+                        sleep_with_context(delay, context).await?;
+                        attempts += 1;
+                    }
+                    None => return Err(error),
+                },
+            }
+        }
+    }
+}
+
+fn check_context(context: &ProviderRequestContext) -> Result<(), ProviderError> {
+    if context.is_cancelled() {
+        Err(ProviderError::Cancelled)
+    } else if context.is_expired() {
+        Err(ProviderError::Timeout(TimeoutStage::Request))
+    } else {
+        Ok(())
+    }
+}
+
+async fn sleep_with_context(
+    delay: Duration,
+    context: &ProviderRequestContext,
+) -> Result<(), ProviderError> {
+    check_context(context)?;
+    match context.remaining() {
+        Some(remaining) if remaining.is_zero() => {
+            Err(ProviderError::Timeout(TimeoutStage::Request))
+        }
+        Some(remaining) => {
+            tokio::select! {
+                _ = context.cancellation.cancelled() => Err(ProviderError::Cancelled),
+                _ = tokio::time::sleep(remaining) => Err(ProviderError::Timeout(TimeoutStage::Request)),
+                _ = tokio::time::sleep(delay) => Ok(()),
+            }
+        }
+        None => {
+            tokio::select! {
+                _ = context.cancellation.cancelled() => Err(ProviderError::Cancelled),
+                _ = tokio::time::sleep(delay) => Ok(()),
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -389,6 +477,7 @@ mod tests {
     fn api(status: u16) -> ProviderError {
         ProviderError::Api {
             status,
+            code: None,
             message: "boom".into(),
         }
     }

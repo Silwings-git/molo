@@ -19,7 +19,7 @@ use crate::effect::{
     DisplayOutput, EffectKind, EffectObservation, EffectOutput, EffectRequest, EffectStatus,
     RiskLevel,
 };
-use crate::provider::{Provider, ProviderError};
+use crate::provider::{Provider, ProviderError, ProviderRequestContext};
 use crate::run::{Artifact, RunContext, RunMetadata, RunOutput, RunRequest};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -27,6 +27,8 @@ use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+
+pub use crate::observability::RedactionRecord;
 
 /// Outer runtime that drives an [`AgentKernel`] with a [`Provider`] and
 /// governed [`Harness`].
@@ -114,7 +116,7 @@ where
             let observation = match action {
                 AgentAction::Respond { output } => return Ok(output),
                 AgentAction::RequestModel { request } => {
-                    Observation::Model(self.execute_model_request(request).await?)
+                    Observation::Model(self.execute_model_request(request, &context).await?)
                 }
                 AgentAction::RequestEffect { request } => {
                     let observation = self.harness.execute(request, &context).await?;
@@ -135,9 +137,14 @@ where
     async fn execute_model_request(
         &self,
         request: ModelRequest,
+        context: &RunContext,
     ) -> Result<ModelObservation, ProviderError> {
         let request_id = request.id;
-        let response = self.provider.chat(request.chat).await?;
+        let provider_context = ProviderRequestContext::from_run_context(&request_id, context);
+        let response = self
+            .provider
+            .chat_with_context(request.chat, &provider_context)
+            .await?;
         Ok(ModelObservation::new(request_id, response))
     }
 }
@@ -642,15 +649,6 @@ pub struct LimitedOutput {
     pub redactions: Vec<RedactionRecord>,
     /// Redacted debug text.
     pub debug: Option<String>,
-}
-
-/// A redaction that was applied to output.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct RedactionRecord {
-    /// Field where redaction occurred.
-    pub field: String,
-    /// Human-readable redaction reason.
-    pub reason: String,
 }
 
 /// Redacted text and metadata.
@@ -2039,6 +2037,7 @@ mod tests {
     async fn runtime_returns_provider_error() {
         let provider = FakeProvider::new([FakeReply::Error(ProviderError::Api {
             status: 500,
+            code: None,
             message: "provider down".to_string(),
         })]);
         let harness = BasicHarness::noop();

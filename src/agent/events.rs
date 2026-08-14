@@ -40,6 +40,7 @@
 //! ```
 
 use super::{AgentEvent, RunSummary};
+use crate::observability::{AgentEventRecord, EventSeverity, RedactionRecord};
 use crate::tool::{RegistryError, ToolResult};
 use crate::{AgentError, UserInput};
 
@@ -123,5 +124,209 @@ impl AgentEvent for ReActEvent {
             ReActEvent::ToolCompleted { .. } => "tool.completed",
             ReActEvent::RunEnded { .. } => "run.ended",
         }
+    }
+
+    fn to_record(&self) -> Option<AgentEventRecord> {
+        let record = match self {
+            ReActEvent::RunStarted { run_id, input } => AgentEventRecord::new(
+                self.name(),
+                EventSeverity::Info,
+                serde_json::json!({
+                    "input.kind": user_input_kind(input),
+                    "input.bytes": user_input_bytes(input),
+                }),
+            )
+            .with_run_id(run_id.clone())
+            .with_redactions(vec![omitted("input")]),
+            ReActEvent::Delta { text } => AgentEventRecord::new(
+                self.name(),
+                EventSeverity::Debug,
+                serde_json::json!({
+                    "delta.bytes": text.len(),
+                }),
+            )
+            .with_redactions(vec![omitted("delta.text")]),
+            ReActEvent::Reasoning { text } => AgentEventRecord::new(
+                self.name(),
+                EventSeverity::Debug,
+                serde_json::json!({
+                    "reasoning.bytes": text.len(),
+                }),
+            )
+            .with_redactions(vec![omitted("reasoning.text")]),
+            ReActEvent::ToolStarted {
+                id,
+                name,
+                arguments,
+            } => AgentEventRecord::new(
+                self.name(),
+                EventSeverity::Info,
+                serde_json::json!({
+                    "tool.id": id,
+                    "tool.name": name,
+                    "tool.arguments_bytes": arguments.len(),
+                }),
+            )
+            .with_redactions(vec![omitted("tool.arguments")]),
+            ReActEvent::ToolCompleted { id, name, result } => AgentEventRecord::new(
+                self.name(),
+                if result.is_ok() {
+                    EventSeverity::Info
+                } else {
+                    EventSeverity::Warn
+                },
+                tool_completed_payload(id, name, result),
+            ),
+            ReActEvent::RunEnded { summary, error } => {
+                let severity = if error.is_some() {
+                    EventSeverity::Error
+                } else {
+                    EventSeverity::Info
+                };
+                let mut payload = run_summary_payload(summary);
+                if let serde_json::Value::Object(object) = &mut payload {
+                    object.insert(
+                        "status".to_string(),
+                        serde_json::json!(if error.is_some() { "error" } else { "ok" }),
+                    );
+                    if let Some(error) = error {
+                        object.insert(
+                            "error.kind".to_string(),
+                            serde_json::json!(agent_error_kind(error)),
+                        );
+                    }
+                }
+                AgentEventRecord::new(self.name(), severity, payload)
+            }
+        };
+        Some(record)
+    }
+}
+
+fn omitted(field: &str) -> RedactionRecord {
+    RedactionRecord {
+        field: field.to_string(),
+        reason: "raw content omitted".to_string(),
+    }
+}
+
+fn user_input_kind(input: &UserInput) -> &'static str {
+    match input {
+        UserInput::Text(_) => "text",
+        UserInput::Blocks(_) => "blocks",
+    }
+}
+
+fn user_input_bytes(input: &UserInput) -> usize {
+    match input {
+        UserInput::Text(text) => text.len(),
+        UserInput::Blocks(blocks) => blocks
+            .iter()
+            .map(|block| serde_json::to_vec(block).map_or(0, |bytes| bytes.len()))
+            .sum(),
+    }
+}
+
+fn tool_completed_payload(
+    id: &str,
+    name: &str,
+    result: &Result<ToolResult, RegistryError>,
+) -> serde_json::Value {
+    match result {
+        Ok(ToolResult::Output(output)) => serde_json::json!({
+            "tool.id": id,
+            "tool.name": name,
+            "status": "ok",
+            "effect.requested": false,
+            "output.bytes": output.content.len(),
+            "artifacts": output.artifacts.len(),
+        }),
+        Ok(ToolResult::Effect(effect)) => serde_json::json!({
+            "tool.id": id,
+            "tool.name": name,
+            "status": "ok",
+            "effect.requested": true,
+            "effect.id": effect.id,
+            "effect.kind": format!("{:?}", effect.kind),
+            "effect.risk": format!("{:?}", effect.risk),
+        }),
+        Err(error) => serde_json::json!({
+            "tool.id": id,
+            "tool.name": name,
+            "status": "error",
+            "error.kind": registry_error_kind(error),
+        }),
+    }
+}
+
+fn run_summary_payload(summary: &RunSummary) -> serde_json::Value {
+    serde_json::json!({
+        "rounds": summary.rounds,
+        "tool_calls": summary.tool_calls,
+        "usage.prompt_tokens": summary.usage.prompt_tokens,
+        "usage.completion_tokens": summary.usage.completion_tokens,
+        "usage.total_tokens": summary.usage.total_tokens,
+        "finish.reason": summary.finish_reason.as_ref().map(|reason| format!("{reason:?}")),
+        "latency_ms": summary.latency.as_millis() as u64,
+        "provider.model": summary.provider_model,
+    })
+}
+
+fn registry_error_kind(error: &RegistryError) -> &'static str {
+    match error {
+        RegistryError::NotFound(_) => "not_found",
+        RegistryError::InvalidArguments(_) => "invalid_arguments",
+        RegistryError::Execution { .. } => "execution",
+        RegistryError::NameCollision { .. } => "name_collision",
+        RegistryError::SourceNameMismatch { .. } => "source_name_mismatch",
+    }
+}
+
+fn agent_error_kind(error: &AgentError) -> &'static str {
+    match error {
+        AgentError::Memory(_) => "memory",
+        AgentError::Provider(_) => "provider",
+        AgentError::TooManyToolRounds(_) => "too_many_tool_rounds",
+        AgentError::StructuredRetriesExhausted(_) => "structured_retries_exhausted",
+        AgentError::StructuredParse(_) => "structured_parse",
+        AgentError::Cancelled => "cancelled",
+        AgentError::DeadlineExceeded => "deadline_exceeded",
+        AgentError::EffectRequiresHarness(_) => "effect_requires_harness",
+        AgentError::InvalidStep(_) => "invalid_step",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn event_record_omits_raw_delta() {
+        let event = ReActEvent::Delta {
+            text: "secret-token".to_string(),
+        };
+
+        let record = event.to_record().expect("ReAct events expose records");
+        let json = serde_json::to_string(&record).unwrap();
+
+        assert!(json.contains("delta.bytes"));
+        assert!(!json.contains("secret-token"));
+        assert_eq!(record.redactions[0].field, "delta.text");
+    }
+
+    #[test]
+    fn tool_started_record_omits_raw_arguments() {
+        let event = ReActEvent::ToolStarted {
+            id: "call-1".to_string(),
+            name: "write_file".to_string(),
+            arguments: r#"{"token":"secret-token"}"#.to_string(),
+        };
+
+        let record = event.to_record().expect("ReAct events expose records");
+        let json = serde_json::to_string(&record).unwrap();
+
+        assert!(json.contains("tool.arguments_bytes"));
+        assert!(!json.contains("secret-token"));
+        assert_eq!(record.redactions[0].field, "tool.arguments");
     }
 }

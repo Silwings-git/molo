@@ -230,9 +230,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // 4. Error injection: this round fails, and the Agent propagates the Provider error as-is.
-    let fake = FakeProvider::new([FakeReply::Error(ProviderError::Api {
-        status: 429,
-        message: "rate limited".into(),
+    let fake = FakeProvider::new([FakeReply::Error(ProviderError::RateLimited {
+        retry_after: None,
     })]);
     let mut agent = SimpleAgent::new(fake, ToolRegistry::new());
     match agent.run("ask a question").await {

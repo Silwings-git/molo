@@ -2,11 +2,21 @@
 //!
 //! This module defines the `Provider` trait and its companion data types:
 //! requests ([`ChatRequest`]), responses ([`ChatResponse`] / [`StreamEvent`]),
-//! errors ([`ProviderError`]), and usage ([`Usage`]). The trait itself is
-//! vendor-agnostic; the implementations ([`FakeProvider`] /
+//! errors ([`ProviderError`]), capabilities ([`ProviderCapabilities`]),
+//! request context ([`ProviderRequestContext`]), and usage ([`Usage`]). The
+//! trait itself is vendor-agnostic; the implementations ([`FakeProvider`] /
 //! [`RetryProvider`], and [`OpenAiProvider`] with the `openai` feature) all
 //! implement the same trait, and any implementation can be wrapped by
 //! [`RetryProvider`] to gain retry capability.
+//!
+//! The provider contract is intentionally explicit: successful `chat`
+//! returns exactly one assistant message, successful streams terminate with
+//! one `Done`, usage is reported only when the provider supplies it, and
+//! local decode/protocol/size-limit failures are distinct from vendor API
+//! errors. Context-aware methods let runtimes pass run ids, model request ids,
+//! deadlines, cancellation, and sanitized metadata across the provider
+//! boundary while preserving compatibility for providers that only implement
+//! the older methods.
 
 mod fake;
 #[cfg(feature = "openai")]
@@ -19,11 +29,120 @@ pub use openai::{OpenAiProvider, StructuredOutputMode};
 pub use retry::{Backoff, RetryPolicy, RetryProvider, Retryable};
 
 use crate::message::Message;
+use crate::run::{RunContext, RunMetadata};
 use crate::tool::ToolSchema;
 use futures::stream::BoxStream;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
-use std::time::Duration;
+use std::fmt;
+use std::time::{Duration, Instant};
+
+/// Provider capability metadata used by hosts and conformance tests.
+///
+/// Capabilities are descriptive, not a security boundary. When a provider
+/// declares support for an optional capability, it should pass the matching
+/// provider conformance cases. Unsupported direct calls should return
+/// [`ProviderError::Unsupported`] rather than panic.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProviderCapabilities {
+    /// Supports [`Provider::stream_chat`] / [`Provider::stream_chat_with_context`].
+    pub streaming: bool,
+    /// Maps provider reasoning/thinking output to [`Message`] or
+    /// [`StreamEvent::Reasoning`].
+    pub reasoning: bool,
+    /// Supports model tool-call requests.
+    pub tool_calls: bool,
+    /// Preserves multiple tool calls in one assistant turn.
+    pub parallel_tool_calls: bool,
+    /// Accepts [`ModelOptions::structured`] as a provider-side best-effort
+    /// constraint.
+    pub structured_output: bool,
+    /// Reports provider token usage when the backend supplies it.
+    pub usage: bool,
+    /// Cooperatively observes cancellation from [`ProviderRequestContext`].
+    pub context_cancellation: bool,
+    /// Cooperatively observes deadlines from [`ProviderRequestContext`].
+    pub context_deadline: bool,
+}
+
+impl ProviderCapabilities {
+    /// Baseline provider capabilities: non-streaming text only.
+    pub fn baseline() -> Self {
+        Self::default()
+    }
+}
+
+/// Request-scoped provider context.
+///
+/// This is the provider-boundary projection of [`RunContext`]: it carries
+/// correlation ids, cancellation/deadline controls, an optional timeout hint,
+/// and sanitized host metadata. Raw prompts, source code, auth headers, API
+/// keys, and environment values should not be placed in metadata by default.
+#[derive(Clone)]
+pub struct ProviderRequestContext {
+    /// Run id shared with run summaries, event records, and tracing spans.
+    pub run_id: String,
+    /// Model request id unique within the run.
+    pub model_request_id: String,
+    /// Cooperative cancellation source.
+    pub cancellation: tokio_util::sync::CancellationToken,
+    /// Optional absolute deadline.
+    pub deadline: Option<Instant>,
+    /// Optional per-provider-call timeout hint.
+    pub timeout: Option<Duration>,
+    /// Host/framework metadata for observability and routing.
+    pub metadata: RunMetadata,
+}
+
+impl fmt::Debug for ProviderRequestContext {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ProviderRequestContext")
+            .field("run_id", &self.run_id)
+            .field("model_request_id", &self.model_request_id)
+            .field("cancellation", &"CancellationToken")
+            .field("deadline", &self.deadline)
+            .field("timeout", &self.timeout)
+            .field("metadata", &self.metadata)
+            .finish()
+    }
+}
+
+impl ProviderRequestContext {
+    /// Builds provider context from a run context and model request id.
+    pub fn from_run_context(model_request_id: impl Into<String>, context: &RunContext) -> Self {
+        Self {
+            run_id: context.run_id.clone(),
+            model_request_id: model_request_id.into(),
+            cancellation: context.cancellation.clone(),
+            deadline: context.deadline,
+            timeout: context.remaining(),
+            metadata: context.metadata.clone(),
+        }
+    }
+
+    /// Sets a provider-call timeout hint.
+    pub fn with_timeout(mut self, timeout: Duration) -> Self {
+        self.timeout = Some(timeout);
+        self
+    }
+
+    /// Whether cancellation has already been requested.
+    pub fn is_cancelled(&self) -> bool {
+        self.cancellation.is_cancelled()
+    }
+
+    /// Whether the deadline has elapsed.
+    pub fn is_expired(&self) -> bool {
+        self.deadline
+            .is_some_and(|deadline| Instant::now() >= deadline)
+    }
+
+    /// Remaining time before the deadline.
+    pub fn remaining(&self) -> Option<Duration> {
+        self.deadline
+            .map(|deadline| deadline.saturating_duration_since(Instant::now()))
+    }
+}
 
 /// The interface for chatting with an LLM.
 ///
@@ -64,6 +183,11 @@ pub trait Provider: Send + Sync {
         None
     }
 
+    /// Capability metadata for this provider instance.
+    fn capabilities(&self) -> ProviderCapabilities {
+        ProviderCapabilities::baseline()
+    }
+
     /// Sends one turn of conversation and returns the model's reply (text, or
     /// a request to call tools).
     ///
@@ -73,6 +197,21 @@ pub trait Provider: Send + Sync {
     /// all returned as [`ProviderError`]; see that type's docs for error
     /// classification and retry guidance.
     async fn chat(&self, request: ChatRequest) -> Result<ChatResponse, ProviderError>;
+
+    /// Sends one turn with request-scoped provider context.
+    ///
+    /// The default implementation preserves compatibility for existing
+    /// providers by ignoring the context and calling [`chat`](Provider::chat).
+    /// Providers that declare context cancellation/deadline support should
+    /// override this method.
+    async fn chat_with_context(
+        &self,
+        request: ChatRequest,
+        context: &ProviderRequestContext,
+    ) -> Result<ChatResponse, ProviderError> {
+        let _ = context;
+        self.chat(request).await
+    }
 
     /// Streams one turn of conversation, returning the Assistant's reply
     /// incrementally.
@@ -93,6 +232,20 @@ pub trait Provider: Send + Sync {
         &self,
         request: ChatRequest,
     ) -> Result<BoxStream<'static, Result<StreamEvent, ProviderError>>, ProviderError>;
+
+    /// Streams one turn with request-scoped provider context.
+    ///
+    /// The default implementation preserves compatibility for existing
+    /// providers by ignoring the context and calling
+    /// [`stream_chat`](Provider::stream_chat).
+    async fn stream_chat_with_context(
+        &self,
+        request: ChatRequest,
+        context: &ProviderRequestContext,
+    ) -> Result<BoxStream<'static, Result<StreamEvent, ProviderError>>, ProviderError> {
+        let _ = context;
+        self.stream_chat(request).await
+    }
 }
 
 /// `Box<dyn Provider>` is itself a Provider: re-exposes the trait object as a
@@ -105,8 +258,20 @@ impl Provider for Box<dyn Provider> {
         self.as_ref().model()
     }
 
+    fn capabilities(&self) -> ProviderCapabilities {
+        self.as_ref().capabilities()
+    }
+
     async fn chat(&self, request: ChatRequest) -> Result<ChatResponse, ProviderError> {
         self.as_ref().chat(request).await
+    }
+
+    async fn chat_with_context(
+        &self,
+        request: ChatRequest,
+        context: &ProviderRequestContext,
+    ) -> Result<ChatResponse, ProviderError> {
+        self.as_ref().chat_with_context(request, context).await
     }
 
     async fn stream_chat(
@@ -114,6 +279,16 @@ impl Provider for Box<dyn Provider> {
         request: ChatRequest,
     ) -> Result<BoxStream<'static, Result<StreamEvent, ProviderError>>, ProviderError> {
         self.as_ref().stream_chat(request).await
+    }
+
+    async fn stream_chat_with_context(
+        &self,
+        request: ChatRequest,
+        context: &ProviderRequestContext,
+    ) -> Result<BoxStream<'static, Result<StreamEvent, ProviderError>>, ProviderError> {
+        self.as_ref()
+            .stream_chat_with_context(request, context)
+            .await
     }
 }
 
@@ -325,25 +500,37 @@ pub enum StreamEvent {
 /// Error classification is the basis for retry decisions (see the `Default`
 /// judgment of [`Retryable`]): Network / Timeout / RateLimited are worth
 /// retrying, while `Api` is judged by status (5xx retried, 4xx not — retrying
-/// would not change the outcome).
+/// would not change the outcome). Local decode/protocol errors are distinct
+/// from vendor API errors and are not retried by default.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[non_exhaustive]
 pub enum ProviderError {
-    /// A business error returned by the vendor (auth failure / invalid
-    /// arguments, etc.), carrying the HTTP status.
-    ///
-    /// `status: 0` means a non-HTTP source (e.g. response parse failure /
-    /// empty choices); it is not a valid status code and naturally
-    /// distinguishes "returned by the vendor" from "framework-side parse
-    /// failure".
+    /// A business/API error returned by the vendor (auth failure / invalid
+    /// arguments, quota exhaustion, server error), carrying the HTTP status
+    /// and optional vendor error code.
     // No "provider " prefix: the type name already expresses the domain,
     // avoiding a double prefix when wrapped by AgentError::Provider
     // ("provider error: provider api error …").
     #[error("api error (status {status}): {message}")]
     Api {
-        /// HTTP status code; 0 = non-HTTP source (e.g. response parse
-        /// failure).
+        /// HTTP status code returned by the vendor.
         status: u16,
+        /// Optional vendor error code.
+        code: Option<String>,
+        /// Error description text.
+        message: String,
+    },
+    /// Provider response was syntactically decoded but violated either the
+    /// vendor contract or molo's provider contract.
+    #[error("provider protocol error: {message}")]
+    Protocol {
+        /// Error description text.
+        message: String,
+    },
+    /// Provider response body, SSE frame, or encoded payload could not be
+    /// decoded.
+    #[error("response decode error: {message}")]
+    Decode {
         /// Error description text.
         message: String,
     },
@@ -372,6 +559,21 @@ pub enum ProviderError {
     /// elapsed" and "event interval stalled" for easier diagnosis.
     #[error("request timed out during {0:?}")]
     Timeout(TimeoutStage),
+    /// Provider request was cancelled through provider context.
+    #[error("provider request cancelled")]
+    Cancelled,
+    /// Provider response exceeded a configured local size limit.
+    #[error("response exceeded configured limit ({limit_bytes} bytes)")]
+    ResponseTooLarge {
+        /// Configured limit that was exceeded.
+        limit_bytes: usize,
+    },
+    /// Capability was requested from a provider that does not support it.
+    #[error("unsupported provider capability: {capability}")]
+    Unsupported {
+        /// Unsupported capability name.
+        capability: &'static str,
+    },
 }
 
 /// The stage at which a timeout occurred: one-to-one with

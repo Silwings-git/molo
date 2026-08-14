@@ -149,6 +149,7 @@ pub mod mcp;
 pub mod memory;
 pub mod message;
 pub mod message_channel;
+pub mod observability;
 pub mod provider;
 pub mod run;
 #[cfg(feature = "skills")]
@@ -199,7 +200,9 @@ pub use effect::{
     DisplayFormat, DisplayOutput, EffectKind, EffectObservation, EffectOutput, EffectRequest,
     EffectSource, EffectStatus, RiskLevel,
 };
-pub use event_channel::{BroadcastEventChannel, EventChannel, EventReceiver, MpscEventChannel};
+pub use event_channel::{
+    BroadcastEventChannel, EventChannel, EventChannelStats, EventReceiver, MpscEventChannel,
+};
 #[cfg(feature = "harness")]
 pub use harness::{
     AgentActionSummary, AlwaysAllowApprovalBroker, AlwaysDenyApprovalBroker, ApprovalBroker,
@@ -209,9 +212,8 @@ pub use harness::{
     HarnessRuntime, HarnessRuntimeConfig, HarnessRuntimeError, LimitedOutput, ModelSummary,
     NetworkPolicy, NoopAuditSink, NoopEffectExecutor, NoopRedactor, NoopTranscriptStore,
     OutputLimit, PatternRedactor, PolicyDecision, PolicyEngine, RawEffectOutput, RedactedText,
-    RedactionRecord, Redactor, RouterEffectExecutor, SandboxPolicy, StaticApprovalBroker,
-    StaticEffectExecutor, TranscriptError, TranscriptRecord, TranscriptStore, VecAuditSink,
-    VecTranscriptStore,
+    Redactor, RouterEffectExecutor, SandboxPolicy, StaticApprovalBroker, StaticEffectExecutor,
+    TranscriptError, TranscriptRecord, TranscriptStore, VecAuditSink, VecTranscriptStore,
 };
 #[cfg(feature = "mcp")]
 pub use mcp::{
@@ -234,9 +236,11 @@ pub use message_channel::{
     BroadcastChannel, BroadcastReceiver, ChannelError, IncomingMessage, MessageChannel,
     MpscChannel, WatchChannel, WatchReceiver,
 };
+pub use observability::{AgentEventRecord, EventSeverity, RedactionRecord};
 pub use provider::{
     Backoff, ChatRequest, ChatResponse, FakeProvider, FakeReply, FinishReason, ModelOptions,
-    Provider, ProviderError, RetryPolicy, RetryProvider, Retryable, StreamEvent, Usage,
+    Provider, ProviderCapabilities, ProviderError, ProviderRequestContext, RetryPolicy,
+    RetryProvider, Retryable, StreamEvent, Usage,
 };
 #[cfg(feature = "openai")]
 pub use provider::{OpenAiProvider, StructuredOutputMode};

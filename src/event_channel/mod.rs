@@ -29,9 +29,10 @@
 //! - a single subscriber (one consumer with exclusive access) → [`MpscEventChannel`].
 //!
 //! Both can drop events (broadcast drops the oldest, a single queue drops new ones when full) — that is a
-//! deliberate trade-off of observation semantics; interactions that need reliable delivery (approval,
-//! confirmation) go through [`MessageChannel`](crate::message_channel::MessageChannel) and must not be
-//! carried by event channels.
+//! deliberate trade-off of observation semantics; [`EventChannelStats`] reports drop / lag counters for
+//! diagnosis, but interactions that need reliable delivery (approval, confirmation) go through
+//! [`MessageChannel`](crate::message_channel::MessageChannel), and side-effect audit belongs to the harness
+//! layer.
 
 mod broadcast;
 mod mpsc;
@@ -41,7 +42,28 @@ pub use mpsc::MpscEventChannel;
 
 use crate::agent::AgentEvent;
 use futures::future::BoxFuture;
+use serde::{Deserialize, Serialize};
 use std::sync::Arc;
+
+/// Diagnostic counters for best-effort event channels.
+///
+/// These counters are observability signals only; they do not provide
+/// backpressure, replay, or reliable audit semantics.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EventChannelStats {
+    /// Publish attempts.
+    pub published: u64,
+    /// Events accepted by the channel implementation.
+    pub delivered: u64,
+    /// Events dropped because no subscriber was available.
+    pub dropped_no_subscribers: u64,
+    /// Events dropped because a bounded queue was full.
+    pub dropped_full: u64,
+    /// Events skipped by lagging broadcast receivers.
+    pub lagged: u64,
+    /// Current subscriber count when known.
+    pub subscribers: usize,
+}
 
 /// The unified receive-end interface: the environment side takes subscribed events out one by one.
 ///
@@ -118,6 +140,11 @@ pub trait EventChannel: Send + Sync {
 
     /// Subscribes a receive end.
     fn subscribe(&self) -> Box<dyn EventReceiver>;
+
+    /// Returns best-effort diagnostic counters.
+    fn stats(&self) -> EventChannelStats {
+        EventChannelStats::default()
+    }
 }
 
 #[cfg(test)]

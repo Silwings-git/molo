@@ -157,7 +157,7 @@ root re-exports each module's core items, so `use molo::...` covers most cases:
 | Concept | What it does | Key types |
 | --- | --- | --- |
 | Agent | the reasoning loop | `Agent`, `AgentKernel`, `AgentAction`, `ReActAgent`, `react_agent!`, `CancellableAgent`; `TypedAgent` with `structured` |
-| Provider | LLM communication | `Provider`, `RetryProvider`, `FakeProvider`; `OpenAiProvider` with `openai` |
+| Provider | LLM communication | `Provider`, `ProviderCapabilities`, `ProviderRequestContext`, `RetryProvider`, `FakeProvider`; `OpenAiProvider` with `openai` |
 | Memory | context management | `Memory`, `InMemoryMemory`, `WindowMemory`, `SummarizeStrategy` |
 | Tool | model-visible capabilities | `Tool`, `ToolSchema`, `ToolPolicy`, `ToolOutput`, `ToolResult`, `ToolRegistry`, `SharedState`; `#[molo::tool]` with `macros` |
 | Effect | side-effect boundary | `EffectRequest`, `EffectObservation`, `EffectKind`, `RiskLevel` |
@@ -316,7 +316,11 @@ mid-reply leaves no residue and the next turn starts fresh.
 - `Provider::stream_chat` — raw `StreamEvent` stream (deltas, reasoning,
   tool calls).
 - `EventChannel` — subscribe to the `AgentEvent` stream of a run for
-  decoupled observation.
+  decoupled best-effort observation; `EventChannelStats` reports drops and
+  lag.
+- `AgentEventRecord` — optional serializable, redacted event summaries for
+  logs/devtools; raw deltas, reasoning and tool arguments are omitted by
+  default.
 - With `features = ["tracing"]`, loops emit `tracing` spans at fixed points
   (`agent.run`, `llm_request`, `tool`). No subscriber is installed — bring
   your own (e.g. `tracing-subscriber`), and wire OpenTelemetry yourself if

@@ -11,7 +11,8 @@
 
 use crate::message::{Message, ToolCall};
 use crate::provider::{
-    ChatRequest, ChatResponse, FinishReason, Provider, ProviderError, StreamEvent, Usage,
+    ChatRequest, ChatResponse, FinishReason, Provider, ProviderCapabilities, ProviderError,
+    ProviderRequestContext, StreamEvent, TimeoutStage, Usage,
 };
 use futures::stream::BoxStream;
 use std::collections::VecDeque;
@@ -69,10 +70,9 @@ impl FakeReply {
 /// replies, consumed in order by `chat` / `stream_chat`.
 ///
 /// - Each call consumes one script turn and records the request; **once the
-///   script is exhausted, calls return
-///   [`ProviderError::Api`](ProviderError::Api)("script exhausted") and do not
-///   replay** — an Agent running an extra turn fails explicitly right away in
-///   tests;
+///   script is exhausted, calls return [`ProviderError::Protocol`] and do
+///   not replay** — an Agent running an extra turn fails explicitly right
+///   away in tests;
 /// - `chat` and `stream_chat` consume the same script with the same
 ///   semantics, differing only in how the reply is delivered (an event stream
 ///   = several increments + one `Done`);
@@ -184,6 +184,19 @@ impl FakeProvider {
 
 #[async_trait::async_trait]
 impl Provider for FakeProvider {
+    fn capabilities(&self) -> ProviderCapabilities {
+        ProviderCapabilities {
+            streaming: true,
+            reasoning: true,
+            tool_calls: true,
+            parallel_tool_calls: true,
+            structured_output: true,
+            usage: true,
+            context_cancellation: true,
+            context_deadline: true,
+        }
+    }
+
     async fn chat(&self, request: ChatRequest) -> Result<ChatResponse, ProviderError> {
         self.requests
             .lock()
@@ -195,15 +208,20 @@ impl Provider for FakeProvider {
             .expect("FakeProvider internal lock poisoned")
             .pop_front()
         {
-            // Script exhaustion is not a vendor error: status 0 = non-HTTP
-            // source, naturally distinct from HTTP errors returned by a
-            // vendor (see the field docs on ProviderError::Api).
-            None => Err(ProviderError::Api {
-                status: 0,
+            None => Err(ProviderError::Protocol {
                 message: EXHAUSTED_MSG.to_string(),
             }),
             Some(reply) => chat_response(reply),
         }
+    }
+
+    async fn chat_with_context(
+        &self,
+        request: ChatRequest,
+        context: &ProviderRequestContext,
+    ) -> Result<ChatResponse, ProviderError> {
+        check_context(context)?;
+        self.chat(request).await
     }
 
     async fn stream_chat(
@@ -224,8 +242,7 @@ impl Provider for FakeProvider {
             .pop_front()
         {
             None => {
-                return Err(ProviderError::Api {
-                    status: 0,
+                return Err(ProviderError::Protocol {
                     message: EXHAUSTED_MSG.to_string(),
                 });
             }
@@ -243,6 +260,25 @@ impl Provider for FakeProvider {
             }
         }
         Ok(Box::pin(futures::stream::iter(events)))
+    }
+
+    async fn stream_chat_with_context(
+        &self,
+        request: ChatRequest,
+        context: &ProviderRequestContext,
+    ) -> Result<BoxStream<'static, Result<StreamEvent, ProviderError>>, ProviderError> {
+        check_context(context)?;
+        self.stream_chat(request).await
+    }
+}
+
+fn check_context(context: &ProviderRequestContext) -> Result<(), ProviderError> {
+    if context.is_cancelled() {
+        Err(ProviderError::Cancelled)
+    } else if context.is_expired() {
+        Err(ProviderError::Timeout(TimeoutStage::Request))
+    } else {
+        Ok(())
     }
 }
 
@@ -347,8 +383,7 @@ fn stream_events(
         // Defensive fallback: on the normal path the caller (stream_chat) has
         // already unwrapped recursively, so this arm should not be reached;
         // return an error rather than panicking on an unwrapped call.
-        FakeReply::WithUsage { .. } => Err(ProviderError::Api {
-            status: 0,
+        FakeReply::WithUsage { .. } => Err(ProviderError::Protocol {
             message: "internal error: WithUsage must be unwrapped before stream_events".into(),
         }),
     }
@@ -359,8 +394,20 @@ fn stream_events(
 /// RetryProvider's attempt count).
 #[async_trait::async_trait]
 impl Provider for Arc<FakeProvider> {
+    fn capabilities(&self) -> ProviderCapabilities {
+        self.as_ref().capabilities()
+    }
+
     async fn chat(&self, request: ChatRequest) -> Result<ChatResponse, ProviderError> {
         self.as_ref().chat(request).await
+    }
+
+    async fn chat_with_context(
+        &self,
+        request: ChatRequest,
+        context: &ProviderRequestContext,
+    ) -> Result<ChatResponse, ProviderError> {
+        self.as_ref().chat_with_context(request, context).await
     }
 
     async fn stream_chat(
@@ -368,6 +415,16 @@ impl Provider for Arc<FakeProvider> {
         request: ChatRequest,
     ) -> Result<BoxStream<'static, Result<StreamEvent, ProviderError>>, ProviderError> {
         self.as_ref().stream_chat(request).await
+    }
+
+    async fn stream_chat_with_context(
+        &self,
+        request: ChatRequest,
+        context: &ProviderRequestContext,
+    ) -> Result<BoxStream<'static, Result<StreamEvent, ProviderError>>, ProviderError> {
+        self.as_ref()
+            .stream_chat_with_context(request, context)
+            .await
     }
 }
 
@@ -395,7 +452,7 @@ mod tests {
         fake.chat(ChatRequest::default()).await.unwrap();
 
         let err = fake.chat(ChatRequest::default()).await.unwrap_err();
-        assert!(matches!(err, ProviderError::Api { message: m, .. } if m.contains("exhausted")));
+        assert!(matches!(err, ProviderError::Protocol { message: m } if m.contains("exhausted")));
 
         // The exhausted call still records its request, so assertions can
         // still see what the Agent last sent.
@@ -499,18 +556,13 @@ mod tests {
     #[tokio::test]
     async fn error_reply_passthrough_and_script_continues() {
         let fake = FakeProvider::new([
-            FakeReply::Error(ProviderError::Api {
-                status: 429,
-                message: "rate limited".into(),
-            }),
+            FakeReply::Error(ProviderError::RateLimited { retry_after: None }),
             FakeReply::Text("ok".into()),
         ]);
 
         // This turn fails: the error is returned as-is.
         let err = fake.chat(ChatRequest::default()).await.unwrap_err();
-        assert!(
-            matches!(err, ProviderError::Api { status: 429, message: m } if m == "rate limited")
-        );
+        assert!(matches!(err, ProviderError::RateLimited { .. }));
 
         // The failed turn has been consumed; the next turn continues the
         // script.
@@ -586,6 +638,7 @@ mod tests {
     async fn stream_chat_error_reply_returns_err() {
         let fake = FakeProvider::new([FakeReply::Error(ProviderError::Api {
             status: 400,
+            code: None,
             message: "boom".into(),
         })]);
         // Boundary behavior consistent with chat: this turn's failure makes
@@ -593,6 +646,7 @@ mod tests {
         match fake.stream_chat(ChatRequest::default()).await {
             Err(ProviderError::Api {
                 status: 400,
+                code: None,
                 message: m,
             }) => assert_eq!(m, "boom"),
             Ok(_) => panic!("expected error"),
@@ -608,9 +662,9 @@ mod tests {
         drop(fake.stream_chat(ChatRequest::default()).await.unwrap());
 
         match fake.stream_chat(ChatRequest::default()).await {
-            Err(ProviderError::Api { message: m, .. }) => assert!(m.contains("exhausted")),
+            Err(ProviderError::Protocol { message: m }) => assert!(m.contains("exhausted")),
             Ok(_) => panic!("expected error"),
-            Err(other) => panic!("expected Api error, got {other:?}"),
+            Err(other) => panic!("expected Protocol error, got {other:?}"),
         }
     }
 

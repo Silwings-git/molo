@@ -68,6 +68,7 @@ pub use sub_agent::{PoolError, SubAgentPool, SubAgentTool};
 
 use crate::effect::{EffectObservation, EffectRequest};
 use crate::memory::MemoryError;
+use crate::observability::AgentEventRecord;
 use crate::provider::{ChatRequest, ChatResponse, ProviderError};
 #[cfg(feature = "structured")]
 use crate::run::TypedRunOutput;
@@ -533,6 +534,16 @@ pub trait AgentEvent: std::any::Any + Send + Sync + fmt::Debug {
     /// (e.g. `"tool.started"`).
     fn name(&self) -> &'static str {
         std::any::type_name::<Self>()
+    }
+
+    /// Returns a sanitized serializable record for external observers.
+    ///
+    /// The default keeps custom events low-cost and process-local. Framework
+    /// event types such as [`ReActEvent`] override this with records that
+    /// summarize ids, statuses, counts, sizes, and redaction markers without
+    /// dumping raw prompt/model/tool content.
+    fn to_record(&self) -> Option<AgentEventRecord> {
+        None
     }
 }
 

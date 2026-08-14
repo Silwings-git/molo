@@ -12,9 +12,10 @@
 //! For a comparison with [`MpscEventChannel`](crate::event_channel::MpscEventChannel),
 //! see the [event channel module](crate::event_channel).
 
-use super::{AgentEvent, EventChannel, EventReceiver};
+use super::{AgentEvent, EventChannel, EventChannelStats, EventReceiver};
 use futures::future::BoxFuture;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// A broadcast event channel: multiple subscribers, each consuming independently; slow subscribers drop the oldest.
 ///
@@ -50,6 +51,15 @@ use std::sync::Arc;
 #[derive(Debug, Clone)]
 pub struct BroadcastEventChannel {
     tx: tokio::sync::broadcast::Sender<Arc<dyn AgentEvent>>,
+    stats: Arc<BroadcastStats>,
+}
+
+#[derive(Debug, Default)]
+struct BroadcastStats {
+    published: AtomicU64,
+    delivered: AtomicU64,
+    dropped_no_subscribers: AtomicU64,
+    lagged: AtomicU64,
 }
 
 impl Default for BroadcastEventChannel {
@@ -70,20 +80,47 @@ impl BroadcastEventChannel {
     /// use 1 for unbuffered semantics.
     pub fn new(capacity: usize) -> Self {
         let (tx, _rx) = tokio::sync::broadcast::channel(capacity);
-        Self { tx }
+        Self {
+            tx,
+            stats: Arc::new(BroadcastStats::default()),
+        }
     }
 }
 
 impl EventChannel for BroadcastEventChannel {
     fn publish(&self, event: Arc<dyn AgentEvent>) {
+        self.stats.published.fetch_add(1, Ordering::Relaxed);
         // send returns Err when there are no subscribers — observation semantics; silently drop.
-        let _ = self.tx.send(event);
+        match self.tx.send(event) {
+            Ok(receivers) => {
+                self.stats
+                    .delivered
+                    .fetch_add(receivers as u64, Ordering::Relaxed);
+            }
+            Err(_) => {
+                self.stats
+                    .dropped_no_subscribers
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+        }
     }
 
     fn subscribe(&self) -> Box<dyn EventReceiver> {
         Box::new(BroadcastEventReceiver {
             rx: self.tx.subscribe(),
+            stats: self.stats.clone(),
         })
+    }
+
+    fn stats(&self) -> EventChannelStats {
+        EventChannelStats {
+            published: self.stats.published.load(Ordering::Relaxed),
+            delivered: self.stats.delivered.load(Ordering::Relaxed),
+            dropped_no_subscribers: self.stats.dropped_no_subscribers.load(Ordering::Relaxed),
+            dropped_full: 0,
+            lagged: self.stats.lagged.load(Ordering::Relaxed),
+            subscribers: self.tx.receiver_count(),
+        }
     }
 }
 
@@ -91,6 +128,7 @@ impl EventChannel for BroadcastEventChannel {
 /// (Lagged), and the stream ends after all senders are dropped.
 struct BroadcastEventReceiver {
     rx: tokio::sync::broadcast::Receiver<Arc<dyn AgentEvent>>,
+    stats: Arc<BroadcastStats>,
 }
 
 impl EventReceiver for BroadcastEventReceiver {
@@ -100,7 +138,10 @@ impl EventReceiver for BroadcastEventReceiver {
                 match self.rx.recv().await {
                     Ok(event) => return Some(event),
                     // A slow subscriber was skipped (Lagged): missed is missed; keep waiting for the next one.
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                        self.stats.lagged.fetch_add(n, Ordering::Relaxed);
+                        continue;
+                    }
                     // All senders have been dropped: the stream ends.
                     Err(_) => return None,
                 }
@@ -172,6 +213,7 @@ mod tests {
         let second = input_of(&*rx.recv().await.unwrap()).to_string();
         assert_eq!(second, "3"); // the newest always arrives
         assert!(first == "2" || first == "3"); // only the oldest can have been skipped
+        assert!(ch.stats().lagged >= 1);
     }
 
     /// Events published before subscribing are missed (the cursor only aligns at subscribe time).
@@ -179,8 +221,12 @@ mod tests {
     async fn events_before_subscribe_missed() {
         let ch = BroadcastEventChannel::new(16);
         ch.publish(ev("1"));
+        let stats = ch.stats();
+        assert_eq!(stats.published, 1);
+        assert_eq!(stats.dropped_no_subscribers, 1);
         let mut rx = ch.subscribe();
         assert!(rx.recv().now_or_never().is_none());
+        assert_eq!(ch.stats().subscribers, 1);
     }
 
     /// The stream ends after all senders are dropped (buffered events are still receivable).
