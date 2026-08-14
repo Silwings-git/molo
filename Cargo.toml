@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "molo-macros"]
+members = [".", "molo-macros", "molo-cli"]
 resolver = "2"
 
 [package]

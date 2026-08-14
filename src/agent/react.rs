@@ -83,7 +83,7 @@ use tracing::Instrument;
 /// Returns [`ReActAgent`](crate::agent::ReActAgent); chained
 /// [`with_memory`](ReActAgent::with_memory) / [`with_config`](ReActAgent::with_config) /
 /// [`with_state`](ReActAgent::with_state) / [`with_event_channel`](ReActAgent::with_event_channel) /
-/// [`with_skills`](ReActAgent::with_skills) /
+/// `with_skills` /
 /// [`with_tool_round_executor`](ReActAgent::with_tool_round_executor) work as usual.
 /// `ReActAgent::new` keeps a single signature; the macro handles the
 /// multiple shapes.

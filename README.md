@@ -247,6 +247,23 @@ policy, approval, audit, and transcript handling.
 
 See [Coding Agents](docs/coding-agent.md) for the SDK boundary and examples.
 
+### Reference CLI
+
+This repository also contains a `publish = false` reference CLI package:
+
+```bash
+cargo run -p molo-cli -- --help
+cargo run -p molo-cli -- chat --no-stream "hello"
+cargo run -p molo-cli -- --workspace . code "inspect this repo"
+cargo run -p molo-cli -- review --json
+```
+
+The binary name is `molo`. It is a dogfooding and architecture-validation
+tool for composing the provider, harness, and coding layers; it is not a
+stable end-user product API. Fake-provider mode is the default, so smoke tests
+and rehearsals do not need an API key. Use `--provider openai --base-url ...`
+with `--api-key-env NAME` to try an OpenAI-compatible provider.
+
 ### Typed (structured) output
 
 Requires `features = ["structured"]`.

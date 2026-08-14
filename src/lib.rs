@@ -22,7 +22,7 @@
 //! - `openai`: [`OpenAiProvider`] and OpenAI-compatible HTTP support.
 //! - `structured`: typed output, [`StructuredValidator`], and JSON Schema
 //!   validation.
-//! - `macros`: the [`tool`](macro@molo::tool) attribute macro. This also
+//! - `macros`: the `#[molo::tool]` attribute macro. This also
 //!   enables `structured` because macro-generated schemas use `schemars`.
 //! - `skills`: Agent Skills protocol support.
 //! - `mcp`: MCP client adapter support.
@@ -86,8 +86,8 @@
 //! - [`tool`](mod@crate::tool): external capabilities — the [`Tool`]
 //!   interface and tool definitions ([`ToolSchema`]), registration and
 //!   execution ([`ToolRegistry`]), cross-tool shared state
-//!   ([`SharedState`]), and the procedural macro for one-shot tool
-//!   definitions [`tool`](macro@molo::tool) with the `macros` feature;
+//!   ([`SharedState`]), and the `#[molo::tool]` procedural macro for
+//!   one-shot tool definitions with the `macros` feature;
 //! - `skill` — skills — capability packages following the Agent Skills
 //!   open protocol, available with the `skills` feature;
 //! - `mcp` — MCP client adapter, available with the `mcp` feature;
