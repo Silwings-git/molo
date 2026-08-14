@@ -5,7 +5,7 @@ error[E0277]: the trait bound `molo::ToolResult: From<u32>` is not satisfied
   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ the trait `From<u32>` is not implemented for `molo::ToolResult`
   |
 help: `molo::ToolResult` implements trait `From<T>`
- --> src/tool/mod.rs
+ --> molo-core/src/tool/mod.rs
   |
   | impl From<ToolOutput> for ToolResult {
   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ `From<ToolOutput>`

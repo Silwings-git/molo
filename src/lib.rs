@@ -1,46 +1,39 @@
 //! molo — an embeddable Rust agent runtime and harness framework.
 #![warn(missing_docs)]
 //!
-//! molo = **Mo**del **Lo**op: an embeddable Rust runtime and harness
-//! framework for building safe, extensible tool-calling agents, with
-//! first-class support for coding-agent workloads.
+//! The `molo` crate is the facade over the molo workspace crates. It keeps
+//! the ergonomic `molo::...` import path while the implementation is split
+//! into focused crates:
 //!
-//! molo is a library, not an end-user agent product. You assemble agents
-//! from its building blocks — model interaction, reasoning loop, memory,
-//! tools, structured output, and observability. Optional harness and coding
-//! layers provide governed side-effect execution (approval, sandbox, audit,
-//! transcript) and coding-workload primitives (workspace, shell, git, patch,
-//! repo context). Public API breaking changes are expected throughout 0.x as
-//! these layers mature, and each one ships with a migration path.
+//! - `molo-core`: message, run, provider, tool, and effect protocols.
+//! - `molo-agent`: agent runtime, memory, channels, and tool registry.
+//! - `molo-harness`: governed effect execution.
+//! - `molo-coding`: coding-workload primitives.
+//! - `molo-mcp`: MCP adapter.
+//! - `molo-skills`: Agent Skills protocol.
+//! - `molo-openai`: OpenAI-compatible provider.
 //!
 //! # Feature Flags
 //!
-//! The default dependency surface is the lightweight core path. Optional
-//! capabilities are enabled explicitly:
+//! The default surface stays lightweight. Enable optional layers explicitly:
 //!
-//! - `openai`: [`OpenAiProvider`] and OpenAI-compatible HTTP support.
-//! - `structured`: typed output, [`StructuredValidator`], and JSON Schema
-//!   validation.
-//! - `macros`: the `#[molo::tool]` attribute macro. This also
-//!   enables `structured` because macro-generated schemas use `schemars`.
+//! - `openai`: `OpenAiProvider` and OpenAI-compatible HTTP/SSE support.
+//! - `structured`: typed output and JSON Schema validation.
+//! - `macros`: the `#[molo::tool]` attribute macro; also enables
+//!   `structured`.
 //! - `skills`: Agent Skills protocol support.
-//! - `mcp`: MCP client adapter support.
-//! - `harness`: `HarnessRuntime` and governed effect execution.
-//! - `coding`: coding-workload primitives on top of `harness`: workspace
-//!   paths, file effects, commands, git inspection, repo search, project
-//!   instructions, and context gathering.
-//! - `cli-channel`: [`CliMessageChannel`] for stdin/stdout interaction.
+//! - `mcp`: MCP client/tool adapter support.
+//! - `harness`: governed effect execution.
+//! - `coding`: coding-workload primitives on top of `harness`.
+//! - `cli-channel`: stdin/stdout message channel.
 //! - `tracing`: internal tracing spans and logs.
 //! - `full`: all optional capabilities above.
 //!
 //! # Quick Start
 //!
-//! A minimal agent needs only three things: a [`Provider`] to talk to the
-//! LLM, a [`Memory`] to manage context, and a [`Tool`] for external
-//! capabilities; the reasoning loop is built into [`ReActAgent`], and the
-//! [`react_agent!`] macro assembles everything in one go. To self-test the
-//! loop, use [`FakeProvider`] to inject scripted replies without depending
-//! on a real API:
+//! A minimal agent needs a [`Provider`], memory, and an optional
+//! [`ToolRegistry`]. The [`react_agent!`] macro assembles the default ReAct
+//! runtime while keeping the familiar `molo::...` path:
 //!
 //! ```rust
 //! # #[tokio::main]
@@ -51,117 +44,99 @@
 //!     FakeProvider::new([FakeReply::Text("Hello".into())]),
 //!     "You are a helpful assistant",
 //! );
+//!
 //! let answer = agent.run("Are you there?").await?;
 //! assert_eq!(answer, "Hello");
 //! # Ok(())
 //! # }
 //! ```
 //!
-//! For a real LLM, enable the `openai` feature and swap [`FakeProvider`] for
-//! [`OpenAiProvider`]; for retry
-//! and timeout protection, wrap it in [`RetryProvider`]; for interaction
-//! with the outside world (human approval, agent-to-agent conversation),
-//! attach a [`MessageChannel`]; to observe the reasoning process, attach an
-//! [`EventChannel`].
-//!
-//! # Component Overview
-//!
-//! Code is organized into domain modules, one concept per module; the top
-//! level re-exports each module's core items, so `use molo::...` covers
-//! most cases without digging into module paths:
-//!
-//! - [`agent`] — the agent interface and reasoning loop — [`Agent`] /
-//!   [`AgentError`], typed output via [`TypedAgent`]
-//!   with the validator [`StructuredValidator`] when the `structured`
-//!   feature is enabled, the [`ReActAgent`] assembly with the
-//!   [`react_agent!`] macro, sub-agent parts
-//!   ([`SubAgentTool`](crate::agent::SubAgentTool) /
-//!   [`SubAgentPool`](crate::agent::SubAgentPool)), streaming output chunks
-//!   and run summaries ([`MessageChunk`] / [`RunSummary`]);
-//! - [`provider`] — LLM communication — the [`Provider`] interface,
-//!   request / response / usage models ([`ChatRequest`] / [`ChatResponse`] /
-//!   [`Usage`]), and implementations [`RetryProvider`] / [`FakeProvider`],
-//!   plus [`OpenAiProvider`] with the `openai` feature;
-//! - [`tool`](mod@crate::tool): external capabilities — the [`Tool`]
-//!   interface and tool definitions ([`ToolSchema`]), registration and
-//!   execution ([`ToolRegistry`]), cross-tool shared state
-//!   ([`SharedState`]), and the `#[molo::tool]` procedural macro for
-//!   one-shot tool definitions with the `macros` feature;
-//! - `skill` — skills — capability packages following the Agent Skills
-//!   open protocol, available with the `skills` feature;
-//! - `mcp` — MCP client adapter, available with the `mcp` feature;
-//! - [`memory`] — context management — the [`Memory`] interface and
-//!   implementations [`InMemoryMemory`] / [`WindowMemory`] (trims the
-//!   oldest turns by token budget), summary compression
-//!   [`SummarizeStrategy`] — old messages over budget are compressed into a
-//!   single summary;
-//! - [`message`] — the conversation message model — [`Message`] /
-//!   [`ContentBlock`] / [`ToolCall`];
-//! - [`message_channel`] — channels for external conversation — in-process
-//!   request-reply / notification channels, plus [`CliMessageChannel`] with
-//!   the `cli-channel` feature;
-//! - [`event_channel`] — observation channels — subscribe to the event
-//!   stream of an agent run ([`AgentEvent`] payloads).
-//!
-//! # Choosing Between Implementations
-//!
-//! When several implementations share a responsibility, pick per scenario:
-//!
-//! - **Context**: short sessions or unbounded needs use
-//!   [`InMemoryMemory`]; long sessions that must stay within budget use
-//!   [`WindowMemory`];
-//! - **Talking to the LLM**: for development, inject scripted replies with
-//!   [`FakeProvider`], no real API needed; for production enable `openai`
-//!   and use [`OpenAiProvider`], wrapped in [`RetryProvider`] for retry /
-//!   timeout protection;
-//! - **External conversation**: use [`MpscChannel`] for one-to-one
-//!   in-process agent conversation, [`BroadcastChannel`] / [`WatchChannel`]
-//!   for one-to-many broadcast / latest-value change notifications, and
-//!   [`CliMessageChannel`] with `cli-channel` for human-terminal
-//!   interaction;
-//! - **Observing the reasoning process**: subscribe to agent events via
-//!   [`BroadcastEventChannel`] (multiple subscribers; slow ones drop the
-//!   oldest events) or [`MpscEventChannel`] (single subscriber; nothing is
-//!   dropped within capacity).
-//!
-//! # Notes
-//!
-//! - molo targets the tokio ecosystem: all async APIs require a tokio
-//!   runtime; the library ships no runtime of its own, so callers bring
-//!   their own (examples uniformly use `#[tokio::main]`);
-//! - cancellation is cooperative: callers pass a [`RunContext`] with a
-//!   [`CancellationToken`] for the run, and the loop responds at safe points;
-//! - tool execution failure does not abort the reasoning loop: the error
-//!   text is passed back to the model, which decides what to do next.
+//! Applications can keep using the facade crate, or depend on focused crates
+//! such as `molo-core`, `molo-agent`, and `molo-harness` when they need a
+//! smaller dependency surface.
 
-pub mod agent;
+pub mod agent {
+    //! Agent runtime facade.
+    pub use molo_agent::agent::*;
+}
+
 #[cfg(feature = "coding")]
-pub mod coding;
-pub mod effect;
-pub mod event_channel;
-#[cfg(feature = "harness")]
-pub mod harness;
-#[cfg(feature = "mcp")]
-pub mod mcp;
-pub mod memory;
-pub mod message;
-pub mod message_channel;
-pub mod observability;
-pub mod provider;
-pub mod run;
-#[cfg(feature = "skills")]
-pub mod skill;
-pub mod tool;
+pub mod coding {
+    //! Coding-workload primitives facade.
+    pub use molo_coding::*;
+}
 
-// `extern crate self`: lets macro-expanded code (which hardcodes `::molo::`
-// paths) and in-crate tests refer to this crate as `molo::`.
+pub mod effect {
+    //! Effect protocol facade.
+    pub use molo_core::effect::*;
+}
+
+pub mod event_channel {
+    //! Event channel facade.
+    pub use molo_agent::event_channel::*;
+}
+
+#[cfg(feature = "harness")]
+pub mod harness {
+    //! Harness runtime facade.
+    pub use molo_harness::*;
+}
+
+pub mod memory {
+    //! Memory facade.
+    pub use molo_agent::memory::*;
+}
+
+pub mod message {
+    //! Message model facade.
+    pub use molo_core::message::*;
+}
+
+pub mod message_channel {
+    //! Message channel facade.
+    pub use molo_agent::message_channel::*;
+}
+
+#[cfg(feature = "mcp")]
+pub mod mcp {
+    //! MCP adapter facade.
+    pub use molo_mcp::*;
+}
+
+pub mod observability {
+    //! Observability facade.
+    pub use molo_core::observability::*;
+}
+
+pub mod provider {
+    //! Provider facade.
+    pub use molo_core::provider::*;
+    #[cfg(feature = "openai")]
+    pub use molo_openai::{OpenAiProvider, StructuredOutputMode};
+}
+
+pub mod run {
+    //! Run protocol facade.
+    pub use molo_core::run::*;
+}
+
+#[cfg(feature = "skills")]
+pub mod skill {
+    //! Agent Skills facade.
+    pub use molo_skills::*;
+}
+
+pub mod tool {
+    //! Tool protocol and registry facade.
+    pub use molo_agent::tool::{MissingTools, RegistryError, ToolRegistry};
+    pub use molo_core::tool::*;
+}
+
+// `extern crate self`: macro-expanded code hardcodes `::molo::...`.
 extern crate self as molo;
 
-// Re-export the procedural macro and helper trait: code expanded by
-// `#[molo::tool]` references `::molo::tool` and `::molo::async_trait`,
-// which transitive dependencies cannot resolve from user crates, so they
-// are routed through this crate's root.
-pub use async_trait::async_trait;
+pub use molo_agent::react_agent;
+pub use molo_core::async_trait;
 #[cfg(feature = "macros")]
 pub use molo_macros::tool;
 
@@ -233,6 +208,7 @@ pub use message_channel::{
     BroadcastChannel, BroadcastReceiver, ChannelError, IncomingMessage, MessageChannel,
     MpscChannel, WatchChannel, WatchReceiver,
 };
+pub use molo_core::CancellationToken;
 pub use observability::{AgentEventRecord, EventSeverity, RedactionRecord};
 pub use provider::{
     Backoff, ChatRequest, ChatResponse, FakeProvider, FakeReply, FinishReason, ModelOptions,
@@ -255,7 +231,3 @@ pub use tool::{
     ToolMemoryPolicy, ToolNamespace, ToolNamespaceKind, ToolOutput, ToolPolicy, ToolRegistry,
     ToolResult, ToolSchema, ToolSource, ToolTrustLevel,
 };
-
-// Cooperative cancellation primitive (a standard tokio-util component), re-exported
-// so callers can build RunContext values without depending on tokio-util directly.
-pub use tokio_util::sync::CancellationToken;

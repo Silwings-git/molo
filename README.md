@@ -29,14 +29,12 @@ rules.
 
 ## Status
 
-molo is in early 0.x development. The `0.3.x` crate ships the `ReActAgent`
-reasoning loop, provider traits, memory, tools, effects, optional
-OpenAI-compatible provider, MCP, skills, structured output, macros,
-observability, the optional `harness` runtime for governed effect execution,
-and an optional `coding` SDK for workspace, patch, command, git, search,
-project instructions, and coding context primitives. Public API breaking
-changes are expected throughout 0.x as these layers mature; each one ships with
-a migration path.
+molo is in early 0.x development. The `molo` crate is now a facade over
+focused workspace crates: `molo-core`, `molo-agent`, `molo-harness`,
+`molo-coding`, `molo-mcp`, `molo-skills`, `molo-openai`, and `molo-macros`.
+The facade keeps the ergonomic `molo::...` import path while optional features
+select the underlying layers. Public API breaking changes are expected
+throughout 0.x as these layers mature; each one ships with a migration path.
 
 ## ✨ Features
 

@@ -36,6 +36,7 @@ molo 是库和框架，不是最终用户产品。它不提供默认 CLI 体验�
 | `molo-coding` | coding workload SDK | `LocalWorkspace`、`PatchApplier`、`GitInspector`、`RepoSearcher`、`RipgrepSearcher`、`ShellCommandExecutor`、`TestRunner`、`InstructionResolver`、`CodingContextProvider`、effect adapter | CLI/TUI、产品策略、绕过 harness 的直接副作用 |
 | `molo-mcp` | MCP adapter | MCP client、MCP tool/effect adapter、server namespace、permission bridge、tool unloading | 成为 `molo-core` 的默认依赖 |
 | `molo-skills` | skills 协议 | `Skill`、`SkillRegistry`、skill 加载、progressive disclosure、allowed tools | effect 执行、成为 `molo-core` 的默认依赖 |
+| `molo-openai` | OpenAI-compatible provider adapter | `OpenAiProvider`、OpenAI-compatible wire mapping、SSE stream parsing | 成为 `molo-core` 的默认依赖 |
 | `molo-cli` | 用于验证架构的 reference CLI | `chat`、`code`、`review`、`resume` 命令、config、transcript、approval prompt | molo 的主要产品形态 |
 
 ## 依赖方向
@@ -44,15 +45,15 @@ molo 是库和框架，不是最终用户产品。它不提供默认 CLI 体验�
 
 ```text
                         molo-cli
-                      /    |    \
-            molo-coding    |     \
-                 \    molo-harness  molo-mcp   molo-skills
-                  \      |            \          /
-                   \     |             \        /
-                    molo-agent          \      /
-                        \                \    /
-                         \                v  /
-                          +----- molo-core ----+
+                 /     /   |   \      \
+        molo-openai   /    |    \      \
+             \       / molo-coding  molo-mcp   molo-skills
+              \     /       \          \          /
+               \   /    molo-harness    \        /
+                \ /          |            \      /
+             molo-agent -----+-------------\----/
+                    \                       v
+                     +------------- molo-core
 ```
 
 具体规则：
@@ -67,6 +68,8 @@ molo 是库和框架，不是最终用户产品。它不提供默认 CLI 体验�
   MCP 副作用转换为 harness effect。
 - `molo-skills` 依赖 `molo-agent` 与 `molo-core`：是 loop 的装配层，不执行
   任何 effect。
+- `molo-openai` 依赖 `molo-core`：它是 provider adapter，不进入 core 或
+  agent runtime 默认依赖面。
 - `molo-cli` 可以依赖所有层；任何层都不能依赖 `molo-cli`。
 
 重依赖（`reqwest`、`rmcp`、`jsonschema`、`schemars`、shell/git/filesystem
@@ -103,15 +106,11 @@ model -> tool/effect request -> risk classification -> policy check
 
 ## 现状
 
-`0.3.x` 是单个 `molo` crate 加 `molo-macros`，交付的是 agent-runtime 一侧、
-可选 harness runtime 与 feature-gated coding SDK：`ReActAgent` loop、provider、
-memory、tool registry、effect protocol、`HarnessRuntime`、`BasicHarness`、
-`LocalWorkspace`、typed coding effect payload、
-`CodingEffectExecutor`、command/git/search/instruction/context primitives、MCP、
-skills、structured output、event 与 cancellation。coding workload 层尚未成为
-独立 crate，当前通过 `coding` feature 按目标边界隔离。
+`0.3.x` 已拆为 workspace 多 crate。根 `molo` crate 是 facade，负责保留
+`molo::...` 用户入口和 feature 聚合；实现分别位于 `molo-core`、`molo-agent`、
+`molo-harness`、`molo-coding`、`molo-mcp`、`molo-skills`、`molo-openai`、
+`molo-macros` 和 reference `molo-cli`。
 
-上述拆分是演进方向，将逐步抽取，而不是一次性完成。在 1.0 之前，当目标
-架构需要时，public API 允许跨 0.x minor 破坏性变更，每次 breaking change
-都附带迁移路径。治理细节，包括 API 稳定性分级、发布规则与 harness 威胁模型，
-会随版本说明和用户文档一起更新。
+在 1.0 之前，当目标架构需要时，public API 允许跨 0.x minor 破坏性变更，每次
+breaking change 都附带迁移路径。治理细节，包括 API 稳定性分级、发布规则与
+harness 威胁模型，会随版本说明和用户文档一起更新。

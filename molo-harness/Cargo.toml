@@ -1,0 +1,29 @@
+[package]
+name = "molo-harness"
+version = "0.3.0"
+edition = "2024"
+rust-version = "1.97"
+description = "Harness runtime and governed effect execution for molo"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/Silwings-git/molo.git"
+homepage = "https://github.com/Silwings-git/molo"
+documentation = "https://docs.rs/molo-harness"
+readme = "../README.md"
+keywords = ["agent", "llm", "ai", "framework"]
+categories = ["artificial-intelligence"]
+authors = ["silwings"]
+
+[lib]
+doctest = false
+
+[dependencies]
+molo-agent = { path = "../molo-agent", version = "0.3.0" }
+molo-core = { path = "../molo-core", version = "0.3.0" }
+async-trait = "0.1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tokio = { version = "1", default-features = false, features = ["macros", "time"] }
+
+[features]
+default = []

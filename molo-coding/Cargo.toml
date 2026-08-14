@@ -1,0 +1,31 @@
+[package]
+name = "molo-coding"
+version = "0.3.0"
+edition = "2024"
+rust-version = "1.97"
+description = "Coding-workload primitives for governed molo agents"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/Silwings-git/molo.git"
+homepage = "https://github.com/Silwings-git/molo"
+documentation = "https://docs.rs/molo-coding"
+readme = "../README.md"
+keywords = ["agent", "llm", "ai", "framework"]
+categories = ["artificial-intelligence"]
+authors = ["silwings"]
+
+[lib]
+doctest = false
+
+[dependencies]
+molo-core = { path = "../molo-core", version = "0.3.0" }
+molo-harness = { path = "../molo-harness", version = "0.3.0" }
+async-trait = "0.1"
+regex = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tokio = { version = "1", default-features = false, features = ["fs", "io-util", "process", "rt", "sync", "time"] }
+
+[features]
+default = []
+

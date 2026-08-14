@@ -1233,26 +1233,43 @@ version = "0.3.0"
 dependencies = [
  "async-stream",
  "async-trait",
- "base64 0.22.1",
  "criterion",
  "dotenvy",
  "evalexpr",
  "futures",
+ "molo-agent",
+ "molo-coding",
+ "molo-core",
+ "molo-harness",
+ "molo-macros",
+ "molo-mcp",
+ "molo-openai",
+ "molo-skills",
+ "rmcp",
+ "schemars",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing-subscriber",
+ "trybuild",
+]
+
+[[package]]
+name = "molo-agent"
+version = "0.3.0"
+dependencies = [
+ "async-stream",
+ "async-trait",
+ "futures",
  "indexmap",
  "jsonschema",
- "molo-macros",
- "regex",
- "reqwest",
- "rmcp",
+ "molo-core",
  "schemars",
  "serde",
  "serde_json",
  "thiserror",
  "tokio",
- "tokio-util",
  "tracing",
- "tracing-subscriber",
- "trybuild",
 ]
 
 [[package]]
@@ -1270,6 +1287,34 @@ dependencies = [
 ]
 
 [[package]]
+name = "molo-coding"
+version = "0.3.0"
+dependencies = [
+ "async-trait",
+ "molo-core",
+ "molo-harness",
+ "regex",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+]
+
+[[package]]
+name = "molo-core"
+version = "0.3.0"
+dependencies = [
+ "async-trait",
+ "futures",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+ "tokio-util",
+ "tracing",
+]
+
+[[package]]
 name = "molo-eval-runner"
 version = "0.1.0"
 dependencies = [
@@ -1280,12 +1325,74 @@ dependencies = [
 ]
 
 [[package]]
+name = "molo-harness"
+version = "0.3.0"
+dependencies = [
+ "async-trait",
+ "molo-agent",
+ "molo-core",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+]
+
+[[package]]
 name = "molo-macros"
 version = "0.3.0"
 dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.119",
+]
+
+[[package]]
+name = "molo-mcp"
+version = "0.3.0"
+dependencies = [
+ "async-trait",
+ "futures",
+ "molo-agent",
+ "molo-core",
+ "molo-harness",
+ "reqwest",
+ "rmcp",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "molo-openai"
+version = "0.3.0"
+dependencies = [
+ "async-stream",
+ "async-trait",
+ "base64 0.22.1",
+ "futures",
+ "molo-core",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
+name = "molo-skills"
+version = "0.3.0"
+dependencies = [
+ "async-trait",
+ "indexmap",
+ "molo-agent",
+ "molo-core",
+ "schemars",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]

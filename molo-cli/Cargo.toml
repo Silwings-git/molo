@@ -5,6 +5,8 @@ edition = "2024"
 rust-version = "1.97"
 description = "Reference CLI and dogfooding harness for molo"
 license = "MIT OR Apache-2.0"
+repository = "https://github.com/Silwings-git/molo.git"
+homepage = "https://github.com/Silwings-git/molo"
 publish = false
 
 [[bin]]
@@ -15,7 +17,7 @@ doc = false
 [dependencies]
 async-trait = "0.1"
 futures = "0.3"
-molo = { path = "..", features = [
+molo = { path = "..", version = "0.3.0", features = [
     "openai",
     "harness",
     "coding",
