@@ -396,7 +396,7 @@ impl ApprovalBroker for StaticApprovalBroker {
 }
 
 /// Filesystem/process sandbox policy requested of an executor.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[non_exhaustive]
 pub enum SandboxPolicy {
     /// Read-only access.
@@ -410,7 +410,7 @@ pub enum SandboxPolicy {
 }
 
 /// Network access policy requested of an executor.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[non_exhaustive]
 pub enum NetworkPolicy {
     /// No network access.

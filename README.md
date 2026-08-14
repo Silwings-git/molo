@@ -32,11 +32,11 @@ boundaries and dependency rules.
 molo is in an early 0.x phase with a planned architecture evolution. The
 `0.3.x` crate ships the agent-runtime side: the `ReActAgent` reasoning loop,
 provider traits, memory, tools, effects, optional OpenAI-compatible provider,
-MCP, skills, structured output, macros, observability, and the optional
-`harness` runtime for governed effect execution. Production coding-workload
-executors such as filesystem, shell, git, and patch remain future optional
-components. Public API breaking changes are expected throughout 0.x when they
-serve the target architecture; each one ships with a migration path.
+MCP, skills, structured output, macros, observability, the optional `harness`
+runtime for governed effect execution, and an optional `coding` SDK baseline
+for workspace, patch, command, git, search, project instructions, and coding
+context primitives. Public API breaking changes are expected throughout 0.x
+when they serve the target architecture; each one ships with a migration path.
 
 ## ✨ Features
 
@@ -77,6 +77,7 @@ molo = { version = "0.3", features = ["openai"] }      # OpenAiProvider
 molo = { version = "0.3", features = ["macros"] }      # #[molo::tool]
 molo = { version = "0.3", features = ["structured"] }  # TypedAgent / validation
 molo = { version = "0.3", features = ["harness"] }     # HarnessRuntime
+molo = { version = "0.3", features = ["coding"] }      # workspace/command/git SDK
 molo = { version = "0.3", features = ["full"] }        # all optional features
 ```
 
@@ -161,6 +162,7 @@ root re-exports each module's core items, so `use molo::...` covers most cases:
 | Tool | model-visible capabilities | `Tool`, `ToolSchema`, `ToolPolicy`, `ToolOutput`, `ToolResult`, `ToolRegistry`, `SharedState`; `#[molo::tool]` with `macros` |
 | Effect | side-effect boundary | `EffectRequest`, `EffectObservation`, `EffectKind`, `RiskLevel` |
 | Harness | governed effect execution | `HarnessRuntime`, `Harness`, `BasicHarness`, `EffectExecutor`, `PolicyEngine`, `ApprovalBroker`, `AuditSink`, `TranscriptStore` with `harness` |
+| Coding | coding-workload primitives | `LocalWorkspace`, `WorkspacePath`, `CodingEffectExecutor`, `CommandExecutor`, `GitInspector`, `RepoSearcher`, `InstructionResolver`, `CodingContextProvider` with `coding` |
 | Skill | capability packs (Agent Skills protocol) | `Skill`, `SkillRegistry`, `LoadSkillTool` with `skills` |
 | MCP | external tool servers | `McpClient`, `McpTool` with `mcp` |
 | Message | conversation model | `Message`, `ContentBlock`, `ToolCall` |
@@ -227,6 +229,23 @@ policy engine, approval broker, effect executor, audit sink, transcript store,
 output limiter, and redactor. Phase 4 includes test/application executors
 (`NoopEffectExecutor`, `StaticEffectExecutor`, `RouterEffectExecutor`); concrete
 filesystem/shell/git/patch executors are intentionally left to the coding layer.
+
+### Coding workload SDK
+
+Requires `features = ["coding"]`.
+
+The coding SDK provides primitives for building coding-agent products without
+making molo itself a CLI: `WorkspacePath` rejects absolute paths and traversal,
+`LocalWorkspace` bounds reads/lists/writes/patches to a canonical root,
+`CommandExecutor` runs explicit argv commands with timeouts and output limits,
+and `GitInspector` / `RepoSearcher` / `InstructionResolver` /
+`CodingContextProvider` keep repo context separate from chat memory.
+Side-effecting model-visible tools should construct typed payloads such as
+`ReadFilePayload`, `WriteFilePayload`, `ApplyPatchPayload`, `CommandPayload`,
+or `GitPayload`; `CodingEffectExecutor` decodes those effects after harness
+policy, approval, audit, and transcript handling.
+
+See [Coding Agents](docs/coding-agent.md) for the SDK boundary and examples.
 
 ### Typed (structured) output
 
@@ -315,6 +334,8 @@ Self-contained examples (no real API needed) are marked ✦.
 | ✦ `tool_registry` | `cargo run --example tool_registry --features structured` | Registry full API: register / names / schemas / call / subset |
 | ✦ `tool_macro` | `cargo run --example tool_macro --features macros` | One-shot tool definitions with `#[molo::tool]` |
 | ✦ `harness_runtime` | `cargo run --example harness_runtime --features harness` | Governed effect execution with `HarnessRuntime` and `BasicHarness` |
+| ✦ `coding_workspace` | `cargo run --example coding_workspace --features coding` | Local workspace read/list/write primitives |
+| ✦ `coding_harness` | `cargo run --example coding_harness --features coding` | Typed coding effects executed through `BasicHarness` |
 | ✦ `shared_state` | `cargo run --example shared_state` | Three ways to use `SharedState` |
 | ✦ `mcp` | `cargo run --example mcp --features mcp` | MCP client adapter, self-contained fake server |
 

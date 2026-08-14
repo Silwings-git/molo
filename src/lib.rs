@@ -27,6 +27,9 @@
 //! - `skills`: Agent Skills protocol support.
 //! - `mcp`: MCP client adapter support.
 //! - `harness`: `HarnessRuntime` and governed effect execution.
+//! - `coding`: coding-workload primitives on top of `harness`: workspace
+//!   paths, file effects, commands, git inspection, repo search, project
+//!   instructions, and context gathering.
 //! - `cli-channel`: [`CliMessageChannel`] for stdin/stdout interaction.
 //! - `tracing`: internal tracing spans and logs.
 //! - `full`: all optional capabilities above.
@@ -135,6 +138,8 @@
 //!   text is passed back to the model, which decides what to do next.
 
 pub mod agent;
+#[cfg(feature = "coding")]
+pub mod coding;
 pub mod effect;
 pub mod event_channel;
 #[cfg(feature = "harness")]
@@ -168,6 +173,28 @@ pub use agent::{
 };
 #[cfg(feature = "structured")]
 pub use agent::{StructuredOutcome, StructuredValidator, TypedAgent};
+#[cfg(feature = "coding")]
+pub use coding::{
+    AgentChangeTracker, ApplyPatchPayload, ApplyPatchTool, CliGitInspector, CodingContextBundle,
+    CodingContextError, CodingContextInclude, CodingContextProvider, CodingContextRequest,
+    CodingEffectExecutor, CodingError, CodingExecutorConfig, CommandError, CommandExecutor,
+    CommandExecutorCapabilities, CommandOutput, CommandOutputLimit, CommandPayload, CommandRequest,
+    CommandStatus, CommandTestRunner, ContentDigest, ContextBudget, DefaultCodingContextProvider,
+    DefaultInstructionResolver, DependencyMetadata, DiffRequest, EnvPolicy, FileBody, FileContent,
+    FilePatch, FileReadOptions, FileVersion, FileWriteContent, FileWriteResult, GitChangedFile,
+    GitChangedFilesRequest, GitDiffRequest, GitError, GitHead, GitInspector, GitOperation,
+    GitPayload, GitStatus, GitStatusRequest, GitStatusTool, InstructionBundle, InstructionError,
+    InstructionFile, InstructionFileSpec, InstructionRequest, InstructionResolver,
+    ListFilesPayload, ListFilesQuery, ListFilesTool, LocalCommandExecutor, LocalWorkspace,
+    LocalWorkspaceConfig, OutputText, Patch, PatchConflict, PatchHunk, PatchOperation,
+    PatchRequest, PatchResult, PolicyEnforcementReport, PtyMode, ReadFilePayload, ReadFileTool,
+    RepoSearchRequest, RepoSearchResults, RepoSearcher, ResolvedPath, ResolvedPathKind,
+    RipgrepSearcher, RunCommandTool, SearchError, SearchMatch, SearchMode, SearchPayload,
+    SearchRepoTool, SnapshotRequest, SymlinkPolicy, TestRunError, TestRunRequest, TestRunner,
+    TextEncoding, VerificationResult, Workspace, WorkspaceAccess, WorkspaceDiff, WorkspaceEntry,
+    WorkspaceError, WorkspacePath, WorkspaceRoot, WorkspaceSearcher, WriteFilePayload,
+    WriteFileRequest,
+};
 pub use effect::{
     DisplayFormat, DisplayOutput, EffectKind, EffectObservation, EffectOutput, EffectRequest,
     EffectSource, EffectStatus, RiskLevel,
