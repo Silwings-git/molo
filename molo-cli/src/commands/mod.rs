@@ -195,12 +195,12 @@ async fn code(config: CliConfig, task: String, json_output: bool) -> Result<(), 
         JsonlAuditSink::new(store.clone(), session.session_id.clone()),
         JsonlTranscriptStore::new(store.clone(), session.session_id.clone()),
     )
-    .with_config(HarnessConfig {
-        default_sandbox: SandboxPolicy::WorkspaceWrite,
-        default_network: NetworkPolicy::Deny,
-        default_timeout: config.policy.command_timeout,
-        ..HarnessConfig::default()
-    });
+    .with_config(
+        HarnessConfig::default()
+            .with_default_sandbox(SandboxPolicy::WorkspaceWrite)
+            .with_default_network(NetworkPolicy::Deny)
+            .with_default_timeout(config.policy.command_timeout),
+    );
     let runtime = HarnessRuntime::new(provider, harness);
     let mut kernel = ReActAgent::kernel(code_registry(), system_prompt);
 
@@ -326,12 +326,12 @@ async fn review(
         JsonlAuditSink::new(store.clone(), session.session_id.clone()),
         JsonlTranscriptStore::new(store.clone(), session.session_id.clone()),
     )
-    .with_config(HarnessConfig {
-        default_sandbox: SandboxPolicy::ReadOnly,
-        default_network: NetworkPolicy::Deny,
-        default_timeout: config.policy.command_timeout,
-        ..HarnessConfig::default()
-    });
+    .with_config(
+        HarnessConfig::default()
+            .with_default_sandbox(SandboxPolicy::ReadOnly)
+            .with_default_network(NetworkPolicy::Deny)
+            .with_default_timeout(config.policy.command_timeout),
+    );
     let runtime = HarnessRuntime::new(provider, harness);
     let mut kernel = ReActAgent::kernel(review_registry(allow_readonly_commands), system_prompt);
     let output = runtime
@@ -450,12 +450,12 @@ async fn resume(
         JsonlAuditSink::new(store.clone(), session.session_id.clone()),
         JsonlTranscriptStore::new(store.clone(), session.session_id.clone()),
     )
-    .with_config(HarnessConfig {
-        default_sandbox: SandboxPolicy::WorkspaceWrite,
-        default_network: NetworkPolicy::Deny,
-        default_timeout: config.policy.command_timeout,
-        ..HarnessConfig::default()
-    });
+    .with_config(
+        HarnessConfig::default()
+            .with_default_sandbox(SandboxPolicy::WorkspaceWrite)
+            .with_default_network(NetworkPolicy::Deny)
+            .with_default_timeout(config.policy.command_timeout),
+    );
     let runtime = HarnessRuntime::new(provider, harness);
     let mut kernel = ReActAgent::kernel(code_registry(), system_prompt);
     let output = runtime

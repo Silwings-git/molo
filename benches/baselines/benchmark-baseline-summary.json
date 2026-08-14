@@ -1,0 +1,24 @@
+{
+  "schema_version": 1,
+  "baseline_id": "runtime-benchmark-baseline",
+  "recorded_at": "2026-08-14",
+  "feature_set": "full",
+  "command": "cargo bench -p molo --features full",
+  "raw_results_committed": false,
+  "benchmarks": [
+    "bench",
+    "runtime_message",
+    "runtime_harness",
+    "coding_primitives"
+  ],
+  "comparison_policy": {
+    "ci_compile": "compile smoke with cargo bench -p molo --features full --no-run",
+    "baseline_update": "run full benchmarks and record redacted summary",
+    "regression_review": "compare against the latest redacted summary and investigate hot-path regressions over 20%"
+  },
+  "baseline_status": "skeleton-established",
+  "notes": [
+    "Initial benchmark harness and baseline summary are established before collecting machine-specific timing data.",
+    "Raw Criterion output is intentionally not committed."
+  ]
+}

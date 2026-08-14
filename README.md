@@ -21,22 +21,22 @@ workloads.
 molo is a framework and SDK, not an end-user agent product. You assemble
 agents — including CLI coding agents — from its building blocks: model
 interaction, reasoning loop, context management, tool calling, structured
-output, and observability. The target architecture adds two optional layers
-on top: a harness that governs and executes side effects (approval, sandbox,
-audit, transcript), and a coding-workload SDK (workspace, shell, git, patch,
-repo context). See [Architecture](docs/architecture.md) for the layer
-boundaries and dependency rules.
+output, and observability. Optional harness and coding layers provide governed
+side-effect execution (approval, sandbox, audit, transcript) and coding
+workload primitives (workspace, shell, git, patch, repo context). See
+[Architecture](docs/architecture.md) for the layer boundaries and dependency
+rules.
 
 ## Status
 
-molo is in an early 0.x phase with a planned architecture evolution. The
-`0.3.x` crate ships the agent-runtime side: the `ReActAgent` reasoning loop,
-provider traits, memory, tools, effects, optional OpenAI-compatible provider,
-MCP, skills, structured output, macros, observability, the optional `harness`
-runtime for governed effect execution, and an optional `coding` SDK baseline
-for workspace, patch, command, git, search, project instructions, and coding
-context primitives. Public API breaking changes are expected throughout 0.x
-when they serve the target architecture; each one ships with a migration path.
+molo is in early 0.x development. The `0.3.x` crate ships the `ReActAgent`
+reasoning loop, provider traits, memory, tools, effects, optional
+OpenAI-compatible provider, MCP, skills, structured output, macros,
+observability, the optional `harness` runtime for governed effect execution,
+and an optional `coding` SDK for workspace, patch, command, git, search,
+project instructions, and coding context primitives. Public API breaking
+changes are expected throughout 0.x as these layers mature; each one ships with
+a migration path.
 
 ## ✨ Features
 
@@ -156,7 +156,7 @@ root re-exports each module's core items, so `use molo::...` covers most cases:
 
 | Concept | What it does | Key types |
 | --- | --- | --- |
-| Agent | the reasoning loop | `Agent`, `AgentKernel`, `AgentAction`, `ReActAgent`, `react_agent!`, `CancellableAgent`; `TypedAgent` with `structured` |
+| Agent | the reasoning loop | `Agent`, `AgentKernel`, `AgentAction`, `ReActAgent`, `react_agent!`, `RunContext`; `TypedAgent` with `structured` |
 | Provider | LLM communication | `Provider`, `ProviderCapabilities`, `ProviderRequestContext`, `RetryProvider`, `FakeProvider`; `OpenAiProvider` with `openai` |
 | Memory | context management | `Memory`, `InMemoryMemory`, `WindowMemory`, `SummarizeStrategy` |
 | Tool | model-visible capabilities | `Tool`, `ToolSchema`, `ToolPolicy`, `ToolOutput`, `ToolResult`, `ToolRegistry`, `SharedState`; `#[molo::tool]` with `macros` |
@@ -226,9 +226,10 @@ Requires `features = ["harness"]`.
 `Provider`, drives an `AgentKernel`, sends effect requests through `Harness`,
 and feeds observations back to the kernel. `BasicHarness` wires together a
 policy engine, approval broker, effect executor, audit sink, transcript store,
-output limiter, and redactor. Phase 4 includes test/application executors
-(`NoopEffectExecutor`, `StaticEffectExecutor`, `RouterEffectExecutor`); concrete
-filesystem/shell/git/patch executors are intentionally left to the coding layer.
+output limiter, and redactor. Built-in executors are deliberately limited to
+test and application-composition use cases (`NoopEffectExecutor`,
+`StaticEffectExecutor`, `RouterEffectExecutor`); concrete filesystem, shell,
+git, and patch execution belongs in the coding layer.
 
 ### Coding workload SDK
 
@@ -307,10 +308,11 @@ The core mechanism is **progressive disclosure**: the model first sees only a
 one-line menu of name + description; when a task matches, it reads the body via
 the `load_skill` tool. Skills declare their tool dependencies with
 `allowed-tools`, which is a policy hint or upper bound, not an authorization
-grant. `SkillLayer` assembles the prompt fragment and loader tool explicitly;
-`ReActAgent::with_skills` remains a convenience wrapper over that layer.
-Skill scripts are not executed by the skill loader; script execution must be
-converted into a harness-governed command/coding effect by the host.
+grant. `SkillLayer::assemble` returns the prompt fragment and optional
+`load_skill` tool; hosts append the fragment to the system prompt and register
+the tool explicitly, keeping skill policy outside the agent loop. Skill scripts
+are not executed by the skill loader; script execution must be converted into a
+harness-governed command/coding effect by the host.
 
 ### Sub-agents
 
@@ -322,8 +324,9 @@ conversations.
 
 ### Cooperative cancellation
 
-Agents that support cancellation implement `CancellableAgent`. Each run
-carries its own `CancellationToken`; cancellation applies per run, so stopping
+Cancellation is carried by `RunContext`. Pass a context with a
+`CancellationToken` to `run_request_with_context` or
+`run_stream_request_with_context`; cancellation applies per run, so stopping
 mid-reply leaves no residue and the next turn starts fresh.
 
 ### Streaming, events & observability
@@ -410,7 +413,7 @@ Self-contained examples (no real API needed) are marked ✦.
 | --- | --- | --- |
 | ✦ `structured` | `cargo run --example structured --features structured` | Typed output with `run_typed` and JSON Schema validation |
 | ✦ `skill` | `cargo run --example skill --features skills` | Skills: discovery, progressive disclosure, activation |
-| ✦ `skill_layer` | `cargo run --example skill_layer --features skills` | SkillLayer prompt/tool assembly without ReActAgent internals |
+| ✦ `skill_layer` | `cargo run --example skill_layer --features skills` | SkillLayer prompt/tool assembly without constructing a ReActAgent |
 | ✦ `cancellation` | `cargo run --example cancellation` | Cooperative cancellation mid-reply, then continue |
 
 ## ⚙️ Configuration

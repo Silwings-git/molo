@@ -13,10 +13,10 @@
 //! returns exactly one assistant message, successful streams terminate with
 //! one `Done`, usage is reported only when the provider supplies it, and
 //! local decode/protocol/size-limit failures are distinct from vendor API
-//! errors. Context-aware methods let runtimes pass run ids, model request ids,
-//! deadlines, cancellation, and sanitized metadata across the provider
-//! boundary while preserving compatibility for providers that only implement
-//! the older methods.
+//! errors. Context-aware methods are the runtime boundary: runtimes pass run
+//! ids, model request ids, deadlines, cancellation, and sanitized metadata to
+//! providers explicitly. The plain `chat` and `stream_chat` methods remain
+//! convenience entry points for direct provider use.
 
 mod fake;
 #[cfg(feature = "openai")]
@@ -188,33 +188,32 @@ pub trait Provider: Send + Sync {
         ProviderCapabilities::baseline()
     }
 
-    /// Sends one turn of conversation and returns the model's reply (text, or
-    /// a request to call tools).
+    /// Sends one turn with request-scoped provider context.
     ///
     /// # Errors
     ///
     /// Network failures / timeouts / rate limits / vendor business errors are
     /// all returned as [`ProviderError`]; see that type's docs for error
     /// classification and retry guidance.
-    async fn chat(&self, request: ChatRequest) -> Result<ChatResponse, ProviderError>;
-
-    /// Sends one turn with request-scoped provider context.
-    ///
-    /// The default implementation preserves compatibility for existing
-    /// providers by ignoring the context and calling [`chat`](Provider::chat).
-    /// Providers that declare context cancellation/deadline support should
-    /// override this method.
     async fn chat_with_context(
         &self,
         request: ChatRequest,
         context: &ProviderRequestContext,
-    ) -> Result<ChatResponse, ProviderError> {
-        let _ = context;
-        self.chat(request).await
+    ) -> Result<ChatResponse, ProviderError>;
+
+    /// Sends one turn of conversation and returns the model's reply (text, or
+    /// a request to call tools).
+    ///
+    /// This direct-use convenience wrapper creates a generated run context.
+    /// Runtimes that already have a [`RunContext`] should call
+    /// [`chat_with_context`](Provider::chat_with_context).
+    async fn chat(&self, request: ChatRequest) -> Result<ChatResponse, ProviderError> {
+        let run = RunContext::generated();
+        let context = ProviderRequestContext::from_run_context("direct-chat", &run);
+        self.chat_with_context(request, &context).await
     }
 
-    /// Streams one turn of conversation, returning the Assistant's reply
-    /// incrementally.
+    /// Streams one turn of conversation for direct provider use.
     ///
     /// Semantically identical to [`chat`](Provider::chat), except that the
     /// reply is returned as a stream of events: several [`StreamEvent::Delta`]
@@ -231,21 +230,21 @@ pub trait Provider: Send + Sync {
     async fn stream_chat(
         &self,
         request: ChatRequest,
-    ) -> Result<BoxStream<'static, Result<StreamEvent, ProviderError>>, ProviderError>;
+    ) -> Result<BoxStream<'static, Result<StreamEvent, ProviderError>>, ProviderError> {
+        let run = RunContext::generated();
+        let context = ProviderRequestContext::from_run_context("direct-stream", &run);
+        self.stream_chat_with_context(request, &context).await
+    }
 
     /// Streams one turn with request-scoped provider context.
     ///
-    /// The default implementation preserves compatibility for existing
-    /// providers by ignoring the context and calling
-    /// [`stream_chat`](Provider::stream_chat).
+    /// Runtimes should call this method so providers can observe cancellation,
+    /// deadlines, request ids, and sanitized metadata.
     async fn stream_chat_with_context(
         &self,
         request: ChatRequest,
         context: &ProviderRequestContext,
-    ) -> Result<BoxStream<'static, Result<StreamEvent, ProviderError>>, ProviderError> {
-        let _ = context;
-        self.stream_chat(request).await
-    }
+    ) -> Result<BoxStream<'static, Result<StreamEvent, ProviderError>>, ProviderError>;
 }
 
 /// `Box<dyn Provider>` is itself a Provider: re-exposes the trait object as a

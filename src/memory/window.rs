@@ -142,16 +142,17 @@ impl Budget {
 /// }
 ///
 /// #[tokio::main]
-/// async fn main() {
+/// async fn main() -> Result<(), MemoryError> {
 ///     let mut memory =
 ///         WindowMemory::new(2).with_token_counter(Box::new(OnePerMessage));
-///     memory.record(Message::user("u1")).await.unwrap();
-///     memory.record(Message::assistant("a1")).await.unwrap();
-///     memory.record(Message::user("u2")).await.unwrap();
-///     memory.record(Message::assistant("a2")).await.unwrap();
+///     memory.record(Message::user("u1")).await?;
+///     memory.record(Message::assistant("a1")).await?;
+///     memory.record(Message::user("u2")).await?;
+///     memory.record(Message::assistant("a2")).await?;
 ///
 ///     // 4 messages > 2 tokens: trimmed to the most recent round.
-///     assert_eq!(memory.context().await.unwrap().len(), 2);
+///     assert_eq!(memory.context().await?.len(), 2);
+///     Ok(())
 /// }
 /// ```
 #[async_trait::async_trait]

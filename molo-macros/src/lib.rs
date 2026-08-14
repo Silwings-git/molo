@@ -9,7 +9,7 @@
 //! `#[molo::tool(...)]` (`molo::tool` is also the name of a module; attribute macros and
 //! modules live in different namespaces, so they can share the same name):
 //!
-//! ```ignore
+//! ```text
 //! #[molo::tool(description = "Evaluate the result of a mathematical expression")]
 //! async fn calculator(expression: String) -> Result<String, molo::tool::ToolError> {
 //!     // Business logic...
@@ -225,7 +225,7 @@ impl RiskAttr {
 /// Complete usage. This block is not compiled: the macro-generated code references `::molo::` /
 /// `::serde_json::` / `::schemars::`, so prepare them as described under dependency prerequisites in a real crate.
 ///
-/// ```ignore
+/// ```text
 /// use molo::tool::{SharedState, ToolError, ToolRegistry};
 /// use schemars::JsonSchema;
 /// use serde::Deserialize;
@@ -276,8 +276,7 @@ impl RiskAttr {
 /// - Zero parameters: an empty object `{ "type": "object", "properties": {} }`.
 ///
 /// On the `call` side, arguments are parsed with the same rules: object arguments deserialize into a struct as a whole; primitive-type
-/// arguments take the value from the `properties.<param name>` field, falling back to the whole argument object when the field is missing
-/// (to stay compatible with callers that pass the bare value directly).
+/// arguments take the value from the `properties.<param name>` field.
 ///
 /// # Errors
 ///
@@ -403,13 +402,14 @@ fn expand_tool(args: ToolArgs, item: ItemFn) -> syn::Result<proc_macro2::TokenSt
         }
     }
 
-    // The original function is kept as-is (its name, visibility, and doc comments all belong to the user); the inner implementation is renamed to
-    // `__molo_impl_*`; what is exposed is the PascalCase unit struct.
+    // Keep the user-visible visibility on the generated marker struct only.
+    // The renamed function is an implementation detail and must not leak into
+    // the downstream crate's public API or rustdoc output.
     let impl_fn = format_ident!("__molo_impl_{}", sig.ident);
     let struct_name = format_ident!("{}", snake_to_pascal(&sig.ident.to_string()));
     let mut new_sig = sig.clone();
     new_sig.ident = impl_fn.clone();
-    let original_fn = quote! { #(#attrs)* #vis #new_sig #block };
+    let original_fn = quote! { #(#attrs)* #new_sig #block };
 
     let name = args.name.unwrap_or_else(|| sig.ident.to_string());
     let description = args.description;
@@ -487,8 +487,7 @@ fn expand_tool(args: ToolArgs, item: ItemFn) -> syn::Result<proc_macro2::TokenSt
     };
 
     // On the call side, arguments are parsed with the same rules as the schema: object arguments deserialize as a whole, primitive-type
-    // arguments take the value from the properties.<param name> field (falling back to the whole argument object when the field is missing,
-    // to stay compatible with callers that pass the bare value); the call shape then depends on whether &SharedState is declared.
+    // arguments take the value from the properties.<param name> field; the call shape then depends on whether &SharedState is declared.
     let arg_parse = match &args_param {
         Some((ident, ty)) => {
             let ident_str = ident.to_string();
@@ -503,7 +502,16 @@ fn expand_tool(args: ToolArgs, item: ItemFn) -> syn::Result<proc_macro2::TokenSt
                     let __molo_value = if __molo_is_object {
                         arguments
                     } else {
-                        arguments.get(#ident_str).cloned().unwrap_or(arguments)
+                        match arguments.get(#ident_str).cloned() {
+                            ::std::option::Option::Some(value) => value,
+                            ::std::option::Option::None => {
+                                return ::std::result::Result::Err(
+                                    ::molo::tool::ToolError::InvalidArguments(
+                                        ::std::format!("missing field {}", #ident_str),
+                                    ),
+                                );
+                            }
+                        }
                     };
                     ::serde_json::from_value(__molo_value)?
                 };
@@ -789,6 +797,16 @@ mod tests {
         assert!(tokens.contains("RiskLevel :: Medium"));
         assert!(tokens.contains("requires_confirmation : true"));
         assert!(tokens.contains("Duration :: from_secs (10"));
+    }
+
+    #[test]
+    fn generated_helper_is_private_even_for_public_tool() {
+        let item: ItemFn = syn::parse_quote! {
+            pub async fn calculator(x: String) -> Result<String, ()> { Ok(x) }
+        };
+        let tokens = expand_tool(args(), item).unwrap().to_string();
+        assert!(tokens.contains("pub struct Calculator"));
+        assert!(!tokens.contains("pub async fn __molo_impl_calculator"));
     }
 
     fn item_plain() -> ItemFn {

@@ -130,7 +130,9 @@ pub trait EventReceiver: Send {
 /// }));
 ///
 /// // The environment side consumes one by one; typed handling via AgentEvent::as_any.
-/// let event = rx.recv().await.unwrap();
+/// let Some(event) = rx.recv().await else {
+///     panic!("expected one published event");
+/// };
 /// assert_eq!(event.name(), "run.started");
 /// # }
 /// ```

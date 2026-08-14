@@ -47,18 +47,18 @@ async fn default_policy_retries_rate_limited() {
 
 /// Usage 2: a custom policy — 5 attempts, a slower backoff, and only rate-limited errors are retried.
 async fn custom_policy() {
-    let policy = RetryPolicy {
-        max_attempts: 5,
-        backoff: Backoff::Exponential {
+    let policy = RetryPolicy::default()
+        .with_max_attempts(5)
+        .with_backoff(Backoff::Exponential {
             initial: Duration::from_millis(200),
             factor: 2.0,
             max: Duration::from_secs(5),
             jitter: false,
-        },
+        })
         // Custom decision: only retry rate limiting; network / 5xx give up immediately.
-        retryable: Retryable::Custom(Arc::new(|e| matches!(e, ProviderError::RateLimited { .. }))),
-        ..Default::default()
-    };
+        .with_retryable(Retryable::Custom(Arc::new(|e| {
+            matches!(e, ProviderError::RateLimited { .. })
+        })));
 
     let inner = Arc::new(FakeProvider::new([
         FakeReply::Error(ProviderError::RateLimited { retry_after: None }),

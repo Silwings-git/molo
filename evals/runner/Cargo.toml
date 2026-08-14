@@ -3,7 +3,7 @@ name = "molo-eval-runner"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.97"
-description = "Internal Phase 9 coding eval runner for molo"
+description = "Coding eval runner for molo"
 license = "MIT OR Apache-2.0"
 publish = false
 

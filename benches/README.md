@@ -1,6 +1,6 @@
 # Runtime Benchmarks
 
-Phase 9 benchmarks measure framework hot paths only. They use generated or
+These benchmarks measure framework hot paths only. They use generated or
 scripted fixtures, never live providers, API keys, private source code, or raw
 user transcripts.
 
@@ -11,12 +11,12 @@ cargo bench -p molo --features full
 cargo bench -p molo --features full --no-run
 ```
 
-Release gate policy:
+Benchmark workflow:
 
 - normal CI compiles the benchmark suite with `--no-run`;
-- pre-freeze records a full local benchmark summary under
+- baseline updates record a full local benchmark summary under
   `benches/baselines/`;
-- release-candidate comparison investigates hot-path regressions over 20% or
+- regression review investigates hot-path regressions over 20% or
   allocation/count blow-ups before publishing;
 - baseline updates must state whether the change came from implementation
   changes, fixture changes, or an accepted performance tradeoff.

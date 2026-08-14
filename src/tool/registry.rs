@@ -40,7 +40,7 @@ fn panic_message(payload: &(dyn Any + Send)) -> String {
 ///
 /// ```
 /// # #[tokio::main]
-/// # async fn main() -> Result<(), molo::RegistryError> {
+/// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// use molo::tool::{SharedState, Tool, ToolContext, ToolError, ToolOutput, ToolRegistry, ToolResult, ToolSchema};
 /// use molo::{RunContext, ToolCall};
 /// use serde_json::json;
@@ -75,7 +75,7 @@ fn panic_message(payload: &(dyn Any + Send)) -> String {
 /// assert_eq!(result.output_content(), Some("42"));
 /// // Allowlist subset: the sub-registry shares the same tool instances as
 /// // the main registry.
-/// let sub = registry.subset(&["calculator"]).unwrap();
+/// let sub = registry.subset(&["calculator"])?;
 /// assert_eq!(sub.names(), vec!["calculator"]);
 /// # Ok(())
 /// # }
@@ -471,6 +471,34 @@ impl fmt::Debug for ToolRegistry {
     }
 }
 
+impl<T> Extend<T> for ToolRegistry
+where
+    T: Tool + 'static,
+{
+    fn extend<I>(&mut self, iter: I)
+    where
+        I: IntoIterator<Item = T>,
+    {
+        for tool in iter {
+            self.register(tool);
+        }
+    }
+}
+
+impl<T> FromIterator<T> for ToolRegistry
+where
+    T: Tool + 'static,
+{
+    fn from_iter<I>(iter: I) -> Self
+    where
+        I: IntoIterator<Item = T>,
+    {
+        let mut registry = Self::new();
+        registry.extend(iter);
+        registry
+    }
+}
+
 fn entry_namespace(entry: &RegisteredTool) -> ToolNamespace {
     entry
         .source
@@ -687,6 +715,16 @@ mod tests {
         assert_eq!(schemas.len(), 2);
         assert_eq!(schemas[0].name, "search");
         assert_eq!(schemas[1].name, "calculator");
+    }
+
+    #[test]
+    fn from_iter_and_extend_keep_registry_semantics() {
+        let mut registry: ToolRegistry = [echo("a"), echo("b"), echo("a")].into_iter().collect();
+        assert_eq!(registry.names(), vec!["a", "b"]);
+        assert_eq!(registry.schemas()[0].description, "a");
+
+        registry.extend([echo("c")]);
+        assert_eq!(registry.names(), vec!["a", "b", "c"]);
     }
 
     #[tokio::test]

@@ -13,13 +13,13 @@
 //!
 //! # Assembly options
 //!
-//! - [`with_skills`](molo::agent::ReActAgent::with_skills): dynamic
-//!   progressive disclosure (the protocol's primary shape) — the menu is
-//!   merged into the system prompt and load_skill is registered into the
-//!   ToolRegistry;
-//! - [`activate_skill`](molo::agent::ReActAgent::activate_skill): explicit
-//!   user activation — the body is merged into the system prompt without the
-//!   model's decision (application-level parsing of slash commands);
+//! - [`SkillLayer::assemble`](molo::skill::SkillLayer::assemble): returns the
+//!   prompt fragment plus optional load_skill tool; hosts append/register
+//!   those explicitly;
+//! - [`SkillLayer::activate_skill`](molo::skill::SkillLayer::activate_skill):
+//!   explicit user activation — the body is merged into the assembled prompt
+//!   without the model's decision (application-level parsing of slash
+//!   commands);
 //! - [`SkillRegistry::from_dir`](molo::skill::SkillRegistry::from_dir):
 //!   directory discovery — scans the skills directory, tolerantly skipping
 //!   broken skills.
@@ -30,7 +30,7 @@
 
 use molo::agent::{Agent, ReActAgent};
 use molo::provider::{FakeProvider, FakeReply};
-use molo::skill::{Skill, SkillRegistry};
+use molo::skill::{Skill, SkillLayer, SkillRegistry};
 use molo::{Message, ToolCall, ToolRegistry};
 use std::sync::Arc;
 
@@ -48,22 +48,42 @@ impl SharedFake {
 
 #[molo::async_trait]
 impl molo::Provider for SharedFake {
-    async fn chat(
+    async fn chat_with_context(
         &self,
         request: molo::ChatRequest,
+        context: &molo::ProviderRequestContext,
     ) -> Result<molo::ChatResponse, molo::ProviderError> {
-        self.0.chat(request).await
+        self.0.chat_with_context(request, context).await
     }
 
-    async fn stream_chat(
+    async fn stream_chat_with_context(
         &self,
         request: molo::ChatRequest,
+        context: &molo::ProviderRequestContext,
     ) -> Result<
         futures::stream::BoxStream<'static, Result<molo::StreamEvent, molo::ProviderError>>,
         molo::ProviderError,
     > {
-        self.0.stream_chat(request).await
+        self.0.stream_chat_with_context(request, context).await
     }
+}
+
+fn agent_with_skill_layer(fake: SharedFake, base_prompt: &str, layer: SkillLayer) -> ReActAgent {
+    let assembly = layer.assemble();
+    let mut tools = ToolRegistry::new();
+    if let Some(tool) = assembly.load_skill_tool {
+        tools
+            .register_with_source(tool, layer.load_skill_source())
+            .expect("SkillLayer load_skill source must match the tool schema");
+    }
+    let mut system_prompt = base_prompt.to_string();
+    if !assembly.prompt_fragment.is_empty() {
+        if !system_prompt.is_empty() {
+            system_prompt.push_str("\n\n");
+        }
+        system_prompt.push_str(&assembly.prompt_fragment);
+    }
+    ReActAgent::new(fake, tools, system_prompt)
 }
 
 /// Skill 1: code review (loaded through the progressive-disclosure path).
@@ -96,7 +116,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     // 1. Parse SKILL.md (pure in-memory, synchronous); registry add is the basis for hot plugging.
-    let registry = SkillRegistry::new();
+    let registry = Arc::new(SkillRegistry::new());
     registry.add(Skill::parse(CODE_REVIEW_SKILL)?);
     registry.add(Skill::parse(RELEASE_NOTES_SKILL)?);
 
@@ -113,12 +133,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         },
         FakeReply::Text("Reviewed per the skill process; found 2 issues.".into()),
     ])));
-    let mut agent = ReActAgent::new(
+    let mut agent = agent_with_skill_layer(
         fake.clone(),
-        ToolRegistry::new(),
         "You are a code review assistant",
-    )
-    .with_skills(registry);
+        SkillLayer::new(Arc::clone(&registry)),
+    );
 
     let answer = agent.run("review the changes under docs/").await?;
     println!("answer: {answer}");
@@ -145,19 +164,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "== Path 2: explicit user activation (activate_skill; the body is not decided by the model) =="
     );
 
-    let registry = SkillRegistry::new();
+    let registry = Arc::new(SkillRegistry::new());
     registry.add(Skill::parse(RELEASE_NOTES_SKILL)?);
     let fake = SharedFake(Arc::new(FakeProvider::new([FakeReply::Text(
         "OK, generated the release notes per the rules.".into(),
     )])));
-    let mut agent = ReActAgent::new(
-        fake.clone(),
-        ToolRegistry::new(),
-        "You are a release assistant",
-    )
-    .with_skills(registry);
-    // The user / application layer activates directly: the body is merged into the system prompt immediately; the model does not need to call load_skill.
-    assert!(agent.activate_skill("release-notes"));
+    let layer = SkillLayer::new(Arc::clone(&registry));
+    // The user / application layer activates directly before assembly: the
+    // body is merged into the system prompt immediately; the model does not
+    // need to call load_skill.
+    assert!(layer.activate_skill("release-notes"));
+    let mut agent = agent_with_skill_layer(fake.clone(), "You are a release assistant", layer);
     let answer = agent.run("generate the release notes").await?;
     println!("answer: {answer}");
 

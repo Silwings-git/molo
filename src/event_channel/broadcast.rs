@@ -38,8 +38,14 @@ use std::sync::atomic::{AtomicU64, Ordering};
 /// }));
 ///
 /// // Each subscriber receives its own copy of the same event.
-/// assert_eq!(rx1.recv().await.unwrap().name(), "run.started");
-/// assert_eq!(rx2.recv().await.unwrap().name(), "run.started");
+/// let Some(event1) = rx1.recv().await else {
+///     panic!("expected event for first subscriber");
+/// };
+/// let Some(event2) = rx2.recv().await else {
+///     panic!("expected event for second subscriber");
+/// };
+/// assert_eq!(event1.name(), "run.started");
+/// assert_eq!(event2.name(), "run.started");
 /// # }
 /// ```
 ///

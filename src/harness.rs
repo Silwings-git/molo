@@ -43,22 +43,24 @@ pub struct HarnessRuntime<P, H> {
 }
 
 /// Runtime loop configuration.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+#[non_exhaustive]
 pub struct HarnessRuntimeConfig {
     /// Maximum number of agent actions before the runtime fails the run.
-    pub max_agent_steps: usize,
+    pub(crate) max_agent_steps: usize,
     /// Intended upper bound for batch effect concurrency.
     ///
     /// The default [`Harness::execute_batch`] is sequential. Custom harness
     /// implementations can read their own configuration to use this value's
     /// semantic equivalent.
-    pub max_effect_batch_concurrency: usize,
+    pub(crate) max_effect_batch_concurrency: usize,
     /// Whether a batch effect runtime should fail the whole run on the first
     /// harness error.
     ///
     /// Effect-level denied/failed/timed-out results should normally be
     /// represented as [`EffectObservation`] values, not as runtime errors.
-    pub fail_fast_effect_batches: bool,
+    pub(crate) fail_fast_effect_batches: bool,
 }
 
 impl Default for HarnessRuntimeConfig {
@@ -68,6 +70,49 @@ impl Default for HarnessRuntimeConfig {
             max_effect_batch_concurrency: 1,
             fail_fast_effect_batches: false,
         }
+    }
+}
+
+impl HarnessRuntimeConfig {
+    /// Constructs a config with default values.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Maximum agent actions before the runtime fails a run.
+    pub fn max_agent_steps(&self) -> usize {
+        self.max_agent_steps
+    }
+
+    /// Returns a config with an updated agent-step limit.
+    pub fn with_max_agent_steps(mut self, max_agent_steps: usize) -> Self {
+        self.max_agent_steps = max_agent_steps;
+        self
+    }
+
+    /// Intended upper bound for batch effect concurrency.
+    pub fn max_effect_batch_concurrency(&self) -> usize {
+        self.max_effect_batch_concurrency
+    }
+
+    /// Returns a config with an updated batch effect concurrency hint.
+    pub fn with_max_effect_batch_concurrency(
+        mut self,
+        max_effect_batch_concurrency: usize,
+    ) -> Self {
+        self.max_effect_batch_concurrency = max_effect_batch_concurrency;
+        self
+    }
+
+    /// Whether batch execution should stop on the first harness error.
+    pub fn fail_fast_effect_batches(&self) -> bool {
+        self.fail_fast_effect_batches
+    }
+
+    /// Returns a config with updated batch failure behavior.
+    pub fn with_fail_fast_effect_batches(mut self, fail_fast_effect_batches: bool) -> Self {
+        self.fail_fast_effect_batches = fail_fast_effect_batches;
+        self
     }
 }
 
@@ -431,14 +476,16 @@ pub enum NetworkPolicy {
 }
 
 /// Output size limits.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+#[non_exhaustive]
 pub struct OutputLimit {
     /// Maximum model-visible output bytes.
-    pub model_bytes: usize,
+    pub(crate) model_bytes: usize,
     /// Maximum display output bytes.
-    pub display_bytes: usize,
+    pub(crate) display_bytes: usize,
     /// Maximum debug output bytes.
-    pub debug_bytes: usize,
+    pub(crate) debug_bytes: usize,
 }
 
 impl Default for OutputLimit {
@@ -451,17 +498,129 @@ impl Default for OutputLimit {
     }
 }
 
+impl OutputLimit {
+    /// Constructs explicit output limits.
+    pub fn new(model_bytes: usize, display_bytes: usize, debug_bytes: usize) -> Self {
+        Self {
+            model_bytes,
+            display_bytes,
+            debug_bytes,
+        }
+    }
+
+    /// Maximum model-visible output bytes.
+    pub fn model_bytes(&self) -> usize {
+        self.model_bytes
+    }
+
+    /// Returns limits with an updated model-visible byte cap.
+    pub fn with_model_bytes(mut self, model_bytes: usize) -> Self {
+        self.model_bytes = model_bytes;
+        self
+    }
+
+    /// Maximum display output bytes.
+    pub fn display_bytes(&self) -> usize {
+        self.display_bytes
+    }
+
+    /// Returns limits with an updated display byte cap.
+    pub fn with_display_bytes(mut self, display_bytes: usize) -> Self {
+        self.display_bytes = display_bytes;
+        self
+    }
+
+    /// Maximum debug output bytes.
+    pub fn debug_bytes(&self) -> usize {
+        self.debug_bytes
+    }
+
+    /// Returns limits with an updated debug byte cap.
+    pub fn with_debug_bytes(mut self, debug_bytes: usize) -> Self {
+        self.debug_bytes = debug_bytes;
+        self
+    }
+}
+
 /// Execution policy passed to an [`EffectExecutor`].
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+#[non_exhaustive]
 pub struct ExecutionPolicy {
     /// Sandbox policy.
-    pub sandbox: SandboxPolicy,
+    pub(crate) sandbox: SandboxPolicy,
     /// Network policy.
-    pub network: NetworkPolicy,
+    pub(crate) network: NetworkPolicy,
     /// Execution timeout.
-    pub timeout: Option<Duration>,
+    pub(crate) timeout: Option<Duration>,
     /// Output limits.
-    pub output_limit: OutputLimit,
+    pub(crate) output_limit: OutputLimit,
+}
+
+impl Default for ExecutionPolicy {
+    fn default() -> Self {
+        Self {
+            sandbox: SandboxPolicy::ReadOnly,
+            network: NetworkPolicy::Deny,
+            timeout: Some(Duration::from_secs(30)),
+            output_limit: OutputLimit::default(),
+        }
+    }
+}
+
+impl ExecutionPolicy {
+    /// Constructs a policy from sandbox and network restrictions.
+    pub fn new(sandbox: SandboxPolicy, network: NetworkPolicy) -> Self {
+        Self {
+            sandbox,
+            network,
+            ..Self::default()
+        }
+    }
+
+    /// Sandbox policy.
+    pub fn sandbox(&self) -> &SandboxPolicy {
+        &self.sandbox
+    }
+
+    /// Returns a policy with an updated sandbox policy.
+    pub fn with_sandbox(mut self, sandbox: SandboxPolicy) -> Self {
+        self.sandbox = sandbox;
+        self
+    }
+
+    /// Network policy.
+    pub fn network(&self) -> &NetworkPolicy {
+        &self.network
+    }
+
+    /// Returns a policy with an updated network policy.
+    pub fn with_network(mut self, network: NetworkPolicy) -> Self {
+        self.network = network;
+        self
+    }
+
+    /// Execution timeout.
+    pub fn timeout(&self) -> Option<Duration> {
+        self.timeout
+    }
+
+    /// Returns a policy with an updated timeout.
+    pub fn with_timeout(mut self, timeout: Option<Duration>) -> Self {
+        self.timeout = timeout;
+        self
+    }
+
+    /// Output limits.
+    pub fn output_limit(&self) -> &OutputLimit {
+        &self.output_limit
+    }
+
+    /// Returns a policy with updated output limits.
+    pub fn with_output_limit(mut self, output_limit: OutputLimit) -> Self {
+        self.output_limit = output_limit;
+        self
+    }
 }
 
 /// Executes an already approved effect.
@@ -1117,20 +1276,22 @@ struct SessionApproval {
 }
 
 /// Harness configuration.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+#[non_exhaustive]
 pub struct HarnessConfig {
     /// Default sandbox policy.
-    pub default_sandbox: SandboxPolicy,
+    pub(crate) default_sandbox: SandboxPolicy,
     /// Default network policy.
-    pub default_network: NetworkPolicy,
+    pub(crate) default_network: NetworkPolicy,
     /// Default timeout.
-    pub default_timeout: Duration,
+    pub(crate) default_timeout: Duration,
     /// Output limits.
-    pub output_limit: OutputLimit,
+    pub(crate) output_limit: OutputLimit,
     /// Whether audit failures stop execution.
-    pub fail_closed_on_audit_error: bool,
+    pub(crate) fail_closed_on_audit_error: bool,
     /// Whether transcript failures stop execution.
-    pub fail_closed_on_transcript_error: bool,
+    pub(crate) fail_closed_on_transcript_error: bool,
 }
 
 impl Default for HarnessConfig {
@@ -1143,6 +1304,82 @@ impl Default for HarnessConfig {
             fail_closed_on_audit_error: true,
             fail_closed_on_transcript_error: false,
         }
+    }
+}
+
+impl HarnessConfig {
+    /// Constructs a config with default values.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Default sandbox policy.
+    pub fn default_sandbox(&self) -> &SandboxPolicy {
+        &self.default_sandbox
+    }
+
+    /// Returns a config with an updated default sandbox policy.
+    pub fn with_default_sandbox(mut self, default_sandbox: SandboxPolicy) -> Self {
+        self.default_sandbox = default_sandbox;
+        self
+    }
+
+    /// Default network policy.
+    pub fn default_network(&self) -> &NetworkPolicy {
+        &self.default_network
+    }
+
+    /// Returns a config with an updated default network policy.
+    pub fn with_default_network(mut self, default_network: NetworkPolicy) -> Self {
+        self.default_network = default_network;
+        self
+    }
+
+    /// Default effect timeout.
+    pub fn default_timeout(&self) -> Duration {
+        self.default_timeout
+    }
+
+    /// Returns a config with an updated default effect timeout.
+    pub fn with_default_timeout(mut self, default_timeout: Duration) -> Self {
+        self.default_timeout = default_timeout;
+        self
+    }
+
+    /// Output limits.
+    pub fn output_limit(&self) -> &OutputLimit {
+        &self.output_limit
+    }
+
+    /// Returns a config with updated output limits.
+    pub fn with_output_limit(mut self, output_limit: OutputLimit) -> Self {
+        self.output_limit = output_limit;
+        self
+    }
+
+    /// Whether audit failures stop execution.
+    pub fn fail_closed_on_audit_error(&self) -> bool {
+        self.fail_closed_on_audit_error
+    }
+
+    /// Returns a config with updated audit failure behavior.
+    pub fn with_fail_closed_on_audit_error(mut self, fail_closed_on_audit_error: bool) -> Self {
+        self.fail_closed_on_audit_error = fail_closed_on_audit_error;
+        self
+    }
+
+    /// Whether transcript failures stop execution.
+    pub fn fail_closed_on_transcript_error(&self) -> bool {
+        self.fail_closed_on_transcript_error
+    }
+
+    /// Returns a config with updated transcript failure behavior.
+    pub fn with_fail_closed_on_transcript_error(
+        mut self,
+        fail_closed_on_transcript_error: bool,
+    ) -> Self {
+        self.fail_closed_on_transcript_error = fail_closed_on_transcript_error;
+        self
     }
 }
 

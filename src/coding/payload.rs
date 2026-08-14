@@ -61,8 +61,8 @@ pub struct ListFilesPayload {
 impl ListFilesPayload {
     /// Converts this payload into a search-kind [`EffectRequest`].
     ///
-    /// Listing uses `EffectKind::Search` because Phase 2 does not define a
-    /// separate list-files effect kind.
+    /// Listing uses `EffectKind::Search` because file discovery and content
+    /// search share the same read-only governance path.
     ///
     /// # Errors
     ///

@@ -579,7 +579,7 @@ pub enum PatchOperation {
     },
 }
 
-/// Text hunk used by the baseline patch applier.
+/// Text hunk used by the local workspace patch applier.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PatchHunk {
     /// Text expected in the current file. For create operations this may be
@@ -597,8 +597,8 @@ pub struct PatchRequest {
     /// Validate without writing.
     pub dry_run: bool,
     /// Whether non-conflicting file patches may be applied when another file
-    /// conflicts. The baseline local workspace currently reports conflicts
-    /// without partial writes.
+    /// conflicts. The local workspace currently reports conflicts without
+    /// partial writes.
     pub allow_partial: bool,
 }
 
@@ -728,19 +728,21 @@ pub trait Workspace: Send + Sync {
 }
 
 /// Local filesystem workspace configuration.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+#[non_exhaustive]
 pub struct LocalWorkspaceConfig {
     /// Symlink behavior.
-    pub symlink_policy: SymlinkPolicy,
+    pub(crate) symlink_policy: SymlinkPolicy,
     /// Default maximum bytes returned by read operations.
-    pub max_read_bytes: usize,
+    pub(crate) max_read_bytes: usize,
     /// Default maximum entries returned by list operations.
-    pub max_list_entries: usize,
+    pub(crate) max_list_entries: usize,
     /// Whether hidden files are included when a query does not opt in.
-    pub include_hidden_by_default: bool,
+    pub(crate) include_hidden_by_default: bool,
     /// Whether simple `.gitignore` patterns are respected when a query does
     /// not opt out.
-    pub respect_gitignore_by_default: bool,
+    pub(crate) respect_gitignore_by_default: bool,
 }
 
 impl Default for LocalWorkspaceConfig {
@@ -752,6 +754,68 @@ impl Default for LocalWorkspaceConfig {
             include_hidden_by_default: false,
             respect_gitignore_by_default: true,
         }
+    }
+}
+
+impl LocalWorkspaceConfig {
+    /// Constructs a config with default values.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Symlink behavior.
+    pub fn symlink_policy(&self) -> SymlinkPolicy {
+        self.symlink_policy
+    }
+
+    /// Returns a config with updated symlink behavior.
+    pub fn with_symlink_policy(mut self, symlink_policy: SymlinkPolicy) -> Self {
+        self.symlink_policy = symlink_policy;
+        self
+    }
+
+    /// Default maximum bytes returned by read operations.
+    pub fn max_read_bytes(&self) -> usize {
+        self.max_read_bytes
+    }
+
+    /// Returns a config with an updated read byte cap.
+    pub fn with_max_read_bytes(mut self, max_read_bytes: usize) -> Self {
+        self.max_read_bytes = max_read_bytes;
+        self
+    }
+
+    /// Default maximum entries returned by list operations.
+    pub fn max_list_entries(&self) -> usize {
+        self.max_list_entries
+    }
+
+    /// Returns a config with an updated list entry cap.
+    pub fn with_max_list_entries(mut self, max_list_entries: usize) -> Self {
+        self.max_list_entries = max_list_entries;
+        self
+    }
+
+    /// Whether hidden files are included when a query does not opt in.
+    pub fn include_hidden_by_default(&self) -> bool {
+        self.include_hidden_by_default
+    }
+
+    /// Returns a config with updated hidden-file behavior.
+    pub fn with_include_hidden_by_default(mut self, include_hidden_by_default: bool) -> Self {
+        self.include_hidden_by_default = include_hidden_by_default;
+        self
+    }
+
+    /// Whether `.gitignore` patterns are respected when a query does not opt out.
+    pub fn respect_gitignore_by_default(&self) -> bool {
+        self.respect_gitignore_by_default
+    }
+
+    /// Returns a config with updated `.gitignore` behavior.
+    pub fn with_respect_gitignore_by_default(mut self, respect_gitignore_by_default: bool) -> Self {
+        self.respect_gitignore_by_default = respect_gitignore_by_default;
+        self
     }
 }
 
@@ -1411,7 +1475,7 @@ async fn validate_file_patch(
             if truncated {
                 return Err(PatchConflict {
                     path: file_patch.path.clone(),
-                    message: "file is too large for baseline patch applier".to_string(),
+                    message: "file is too large for local patch applier".to_string(),
                     expected_version: file_patch.expected_version.clone(),
                     actual_version: Some(version),
                 });
@@ -1479,7 +1543,7 @@ async fn validate_file_patch(
             if truncated {
                 return Err(PatchConflict {
                     path: from.clone(),
-                    message: "file is too large for baseline patch applier".to_string(),
+                    message: "file is too large for local patch applier".to_string(),
                     expected_version: file_patch.expected_version.clone(),
                     actual_version: Some(version),
                 });

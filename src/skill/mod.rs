@@ -16,15 +16,16 @@
 //! tools — tools stay in [`ToolRegistry`](crate::ToolRegistry), and skills
 //! declare dependencies with `allowed-tools`.
 //!
-//! Companion assembly: [`ReActAgent::with_skills`](crate::agent::ReActAgent::with_skills)
-//! merges the menu into the system prompt and registers [`LoadSkillTool`],
-//! ready to use once assembled.
+//! Companion assembly: [`SkillLayer`] returns the prompt fragment and optional
+//! [`LoadSkillTool`]. Hosts append the fragment to their system prompt and
+//! register the tool explicitly, keeping skill policy outside the agent loop.
 //!
 //! # Example
 //!
 //! Parse a SKILL.md text (a self-contained skill, no resource directory):
 //!
 //! ```
+//! # fn main() -> Result<(), molo::skill::SkillError> {
 //! use molo::skill::Skill;
 //!
 //! let skill = Skill::parse(
@@ -34,16 +35,18 @@
 //!      allowed-tools: Bash(git:*)\n\
 //!      ---\n\
 //!      Review steps: read the diff first, then check each file.",
-//! )
-//! .unwrap();
+//! )?;
 //!
 //! assert_eq!(skill.name(), "code-review");
 //! assert_eq!(skill.description(), "Review code changes against team conventions, find bugs and style issues");
 //! assert_eq!(skill.body(), "Review steps: read the diff first, then check each file.");
-//! assert_eq!(skill.allowed_tools()[0].name, "Bash");
+//! assert_eq!(skill.allowed_tools().first().map(|tool| tool.name.as_str()), Some("Bash"));
+//! # Ok(())
+//! # }
 //! ```
 
 use indexmap::IndexMap;
+use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, RwLock};
@@ -64,7 +67,7 @@ const MAX_SKILL_FILE_BYTES: u64 = 1024 * 1024;
 const MAX_SKILL_BODY_CHARS: usize = 256 * 1024;
 
 /// Skill assembly mode.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[non_exhaustive]
 pub enum SkillMode {
     /// Progressive disclosure: inject a menu and expose `load_skill`.
@@ -76,7 +79,7 @@ pub enum SkillMode {
 }
 
 /// Trust assigned by the host to skill packages.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[non_exhaustive]
 pub enum SkillSourceTrust {
     /// Project-local skill.
@@ -98,18 +101,20 @@ impl From<SkillSourceTrust> for ToolTrustLevel {
 }
 
 /// Configuration for [`SkillLayer`] assembly.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+#[non_exhaustive]
 pub struct SkillLayerConfig {
     /// Maximum menu characters emitted into the prompt.
-    pub max_menu_chars: usize,
+    pub(crate) max_menu_chars: usize,
     /// Maximum body characters emitted into the prompt.
-    pub max_body_chars: usize,
+    pub(crate) max_body_chars: usize,
     /// Maximum reference bytes returned by reference loading tools.
-    pub max_reference_bytes: usize,
+    pub(crate) max_reference_bytes: usize,
     /// Whether allowed-tools should be treated as a strict policy hint.
-    pub strict_allowed_tools: bool,
+    pub(crate) strict_allowed_tools: bool,
     /// Trust assigned to tools exposed by this skill layer.
-    pub source_trust: SkillSourceTrust,
+    pub(crate) source_trust: SkillSourceTrust,
 }
 
 impl Default for SkillLayerConfig {
@@ -121,6 +126,68 @@ impl Default for SkillLayerConfig {
             strict_allowed_tools: false,
             source_trust: SkillSourceTrust::Project,
         }
+    }
+}
+
+impl SkillLayerConfig {
+    /// Constructs a config with default values.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Maximum menu characters emitted into the prompt.
+    pub fn max_menu_chars(&self) -> usize {
+        self.max_menu_chars
+    }
+
+    /// Returns a config with an updated menu character cap.
+    pub fn with_max_menu_chars(mut self, max_menu_chars: usize) -> Self {
+        self.max_menu_chars = max_menu_chars;
+        self
+    }
+
+    /// Maximum body characters emitted into the prompt.
+    pub fn max_body_chars(&self) -> usize {
+        self.max_body_chars
+    }
+
+    /// Returns a config with an updated body character cap.
+    pub fn with_max_body_chars(mut self, max_body_chars: usize) -> Self {
+        self.max_body_chars = max_body_chars;
+        self
+    }
+
+    /// Maximum reference bytes returned by reference loading tools.
+    pub fn max_reference_bytes(&self) -> usize {
+        self.max_reference_bytes
+    }
+
+    /// Returns a config with an updated reference byte cap.
+    pub fn with_max_reference_bytes(mut self, max_reference_bytes: usize) -> Self {
+        self.max_reference_bytes = max_reference_bytes;
+        self
+    }
+
+    /// Whether allowed-tools should be treated as a strict policy hint.
+    pub fn strict_allowed_tools(&self) -> bool {
+        self.strict_allowed_tools
+    }
+
+    /// Returns a config with updated allowed-tools strictness.
+    pub fn with_strict_allowed_tools(mut self, strict_allowed_tools: bool) -> Self {
+        self.strict_allowed_tools = strict_allowed_tools;
+        self
+    }
+
+    /// Trust assigned to tools exposed by this skill layer.
+    pub fn source_trust(&self) -> SkillSourceTrust {
+        self.source_trust
+    }
+
+    /// Returns a config with updated skill source trust.
+    pub fn with_source_trust(mut self, source_trust: SkillSourceTrust) -> Self {
+        self.source_trust = source_trust;
+        self
     }
 }
 
@@ -592,20 +659,29 @@ impl Skill {
 /// # Example
 ///
 /// ```
+/// # fn main() -> Result<(), molo::skill::SkillError> {
 /// use molo::skill::{Skill, SkillRegistry};
 ///
 /// let registry = SkillRegistry::new();
-/// let skill = Skill::parse("---\nname: greet\ndescription: Say hello\n---\nHello!").unwrap();
+/// let skill = Skill::parse("---\nname: greet\ndescription: Say hello\n---\nHello!")?;
 /// registry.add(skill);
 ///
 /// assert_eq!(registry.menu(), "- greet: Say hello");
-/// assert_eq!(registry.get("greet").unwrap().body(), "Hello!");
+/// assert_eq!(
+///     registry.get("greet").map(|skill| skill.body().to_string()),
+///     Some("Hello!".to_string())
+/// );
 /// // re-registering the same name: replaces the original skill, position
 /// // unchanged
-/// let v2 = Skill::parse("---\nname: greet\ndescription: Say hello\n---\nGood morning!").unwrap();
+/// let v2 = Skill::parse("---\nname: greet\ndescription: Say hello\n---\nGood morning!")?;
 /// registry.add(v2);
-/// assert_eq!(registry.get("greet").unwrap().body(), "Good morning!");
+/// assert_eq!(
+///     registry.get("greet").map(|skill| skill.body().to_string()),
+///     Some("Good morning!".to_string())
+/// );
 /// assert_eq!(registry.skills().len(), 1);
+/// # Ok(())
+/// # }
 /// ```
 #[derive(Default)]
 pub struct SkillRegistry {
@@ -655,9 +731,9 @@ impl SkillRegistry {
     /// when the skill does not exist.
     ///
     /// This is the developer's physical management interface (upgrading /
-    /// retiring skills); session-level "invisibility" filtering uses the
-    /// assembly layer's allowlist ([`ReActAgent::with_enabled_skills`](crate::agent::ReActAgent::with_enabled_skills)),
-    /// and metadata can stay in the registry.
+    /// retiring skills); session-level "invisibility" filtering uses
+    /// [`SkillLayer::with_enabled_skills`], and metadata can stay in the
+    /// registry.
     pub fn remove(&self, name: &str) -> bool {
         let mut guard = self
             .skills
@@ -804,9 +880,8 @@ impl SkillRegistry {
 
     /// A cloned snapshot of all skills (in registration order).
     ///
-    /// For static assembly scenarios (e.g. the assembly layer's
-    /// `with_skills_inline`): take the snapshot and build the system
-    /// prompt yourself, bypassing the disclosure flow.
+    /// For static assembly scenarios, take the snapshot and build the
+    /// system prompt yourself, bypassing the disclosure flow.
     pub fn skills(&self) -> Vec<Skill> {
         let guard = self
             .skills
@@ -827,6 +902,28 @@ impl std::fmt::Debug for SkillRegistry {
                 .finish(),
             Err(_) => f.write_str("<locked>"),
         }
+    }
+}
+
+impl Extend<Skill> for SkillRegistry {
+    fn extend<I>(&mut self, iter: I)
+    where
+        I: IntoIterator<Item = Skill>,
+    {
+        for skill in iter {
+            self.add(skill);
+        }
+    }
+}
+
+impl FromIterator<Skill> for SkillRegistry {
+    fn from_iter<I>(iter: I) -> Self
+    where
+        I: IntoIterator<Item = Skill>,
+    {
+        let mut registry = Self::new();
+        registry.extend(iter);
+        registry
     }
 }
 
@@ -1114,13 +1211,13 @@ fn limit_chars(text: &str, max_chars: usize) -> String {
 /// beyond goes into `references/` resources read via
 /// [`Skill::load_reference`] (protocol recommendation, not enforced).
 ///
-/// The assembly layer ([`ReActAgent::with_skills`](crate::agent::ReActAgent::with_skills))
-/// automatically registers this tool into the ToolRegistry; `enabled` is
-/// the session allowlist view (a snapshot built at construction, `None` =
-/// all visible), and skills outside the allowlist are refused. The `name`
-/// argument is constrained by enum to allowlisted skill names (queried
-/// fresh from the registry each turn, so hot-swaps are reflected per
-/// turn), preventing the model from hallucinating nonexistent skills.
+/// [`SkillLayer`] returns this tool in progressive mode; hosts register it
+/// into the ToolRegistry with [`SkillLayer::load_skill_source`]. `enabled` is
+/// the session allowlist view (`None` = all visible), and skills outside the
+/// allowlist are refused. The `name` argument is constrained by enum to
+/// allowlisted skill names (queried fresh from the registry each turn, so
+/// hot-swaps are reflected per turn), preventing the model from hallucinating
+/// nonexistent skills.
 ///
 /// # Errors
 ///
@@ -1260,10 +1357,12 @@ impl LoadSkillTool {
 }
 
 /// Skill resource loading limits.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+#[non_exhaustive]
 pub struct SkillResourceStore {
     /// Maximum bytes returned from a reference resource.
-    pub max_reference_bytes: usize,
+    pub(crate) max_reference_bytes: usize,
 }
 
 impl Default for SkillResourceStore {
@@ -1271,6 +1370,24 @@ impl Default for SkillResourceStore {
         Self {
             max_reference_bytes: 256 * 1024,
         }
+    }
+}
+
+impl SkillResourceStore {
+    /// Constructs a store config with default limits.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Maximum bytes returned from a reference resource.
+    pub fn max_reference_bytes(&self) -> usize {
+        self.max_reference_bytes
+    }
+
+    /// Returns a store config with an updated reference byte cap.
+    pub fn with_max_reference_bytes(mut self, max_reference_bytes: usize) -> Self {
+        self.max_reference_bytes = max_reference_bytes;
+        self
     }
 }
 
@@ -2320,6 +2437,29 @@ Review steps.
             .collect();
         assert_eq!(names, vec!["a", "b", "c"]);
         assert_eq!(registry.get("b").unwrap().body(), "new body");
+    }
+
+    #[test]
+    fn registry_from_iter_and_extend_keep_add_semantics() {
+        let mut registry: SkillRegistry = [minimal("a"), minimal("b"), minimal("a")]
+            .into_iter()
+            .collect();
+        let names: Vec<String> = registry
+            .skills()
+            .iter()
+            .map(|skill| skill.name().to_string())
+            .collect();
+        assert_eq!(names, vec!["a", "b"]);
+
+        registry.extend([minimal("c")]);
+        assert_eq!(
+            registry
+                .skills()
+                .iter()
+                .map(|skill| skill.name().to_string())
+                .collect::<Vec<_>>(),
+            vec!["a", "b", "c"]
+        );
     }
 
     #[test]

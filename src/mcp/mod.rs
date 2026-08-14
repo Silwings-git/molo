@@ -211,7 +211,7 @@ pub enum McpToolMode {
 /// molo tools.
 ///
 /// This type is a **converter**, not a long-lived handle: once connected, each
-/// generated [`McpTool`] holds its own connection reference, and the
+/// generated [`McpDirectTool`] holds its own connection reference, and the
 /// `McpClient` itself can be dropped after assembly; the connection is kept
 /// alive by the tools and closes automatically when the last tool is dropped.
 ///
@@ -345,7 +345,7 @@ impl McpClient {
     /// own risk.
     ///
     /// Only affects the display names produced by **subsequent**
-    /// [`tools`](McpClient::tools) calls; already-created [`McpTool`]s are
+    /// [`tools`](McpClient::tools) calls; already-created [`McpDirectTool`]s are
     /// unchanged.
     pub fn with_name_prefix(&mut self, enabled: bool) -> &mut Self {
         self.prefix = enabled;
@@ -488,10 +488,10 @@ impl McpClient {
     /// Disconnects; idempotent.
     ///
     /// Releases the connection reference held by this component: if any
-    /// generated [`McpTool`] is still referenced (e.g., still registered in a
-    /// `ToolRegistry`), the tools keep the connection alive and calls work as
-    /// usual; once all tools are released, the connection closes automatically
-    /// (the child process terminates). A later
+    /// generated [`McpDirectTool`] is still referenced (e.g., still registered
+    /// in a `ToolRegistry`), the tools keep the connection alive and calls
+    /// work as usual; once all tools are released, the connection closes
+    /// automatically (the child process terminates). A later
     /// [`tools`](McpClient::tools) call reconnects automatically.
     pub async fn cleanup(&mut self) -> Result<(), McpError> {
         self.running = None;
@@ -694,12 +694,6 @@ impl McpDirectTool {
         .with_trust(ToolTrustLevel::External)
     }
 }
-
-/// Backward-compatible alias for the direct MCP tool wrapper.
-///
-/// New code should prefer [`McpDirectTool`] for prototype/direct execution or
-/// [`McpEffectTool`] for harness-governed execution.
-pub type McpTool = McpDirectTool;
 
 /// Mapping result of a server tool description: display name / raw name /
 /// description / parameter Schema.
@@ -1453,7 +1447,7 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     async fn call_mcp_tool(
-        tool: &McpTool,
+        tool: &McpDirectTool,
         arguments: serde_json::Value,
     ) -> Result<String, ToolError> {
         let run = crate::RunContext::new("mcp-tool-test");

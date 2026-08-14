@@ -1,9 +1,8 @@
 //! Cooperative cancellation demo: stop the reply mid-stream, then keep
 //! chatting with the same Agent afterwards.
 //!
-//! Demonstrates two ways of using
-//! [`CancellableAgent`](molo::agent::CancellableAgent), two typical scenarios
-//! for interactive applications:
+//! Demonstrates two cancellation scenarios for interactive applications using
+//! [`RunContext`](molo::RunContext):
 //!
 //! 1. **Stop mid-reply**: "press Esc" during streaming (the example simulates
 //!    the keypress with a delay) — deltas already emitted are kept, the stream
@@ -28,11 +27,12 @@
 //! Run: `cargo run --example cancellation`
 
 use futures::StreamExt;
-use molo::CancellationToken;
-use molo::agent::{CancellableAgent, MessageChunk};
+use molo::agent::{Agent, MessageChunk};
 use molo::provider::{
-    ChatRequest, ChatResponse, FinishReason, Provider, ProviderError, StreamEvent,
+    ChatRequest, ChatResponse, FinishReason, Provider, ProviderError, ProviderRequestContext,
+    StreamEvent,
 };
+use molo::{CancellationToken, RunContext, RunRequest};
 use std::io::Write;
 use std::time::Duration;
 
@@ -41,19 +41,29 @@ struct SlowProvider;
 
 #[async_trait::async_trait]
 impl Provider for SlowProvider {
-    async fn chat(&self, _request: ChatRequest) -> Result<ChatResponse, ProviderError> {
+    async fn chat_with_context(
+        &self,
+        _request: ChatRequest,
+        _context: &ProviderRequestContext,
+    ) -> Result<ChatResponse, ProviderError> {
         unreachable!("example uses streaming path only")
     }
 
-    async fn stream_chat(
+    async fn stream_chat_with_context(
         &self,
         _request: ChatRequest,
+        context: &ProviderRequestContext,
     ) -> Result<
         futures::stream::BoxStream<'static, Result<StreamEvent, ProviderError>>,
         ProviderError,
     > {
+        let context = context.clone();
         Ok(Box::pin(async_stream::stream! {
             for chunk in ["Hello", ",", " this", " is", " a", " long", " reply"] {
+                if context.is_cancelled() {
+                    yield Err(ProviderError::Cancelled);
+                    return;
+                }
                 yield Ok(StreamEvent::Delta(chunk.into()));
                 tokio::time::sleep(Duration::from_millis(40)).await;
             }
@@ -81,7 +91,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
 
     let mut stream = agent
-        .run_stream_cancellable("say something", &token)
+        .run_stream_request_with_context(
+            RunRequest::text("say something"),
+            RunContext::generated().with_cancellation(token),
+        )
         .await?;
     let mut got = String::new();
     while let Some(event) = stream.next().await {
@@ -111,7 +124,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Cancellation leaves no residue: run again with a fresh token; memory/history is intact (messages recorded in the previous round are kept).
     println!("\nuser: continue");
     let token = CancellationToken::new();
-    let mut stream = agent.run_stream_cancellable("continue", &token).await?;
+    let mut stream = agent
+        .run_stream_request_with_context(
+            RunRequest::text("continue"),
+            RunContext::generated().with_cancellation(token),
+        )
+        .await?;
     while let Some(event) = stream.next().await {
         match event? {
             MessageChunk::Delta(delta) => {

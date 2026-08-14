@@ -20,13 +20,12 @@
 use super::config::AgentConfig;
 #[cfg(feature = "structured")]
 use super::structured::{StructuredOutcome, StructuredValidator};
-use crate::CancellationToken;
 #[cfg(feature = "structured")]
 use crate::agent::TypedAgent;
 use crate::agent::events::ReActEvent;
 use crate::agent::{
-    Agent, AgentAction, AgentError, AgentEvent, AgentKernel, CancellableAgent, MessageChunk,
-    ModelObservation, ModelRequest, Observation, RunSummary,
+    Agent, AgentAction, AgentError, AgentEvent, AgentKernel, MessageChunk, ModelObservation,
+    ModelRequest, Observation, RunSummary,
 };
 use crate::effect::{EffectObservation, EffectRequest};
 use crate::event_channel::EventChannel;
@@ -41,8 +40,6 @@ use crate::provider::{
 #[cfg(feature = "structured")]
 use crate::run::TypedRunOutput;
 use crate::run::{Artifact, RunContext, RunMetadata, RunOutput, RunRequest};
-#[cfg(feature = "skills")]
-use crate::skill::{SkillLayer, SkillMode, SkillRegistry};
 use crate::tool::{SharedState, ToolMemoryPolicy, ToolOutput, ToolRegistry, ToolResult};
 use futures::StreamExt;
 use futures::stream::BoxStream;
@@ -83,7 +80,6 @@ use tracing::Instrument;
 /// Returns [`ReActAgent`](crate::agent::ReActAgent); chained
 /// [`with_memory`](ReActAgent::with_memory) / [`with_config`](ReActAgent::with_config) /
 /// [`with_state`](ReActAgent::with_state) / [`with_event_channel`](ReActAgent::with_event_channel) /
-/// `with_skills` /
 /// [`with_tool_round_executor`](ReActAgent::with_tool_round_executor) work as usual.
 /// `ReActAgent::new` keeps a single signature; the macro handles the
 /// multiple shapes.
@@ -170,9 +166,8 @@ macro_rules! react_agent {
 ///
 /// # Cancellation semantics
 ///
-/// ReActAgent implements [`CancellableAgent`] — every run carries a
-/// [`CancellationToken`]; cancellation is cooperative and only checked
-/// at safe points:
+/// ReActAgent observes cancellation and deadlines carried by [`RunContext`].
+/// Cancellation is cooperative and only checked at safe points:
 ///
 /// - Cancelled mid-conversation: the in-flight request is dropped, and
 ///   nothing is recorded for this round;
@@ -239,20 +234,6 @@ pub struct ReActAgent {
     /// custom policy (order / concurrency / approval gates) via
     /// [`with_tool_round_executor`](ReActAgent::with_tool_round_executor).
     executor: Box<dyn ToolRoundExecutor>,
-    /// Skill registry (optional, empty by default): held when skills are
-    /// assembled; the application reads and writes this field directly
-    /// across runs (hot-swappable — additions/removals take effect on the
-    /// next request).
-    #[cfg(feature = "skills")]
-    pub skills: Arc<SkillRegistry>,
-    /// Session-visible allowlist (`None` = all skills visible; only
-    /// effective in dynamic mode).
-    #[cfg(feature = "skills")]
-    enabled_skills: Option<Arc<HashSet<String>>>,
-    /// Optional skill extension layer. Legacy `with_skills*` methods are thin
-    /// wrappers around this layer.
-    #[cfg(feature = "skills")]
-    skill_layer: Option<SkillLayer>,
     /// Step-wise kernel state. `None` means no `AgentKernel` run is active.
     kernel_state: Option<ReActKernelState>,
 }
@@ -306,12 +287,6 @@ impl ReActAgent {
             state: SharedState::default(),
             events: None,
             executor: Box::new(SerialToolRoundExecutor),
-            #[cfg(feature = "skills")]
-            skills: Arc::new(SkillRegistry::new()),
-            #[cfg(feature = "skills")]
-            enabled_skills: None,
-            #[cfg(feature = "skills")]
-            skill_layer: None,
             kernel_state: None,
         }
     }
@@ -517,185 +492,6 @@ impl ReActAgent {
     pub fn with_tool_round_executor(mut self, executor: impl ToolRoundExecutor + 'static) -> Self {
         self.executor = Box::new(executor);
         self
-    }
-
-    /// Attach a skill registry (dynamic progressive disclosure): the skill
-    /// menu joins the system prompt, the
-    /// [`load_skill`](crate::skill::LoadSkillTool) tool is registered into
-    /// the ToolRegistry, and the model reads skill bodies on demand.
-    ///
-    /// Skills are **hot-swappable**: the agent exposes a
-    /// [`skills`](ReActAgent::skills) handle; the application side can add
-    /// or remove anytime, taking effect on the next request's menu and
-    /// loading; assembling an empty registry = unchanged system prompt
-    /// (zero cost).
-    ///
-    /// Mutually exclusive with
-    /// [`with_skills_inline`](ReActAgent::with_skills_inline); the last
-    /// call wins.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// # #[tokio::main]
-    /// # async fn main() -> Result<(), molo::AgentError> {
-    /// use molo::agent::{Agent, ReActAgent};
-    /// use molo::provider::{FakeProvider, FakeReply};
-    /// use molo::skill::{Skill, SkillRegistry};
-    /// use molo::tool::ToolRegistry;
-    ///
-    /// let skills = SkillRegistry::new();
-    /// // The sample input is known-valid: a parse failure means the sample
-    /// // text is wrong, and the assertion surfaces it directly.
-    /// skills.add(
-    ///     Skill::parse("---\nname: greet\ndescription: Greet the user\n---\nRule: start with 'Hello'.")
-    ///         .unwrap(),
-    /// );
-    ///
-    /// let mut agent = ReActAgent::new(
-    ///     FakeProvider::new([FakeReply::Text("Hello".into())]),
-    ///     ToolRegistry::new(),
-    ///     "You are an assistant",
-    /// )
-    /// .with_skills(skills);
-    ///
-    /// assert_eq!(agent.run("Are you there").await?, "Hello");
-    /// # Ok(())
-    /// # }
-    /// ```
-    #[cfg(feature = "skills")]
-    pub fn with_skills(mut self, registry: SkillRegistry) -> Self {
-        self.skills = Arc::new(registry);
-        self.registry.remove("load_skill");
-        let layer = SkillLayer::new(Arc::clone(&self.skills))
-            .with_enabled_set(self.enabled_skills.clone())
-            .with_mode(SkillMode::Progressive);
-        let assembly = layer.assemble();
-        if let Some(tool) = assembly.load_skill_tool {
-            self.registry
-                .register_with_source(tool, layer.load_skill_source())
-                .expect("SkillLayer load_skill source must match tool schema");
-        }
-        self.skill_layer = Some(layer);
-        self
-    }
-
-    /// Attach a skill registry (static inlining): all bodies stay in the
-    /// system prompt, and no load_skill tool is registered.
-    ///
-    /// The counterpart of [`with_skills`](ReActAgent::with_skills)'s
-    /// "menu + load on demand": with small skill sets and deterministic
-    /// flows, resident bodies save the tool round-trip; with many skills,
-    /// the system-prompt cost grows with the bodies, and the dynamic mode
-    /// should be used instead.
-    ///
-    /// Mutually exclusive with [`with_skills`](ReActAgent::with_skills);
-    /// the last call wins.
-    #[cfg(feature = "skills")]
-    pub fn with_skills_inline(mut self, registry: SkillRegistry) -> Self {
-        self.skills = Arc::new(registry);
-        // If switching from dynamic mode: remove load_skill, to avoid
-        // leaving a loader tool with no menu to guide it.
-        self.registry.remove("load_skill");
-        self.skill_layer = Some(
-            SkillLayer::new(Arc::clone(&self.skills))
-                .with_enabled_set(self.enabled_skills.clone())
-                .with_mode(SkillMode::Inline),
-        );
-        self
-    }
-
-    /// Restrict the allowlist of skills visible in this session (all
-    /// visible by default).
-    ///
-    /// The allowlist is set at construction time and immutable; skills
-    /// outside the allowlist:
-    /// - don't appear in the system prompt's menu, and load_skill returns
-    ///   "skill not enabled" when loading them;
-    /// - can't be pre-activated via
-    ///   [`activate_skill`](ReActAgent::activate_skill).
-    ///
-    /// Disabling ≠ deleting: metadata always stays in the registry
-    /// ([`skills`](ReActAgent::skills)), and a new session (a newly
-    /// constructed agent) restores full visibility by default. The
-    /// allowlist only applies to dynamic mode
-    /// ([`with_skills`](ReActAgent::with_skills)); in inline mode
-    /// ([`with_skills_inline`](ReActAgent::with_skills_inline)) all bodies
-    /// are already resident, so the allowlist has no effect.
-    #[cfg(feature = "skills")]
-    pub fn with_enabled_skills(mut self, names: &[&str]) -> Self {
-        let set: HashSet<String> = names.iter().map(|n| n.to_string()).collect();
-        self.enabled_skills = Some(Arc::new(set));
-        // Dynamic mode: re-register load_skill (same-name replacement) so
-        // the allowlist takes effect immediately.
-        if let Some(layer) = self.skill_layer.take() {
-            let mode = layer.mode();
-            let layer = layer.with_enabled_set(self.enabled_skills.clone());
-            self.registry.remove("load_skill");
-            if mode == SkillMode::Progressive {
-                let assembly = layer.assemble();
-                if let Some(tool) = assembly.load_skill_tool {
-                    self.registry
-                        .register_with_source(tool, layer.load_skill_source())
-                        .expect("SkillLayer load_skill source must match tool schema");
-                }
-            }
-            self.skill_layer = Some(layer);
-        }
-        self
-    }
-
-    /// Pre-activate a skill: the body joins the system prompt without the
-    /// model's involvement.
-    ///
-    /// The counterpart of load_skill's "model loads on its own", this is
-    /// the second path for **explicit user activation** (e.g. interactive
-    /// UI selection, application-level parsing of slash commands): the
-    /// skill enters the system prompt immediately and deterministically,
-    /// consuming no tool rounds. Repeated activation is idempotent;
-    /// activated skills are excluded from the menu (no duplicate
-    /// disclosure), and the model can still load_skill other skills.
-    ///
-    /// Pre-activated bodies stay resident in the system prompt and are not
-    /// trimmed by window Memory — the activation count is the user's token
-    /// trade-off; session cleanup = constructing a new agent resets it.
-    ///
-    /// # Returns
-    ///
-    /// Activation succeeded (the skill exists and is visible) or it was
-    /// already activated → `true`; the skill doesn't exist, is outside the
-    /// allowlist, or the mode is inline → `false`.
-    #[cfg(feature = "skills")]
-    pub fn activate_skill(&mut self, name: &str) -> bool {
-        self.skill_layer
-            .as_ref()
-            .is_some_and(|layer| layer.activate_skill(name))
-    }
-
-    /// Deactivate a pre-activated skill: the body leaves the system prompt
-    /// and returns to the menu (the model can reload it via load_skill).
-    ///
-    /// # Returns
-    ///
-    /// Successfully deactivated (previously activated) → `true`; the skill
-    /// wasn't activated or the mode is inline → `false`.
-    ///
-    /// # Examples
-    ///
-    /// With no skills assembled (not dynamic mode), deactivation is always
-    /// `false`:
-    ///
-    /// ```
-    /// use molo::{FakeProvider, FakeReply, react_agent};
-    ///
-    /// let mut agent = react_agent!(FakeProvider::new([FakeReply::Text("Hello".into())]));
-    /// assert!(!agent.deactivate_skill("greet"));
-    /// ```
-    #[cfg(feature = "skills")]
-    pub fn deactivate_skill(&mut self, name: &str) -> bool {
-        self.skill_layer
-            .as_ref()
-            .is_some_and(|layer| layer.deactivate_skill(name))
     }
 
     /// Publish an event (no-op when no channel is attached). Takes a
@@ -922,9 +718,8 @@ impl ReActAgent {
         }
     }
 
-    /// Assemble the full prompt for each request: System first (base prompt +
-    /// skill disclosure, per the assembly mode), followed by Memory's
-    /// conversation history.
+    /// Assemble the full prompt for each request: System first, followed by
+    /// Memory's conversation history.
     ///
     /// Assembly happens when the conversation starts and is not written to
     /// Memory — the system prompt is static configuration while Memory is
@@ -941,33 +736,9 @@ impl ReActAgent {
         messages
     }
 
-    /// Assemble the system prompt: base prompt + skill disclosure (per the
-    /// assembly mode); an empty result = no system prompt.
-    ///
-    /// - No skills assembled: the base prompt is returned as-is;
-    /// - Dynamic mode: base prompt + menu (skills in the allowlist that are
-    ///   not activated, `- name: desc` in registration order) +
-    ///   pre-activated bodies ([Skill name] sections, in activation order);
-    /// - Inline mode: base prompt + all skill bodies (the allowlist has no
-    ///   effect).
+    /// Assemble the system prompt; an empty result = no system prompt.
     fn assemble_system_prompt(&self) -> String {
-        #[cfg(not(feature = "skills"))]
-        {
-            self.system_prompt.clone()
-        }
-        #[cfg(feature = "skills")]
-        {
-            let base = self.system_prompt.as_str();
-            let mut out = String::new();
-            out.push_str(base);
-            if let Some(layer) = &self.skill_layer {
-                let assembly = layer.assemble();
-                if !assembly.prompt_fragment.is_empty() {
-                    append_sections(&mut out, &[assembly.prompt_fragment]);
-                }
-            }
-            out
-        }
+        self.system_prompt.clone()
     }
 }
 
@@ -1472,28 +1243,7 @@ impl fmt::Debug for ReActAgent {
                     None => "None",
                 },
             );
-        #[cfg(feature = "skills")]
-        debug.field("skills", &self.skills);
         debug.finish()
-    }
-}
-
-/// Append a set of sections to the system prompt: sections are separated
-/// by blank lines, with a blank line inserted before existing content. An
-/// empty section list is a no-op.
-#[cfg(feature = "skills")]
-fn append_sections(out: &mut String, sections: &[String]) {
-    if sections.is_empty() {
-        return;
-    }
-    if !out.is_empty() {
-        out.push_str("\n\n");
-    }
-    for (i, section) in sections.iter().enumerate() {
-        if i > 0 {
-            out.push('\n');
-        }
-        out.push_str(section);
     }
 }
 
@@ -2768,39 +2518,6 @@ impl ReActAgent {
     }
 }
 
-#[async_trait::async_trait]
-impl CancellableAgent for ReActAgent {
-    async fn run_cancellable(
-        &mut self,
-        input: &str,
-        token: &CancellationToken,
-    ) -> Result<String, AgentError> {
-        let context = RunContext::generated().with_cancellation(token.clone());
-        Ok(self
-            .run_request_with_context(RunRequest::text(input), context)
-            .await?
-            .answer)
-    }
-
-    async fn run_stream_cancellable<'a>(
-        &'a mut self,
-        input: &'a str,
-        token: &CancellationToken,
-    ) -> Result<BoxStream<'a, Result<MessageChunk, AgentError>>, AgentError> {
-        let context = RunContext::generated().with_cancellation(token.clone());
-        match self
-            .run_stream_request_with_context(RunRequest::text(input), context)
-            .await
-        {
-            Ok(stream) => Ok(stream),
-            Err(AgentError::Cancelled) => Ok(Box::pin(futures::stream::iter([Ok(
-                MessageChunk::Cancelled,
-            )]))),
-            Err(e) => Err(e),
-        }
-    }
-}
-
 /// Wrap a span around a stream: enters on each poll and exits on return;
 /// the span's lifetime = the stream's consumption period (creation to drop,
 /// including time spent waiting while the consumer hasn't polled yet).
@@ -2886,11 +2603,27 @@ mod tests {
             self.0.chat(request).await
         }
 
+        async fn chat_with_context(
+            &self,
+            request: ChatRequest,
+            context: &ProviderRequestContext,
+        ) -> Result<ChatResponse, ProviderError> {
+            self.0.chat_with_context(request, context).await
+        }
+
         async fn stream_chat(
             &self,
             request: ChatRequest,
         ) -> Result<BoxStream<'static, Result<StreamEvent, ProviderError>>, ProviderError> {
             self.0.stream_chat(request).await
+        }
+
+        async fn stream_chat_with_context(
+            &self,
+            request: ChatRequest,
+            context: &ProviderRequestContext,
+        ) -> Result<BoxStream<'static, Result<StreamEvent, ProviderError>>, ProviderError> {
+            self.0.stream_chat_with_context(request, context).await
         }
     }
 
@@ -3020,6 +2753,10 @@ mod tests {
         ReActAgent::new(fake, registry, "").with_config(config)
     }
 
+    fn cancellation_context(token: &CancellationToken) -> RunContext {
+        RunContext::generated().with_cancellation(token.clone())
+    }
+
     #[tokio::test]
     async fn direct_answer() {
         let fake = SharedFake::new([FakeReply::Text("Hello".into())]);
@@ -3085,12 +2822,29 @@ mod tests {
                 self.0.chat(request).await
             }
 
+            async fn chat_with_context(
+                &self,
+                request: ChatRequest,
+                context: &ProviderRequestContext,
+            ) -> Result<ChatResponse, ProviderError> {
+                self.0.chat_with_context(request, context).await
+            }
+
             async fn stream_chat(
                 &self,
                 request: ChatRequest,
             ) -> Result<BoxStream<'static, Result<StreamEvent, ProviderError>>, ProviderError>
             {
                 self.0.stream_chat(request).await
+            }
+
+            async fn stream_chat_with_context(
+                &self,
+                request: ChatRequest,
+                context: &ProviderRequestContext,
+            ) -> Result<BoxStream<'static, Result<StreamEvent, ProviderError>>, ProviderError>
+            {
+                self.0.stream_chat_with_context(request, context).await
             }
         }
 
@@ -3774,12 +3528,17 @@ mod tests {
         struct EmptyStreamProvider;
         #[async_trait::async_trait]
         impl Provider for EmptyStreamProvider {
-            async fn chat(&self, _r: ChatRequest) -> Result<ChatResponse, ProviderError> {
-                unreachable!("this test uses streaming only")
-            }
-            async fn stream_chat(
+            async fn chat_with_context(
                 &self,
                 _r: ChatRequest,
+                _context: &ProviderRequestContext,
+            ) -> Result<ChatResponse, ProviderError> {
+                unreachable!("this test uses streaming only")
+            }
+            async fn stream_chat_with_context(
+                &self,
+                _r: ChatRequest,
+                _context: &ProviderRequestContext,
             ) -> Result<BoxStream<'static, Result<StreamEvent, ProviderError>>, ProviderError>
             {
                 Ok(Box::pin(futures::stream::empty()))
@@ -3971,12 +3730,17 @@ mod tests {
         struct FailInStream;
         #[async_trait::async_trait]
         impl Provider for FailInStream {
-            async fn chat(&self, _request: ChatRequest) -> Result<ChatResponse, ProviderError> {
-                unreachable!("this test uses streaming path only")
-            }
-            async fn stream_chat(
+            async fn chat_with_context(
                 &self,
                 _request: ChatRequest,
+                _context: &ProviderRequestContext,
+            ) -> Result<ChatResponse, ProviderError> {
+                unreachable!("this test uses streaming path only")
+            }
+            async fn stream_chat_with_context(
+                &self,
+                _request: ChatRequest,
+                _context: &ProviderRequestContext,
             ) -> Result<BoxStream<'static, Result<StreamEvent, ProviderError>>, ProviderError>
             {
                 Ok(Box::pin(futures::stream::iter(vec![
@@ -4177,10 +3941,10 @@ mod tests {
         assert_eq!(req.options.max_tokens, Some(64));
     }
 
-    // ---- Cancellation: run_cancellable / run_stream_cancellable ----
+    // ---- Cancellation through RunContext ----
 
     /// Pre-round cancellation: with an already-cancelled token,
-    /// run_cancellable returns Cancelled immediately, having started no
+    /// run_request_with_context returns Cancelled immediately, having started no
     /// conversation; the user message is already recorded (kept, consistent
     /// with the main path).
     #[tokio::test]
@@ -4190,7 +3954,10 @@ mod tests {
         let token = CancellationToken::new();
         token.cancel();
 
-        let err = agent.run_cancellable("hi", &token).await.unwrap_err();
+        let err = agent
+            .run_request_with_context(RunRequest::text("hi"), cancellation_context(&token))
+            .await
+            .unwrap_err();
         assert!(matches!(err, AgentError::Cancelled));
         assert_eq!(fake.requests().len(), 0); // no conversation started
         assert_eq!(agent.memory.context().await.unwrap().len(), 1); // user only
@@ -4206,7 +3973,10 @@ mod tests {
 
         // Non-streaming path.
         let (mut run_agent, mut rx) = attach_channel(agent(fake.clone(), ""));
-        let err = run_agent.run_cancellable("hi", &token).await.unwrap_err();
+        let err = run_agent
+            .run_request_with_context(RunRequest::text("hi"), cancellation_context(&token))
+            .await
+            .unwrap_err();
         assert!(matches!(err, AgentError::Cancelled));
         drop(run_agent);
         let events = drain(&mut rx).await;
@@ -4221,7 +3991,7 @@ mod tests {
         // Streaming path.
         let (mut stream_agent, mut rx) = attach_channel(agent(fake, ""));
         let mut stream = stream_agent
-            .run_stream_cancellable("hi", &token)
+            .run_stream_request_with_context(RunRequest::text("hi"), cancellation_context(&token))
             .await
             .unwrap();
         let chunks: Vec<MessageChunk> = stream.by_ref().map(|e| e.unwrap()).collect().await;
@@ -4250,12 +4020,17 @@ mod tests {
         struct PendingProvider;
         #[async_trait::async_trait]
         impl Provider for PendingProvider {
-            async fn chat(&self, _request: ChatRequest) -> Result<ChatResponse, ProviderError> {
-                std::future::pending().await // never completes: simulates a slow LLM
-            }
-            async fn stream_chat(
+            async fn chat_with_context(
                 &self,
                 _request: ChatRequest,
+                _context: &ProviderRequestContext,
+            ) -> Result<ChatResponse, ProviderError> {
+                std::future::pending().await // never completes: simulates a slow LLM
+            }
+            async fn stream_chat_with_context(
+                &self,
+                _request: ChatRequest,
+                _context: &ProviderRequestContext,
             ) -> Result<BoxStream<'static, Result<StreamEvent, ProviderError>>, ProviderError>
             {
                 unreachable!("this test uses non-streaming path only")
@@ -4265,7 +4040,7 @@ mod tests {
         let mut agent = ReActAgent::new(PendingProvider, ToolRegistry::new(), "");
         let token = CancellationToken::new();
         let result = tokio::select! {
-            r = agent.run_cancellable("hi", &token) => r,
+            r = agent.run_request_with_context(RunRequest::text("hi"), cancellation_context(&token)) => r.map(|output| output.answer),
             _ = async {
                 tokio::time::sleep(Duration::from_millis(20)).await;
                 token.cancel();
@@ -4285,12 +4060,17 @@ mod tests {
         struct FailProvider(ProviderError);
         #[async_trait::async_trait]
         impl Provider for FailProvider {
-            async fn chat(&self, _request: ChatRequest) -> Result<ChatResponse, ProviderError> {
-                Err(self.0.clone())
-            }
-            async fn stream_chat(
+            async fn chat_with_context(
                 &self,
                 _request: ChatRequest,
+                _context: &ProviderRequestContext,
+            ) -> Result<ChatResponse, ProviderError> {
+                Err(self.0.clone())
+            }
+            async fn stream_chat_with_context(
+                &self,
+                _request: ChatRequest,
+                _context: &ProviderRequestContext,
             ) -> Result<BoxStream<'static, Result<StreamEvent, ProviderError>>, ProviderError>
             {
                 Err(self.0.clone())
@@ -4326,13 +4106,18 @@ mod tests {
         struct PendingProvider;
         #[async_trait::async_trait]
         impl Provider for PendingProvider {
-            async fn chat(&self, _request: ChatRequest) -> Result<ChatResponse, ProviderError> {
+            async fn chat_with_context(
+                &self,
+                _request: ChatRequest,
+                _context: &ProviderRequestContext,
+            ) -> Result<ChatResponse, ProviderError> {
                 std::future::pending().await
             }
 
-            async fn stream_chat(
+            async fn stream_chat_with_context(
                 &self,
                 _request: ChatRequest,
+                _context: &ProviderRequestContext,
             ) -> Result<BoxStream<'static, Result<StreamEvent, ProviderError>>, ProviderError>
             {
                 std::future::pending().await
@@ -4356,13 +4141,18 @@ mod tests {
         struct PendingStreamProvider;
         #[async_trait::async_trait]
         impl Provider for PendingStreamProvider {
-            async fn chat(&self, _request: ChatRequest) -> Result<ChatResponse, ProviderError> {
+            async fn chat_with_context(
+                &self,
+                _request: ChatRequest,
+                _context: &ProviderRequestContext,
+            ) -> Result<ChatResponse, ProviderError> {
                 unreachable!("this test uses streaming only")
             }
 
-            async fn stream_chat(
+            async fn stream_chat_with_context(
                 &self,
                 _request: ChatRequest,
+                _context: &ProviderRequestContext,
             ) -> Result<BoxStream<'static, Result<StreamEvent, ProviderError>>, ProviderError>
             {
                 Ok(Box::pin(futures::stream::pending()))
@@ -4712,7 +4502,7 @@ mod tests {
         // Cancel at 50ms: right in the middle of the tool round (tool takes
         // 100ms).
         let result = tokio::select! {
-            r = agent.run_cancellable("Compute", &token) => r,
+            r = agent.run_request_with_context(RunRequest::text("Compute"), cancellation_context(&token)) => r.map(|output| output.answer),
             _ = async {
                 tokio::time::sleep(Duration::from_millis(50)).await;
                 token.cancel();
@@ -5149,12 +4939,17 @@ mod tests {
         struct SlowStreamProvider;
         #[async_trait::async_trait]
         impl Provider for SlowStreamProvider {
-            async fn chat(&self, _request: ChatRequest) -> Result<ChatResponse, ProviderError> {
-                unreachable!("this test uses streaming path only")
-            }
-            async fn stream_chat(
+            async fn chat_with_context(
                 &self,
                 _request: ChatRequest,
+                _context: &ProviderRequestContext,
+            ) -> Result<ChatResponse, ProviderError> {
+                unreachable!("this test uses streaming path only")
+            }
+            async fn stream_chat_with_context(
+                &self,
+                _request: ChatRequest,
+                _context: &ProviderRequestContext,
             ) -> Result<BoxStream<'static, Result<StreamEvent, ProviderError>>, ProviderError>
             {
                 Ok(Box::pin(async_stream::stream! {
@@ -5172,7 +4967,10 @@ mod tests {
 
         let mut agent = ReActAgent::new(SlowStreamProvider, ToolRegistry::new(), "");
         let token = CancellationToken::new();
-        let mut stream = agent.run_stream_cancellable("hi", &token).await.unwrap();
+        let mut stream = agent
+            .run_stream_request_with_context(RunRequest::text("hi"), cancellation_context(&token))
+            .await
+            .unwrap();
 
         // Cancel at 50ms: d0 already received (0ms), d1 still pending
         // (100ms) — cancellation lands in the gap.
@@ -5214,12 +5012,21 @@ mod tests {
         let t1 = CancellationToken::new();
         t1.cancel();
         assert!(matches!(
-            agent.run_cancellable("one", &t1).await,
+            agent
+                .run_request_with_context(RunRequest::text("one"), cancellation_context(&t1))
+                .await,
             Err(AgentError::Cancelled)
         ));
 
         let t2 = CancellationToken::new();
-        assert_eq!(agent.run_cancellable("two", &t2).await.unwrap(), "hi");
+        assert_eq!(
+            agent
+                .run_request_with_context(RunRequest::text("two"), cancellation_context(&t2))
+                .await
+                .unwrap()
+                .answer,
+            "hi"
+        );
     }
 
     // ---- Observation channel: the loop pushes process events once an
@@ -5449,12 +5256,17 @@ mod tests {
         struct SlowStreamProvider;
         #[async_trait::async_trait]
         impl Provider for SlowStreamProvider {
-            async fn chat(&self, _request: ChatRequest) -> Result<ChatResponse, ProviderError> {
-                unreachable!("this test uses streaming path only")
-            }
-            async fn stream_chat(
+            async fn chat_with_context(
                 &self,
                 _request: ChatRequest,
+                _context: &ProviderRequestContext,
+            ) -> Result<ChatResponse, ProviderError> {
+                unreachable!("this test uses streaming path only")
+            }
+            async fn stream_chat_with_context(
+                &self,
+                _request: ChatRequest,
+                _context: &ProviderRequestContext,
             ) -> Result<BoxStream<'static, Result<StreamEvent, ProviderError>>, ProviderError>
             {
                 Ok(Box::pin(async_stream::stream! {
@@ -5473,7 +5285,10 @@ mod tests {
         let (mut agent, mut rx) =
             attach_channel(ReActAgent::new(SlowStreamProvider, ToolRegistry::new(), ""));
         let token = CancellationToken::new();
-        let mut stream = agent.run_stream_cancellable("hi", &token).await.unwrap();
+        let mut stream = agent
+            .run_stream_request_with_context(RunRequest::text("hi"), cancellation_context(&token))
+            .await
+            .unwrap();
 
         // Cancel at 50ms: the select cancellation branch wins and the
         // consumption branch is dropped; after cancellation, keep consuming
@@ -6025,12 +5840,17 @@ mod tests {
             struct FailInStream;
             #[async_trait::async_trait]
             impl Provider for FailInStream {
-                async fn chat(&self, _request: ChatRequest) -> Result<ChatResponse, ProviderError> {
-                    unreachable!("this test uses streaming path only")
-                }
-                async fn stream_chat(
+                async fn chat_with_context(
                     &self,
                     _request: ChatRequest,
+                    _context: &ProviderRequestContext,
+                ) -> Result<ChatResponse, ProviderError> {
+                    unreachable!("this test uses streaming path only")
+                }
+                async fn stream_chat_with_context(
+                    &self,
+                    _request: ChatRequest,
+                    _context: &ProviderRequestContext,
                 ) -> Result<BoxStream<'static, Result<StreamEvent, ProviderError>>, ProviderError>
                 {
                     Ok(Box::pin(futures::stream::iter(vec![
@@ -6065,13 +5885,10 @@ mod tests {
     }
 
     #[cfg(feature = "skills")]
-    mod skill_tests {
+    mod skill_layer_integration_tests {
         use super::*;
-        use crate::skill::SkillRegistry;
+        use crate::skill::{SkillLayer, SkillMode, SkillRegistry};
 
-        // ---------- Skill assembly ----------
-
-        /// Test skill: builds a minimal valid SKILL.md.
         fn skill(name: &str, description: &str, body: &str) -> crate::skill::Skill {
             crate::skill::Skill::parse(&format!(
                 "---\nname: {name}\ndescription: {description}\n---\n{body}"
@@ -6079,7 +5896,6 @@ mod tests {
             .unwrap()
         }
 
-        /// A registry containing multiple skills.
         fn skill_registry(skills: &[(&str, &str, &str)]) -> SkillRegistry {
             let registry = SkillRegistry::new();
             for (name, description, body) in skills {
@@ -6088,7 +5904,31 @@ mod tests {
             registry
         }
 
-        /// The System message text of the most recent request.
+        fn explicit_skill_agent(
+            fake: SharedFake,
+            base_prompt: &str,
+            registry: SkillRegistry,
+            configure: impl FnOnce(SkillLayer) -> SkillLayer,
+        ) -> ReActAgent {
+            let registry = Arc::new(registry);
+            let layer = configure(SkillLayer::new(Arc::clone(&registry)));
+            let assembly = layer.assemble();
+            let mut tools = ToolRegistry::new();
+            if let Some(tool) = assembly.load_skill_tool {
+                tools
+                    .register_with_source(tool, layer.load_skill_source())
+                    .unwrap();
+            }
+            let mut system_prompt = base_prompt.to_string();
+            if !assembly.prompt_fragment.is_empty() {
+                if !system_prompt.is_empty() {
+                    system_prompt.push_str("\n\n");
+                }
+                system_prompt.push_str(&assembly.prompt_fragment);
+            }
+            ReActAgent::new(fake, tools, system_prompt)
+        }
+
         fn system_text(fake: &SharedFake) -> String {
             let requests = fake.requests();
             let last = requests.last().expect("expected a request");
@@ -6098,8 +5938,6 @@ mod tests {
             }
         }
 
-        /// The ToolResult content carrying the given substring in the most
-        /// recent request.
         fn tool_result_contains(fake: &SharedFake, needle: &str) {
             let requests = fake.requests();
             let last = requests.last().expect("expected a request");
@@ -6118,44 +5956,33 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn with_skills_adds_menu_to_system_prompt() {
+        async fn explicit_progressive_skill_layer_reaches_prompt_and_tools() {
             let fake = SharedFake::new([FakeReply::Text("OK".into())]);
-            let mut agent =
-                agent(fake.clone(), "You are an assistant").with_skills(skill_registry(&[
+            let mut agent = explicit_skill_agent(
+                fake.clone(),
+                "You are an assistant",
+                skill_registry(&[
                     ("code-review", "Review code", "Step one"),
                     ("greet", "Say hello", "Hello"),
-                ]));
+                ]),
+                |layer| layer,
+            );
 
             agent.run("Are you there").await.unwrap();
             let system = system_text(&fake);
-            assert!(
-                system.starts_with("You are an assistant"),
-                "base prompt must come first: {system}"
-            );
+            assert!(system.starts_with("You are an assistant"));
             assert!(system.contains("- code-review: Review code"));
             assert!(system.contains("- greet: Say hello"));
-        }
-
-        #[tokio::test]
-        async fn with_skills_registers_load_skill() {
-            let fake = SharedFake::new([FakeReply::Text("OK".into())]);
-            let mut agent = agent(fake.clone(), "You are an assistant")
-                .with_skills(skill_registry(&[("greet", "Say hello", "Hello body")]));
-
-            // The tool is registered into the registry; the schema reaches the
-            // request's tools, visible to the model.
-            assert!(agent.registry.names().contains(&"load_skill".to_string()));
-            agent.run("Are you there").await.unwrap();
             assert!(
                 fake.requests()[0]
                     .tools
                     .iter()
-                    .any(|t| t.name == "load_skill")
+                    .any(|tool| tool.name == "load_skill")
             );
         }
 
         #[tokio::test]
-        async fn load_skill_used_in_loop() {
+        async fn explicit_load_skill_tool_used_in_loop() {
             let fake = SharedFake::new([
                 FakeReply::ToolCalls {
                     content: "".into(),
@@ -6163,218 +5990,46 @@ mod tests {
                 },
                 FakeReply::Text("Done".into()),
             ]);
-            let mut agent = agent(fake.clone(), "You are an assistant")
-                .with_skills(skill_registry(&[("greet", "Say hello", "Hello body")]));
+            let mut agent = explicit_skill_agent(
+                fake.clone(),
+                "You are an assistant",
+                skill_registry(&[("greet", "Say hello", "Hello body")]),
+                |layer| layer,
+            );
 
             let answer = agent.run("Say hello").await.unwrap();
             assert_eq!(answer, "Done");
-            // The body is recorded as a ToolResult and sent back to the model in
-            // the second request.
-            let requests = fake.requests();
-            assert_eq!(requests.len(), 2);
-            let tool_results: Vec<&Message> = requests[1]
-                .messages
-                .iter()
-                .filter(|m| matches!(m, Message::ToolResult { .. }))
-                .collect();
-            assert_eq!(tool_results.len(), 1);
-            match tool_results[0] {
-                Message::ToolResult { content, .. } => assert!(content.contains("Hello body")),
-                _ => unreachable!(),
-            }
+            tool_result_contains(&fake, "Hello body");
         }
 
         #[tokio::test]
-        async fn load_skill_not_found_returns_error_text() {
-            let fake = SharedFake::new([
-                FakeReply::ToolCalls {
-                    content: "".into(),
-                    calls: vec![call("c1", "load_skill", r#"{"name":"ghost"}"#)],
-                },
-                FakeReply::Text("Try another".into()),
-            ]);
-            let mut agent = agent(fake.clone(), "You are an assistant")
-                .with_skills(skill_registry(&[("greet", "Say hello", "Hello body")]));
-
-            agent.run("Load skill").await.unwrap();
-            tool_result_contains(&fake, "not found");
-        }
-
-        #[tokio::test]
-        async fn load_skill_not_enabled_returns_text() {
-            let fake = SharedFake::new([
-                FakeReply::ToolCalls {
-                    content: "".into(),
-                    calls: vec![call("c1", "load_skill", r#"{"name":"other"}"#)],
-                },
-                FakeReply::Text("Understood".into()),
-            ]);
-            let mut agent = agent(fake.clone(), "You are an assistant")
-                .with_skills(skill_registry(&[
-                    ("greet", "Say hello", "Hello body"),
-                    ("other", "Another", "Other content"),
-                ]))
-                .with_enabled_skills(&["greet"]);
-
-            agent.run("Load").await.unwrap();
-            tool_result_contains(&fake, "not enabled");
-        }
-
-        #[tokio::test]
-        async fn with_skills_inline_embeds_all_bodies() {
+        async fn explicit_inline_skill_layer_embeds_bodies_without_loader() {
             let fake = SharedFake::new([FakeReply::Text("OK".into())]);
-            let mut agent =
-                agent(fake.clone(), "You are an assistant").with_skills_inline(skill_registry(&[
+            let mut agent = explicit_skill_agent(
+                fake.clone(),
+                "You are an assistant",
+                skill_registry(&[
                     ("greet", "Say hello", "Hello body"),
                     ("other", "Another", "Other content"),
-                ]));
-            assert!(!agent.registry.names().contains(&"load_skill".to_string()));
+                ]),
+                |layer| layer.with_mode(SkillMode::Inline),
+            );
 
             agent.run("Are you there").await.unwrap();
             let system = system_text(&fake);
             assert!(system.contains("[Skill greet]\nHello body"));
             assert!(system.contains("[Skill other]\nOther content"));
-            // Inline mode has no menu.
             assert!(!system.contains("- greet:"));
+            assert!(
+                fake.requests()[0]
+                    .tools
+                    .iter()
+                    .all(|tool| tool.name != "load_skill")
+            );
         }
 
         #[tokio::test]
-        async fn with_enabled_skills_filters_menu() {
-            let fake = SharedFake::new([FakeReply::Text("OK".into())]);
-            let mut agent = agent(fake.clone(), "You are an assistant")
-                .with_skills(skill_registry(&[
-                    ("greet", "Say hello", "Hello body"),
-                    ("other", "Another", "Other content"),
-                ]))
-                .with_enabled_skills(&["greet"]);
-
-            agent.run("Are you there").await.unwrap();
-            let system = system_text(&fake);
-            assert!(system.contains("- greet: Say hello"));
-            assert!(!system.contains("- other:"));
-        }
-
-        #[tokio::test]
-        async fn activate_skill_embeds_body_and_leaves_menu() {
-            let fake = SharedFake::new([FakeReply::Text("OK".into())]);
-            let mut agent =
-                agent(fake.clone(), "You are an assistant").with_skills(skill_registry(&[
-                    ("greet", "Say hello", "Hello body"),
-                    ("other", "Another", "Other content"),
-                ]));
-            assert!(agent.activate_skill("greet"));
-
-            agent.run("Are you there").await.unwrap();
-            let system = system_text(&fake);
-            assert!(system.contains("[Skill greet]\nHello body"));
-            // Pre-activated skills leave the menu; other skills remain.
-            assert!(!system.contains("- greet:"));
-            assert!(system.contains("- other: Another"));
-        }
-
-        #[tokio::test]
-        async fn deactivate_skill_returns_to_menu() {
-            let fake = SharedFake::new([FakeReply::Text("OK".into())]);
-            let mut agent = agent(fake.clone(), "You are an assistant")
-                .with_skills(skill_registry(&[("greet", "Say hello", "Hello body")]));
-            assert!(agent.activate_skill("greet"));
-            assert!(agent.deactivate_skill("greet"));
-
-            agent.run("Are you there").await.unwrap();
-            let system = system_text(&fake);
-            assert!(system.contains("- greet: Say hello"));
-            assert!(!system.contains("[Skill greet]"));
-            // Deactivating a skill that isn't activated: false.
-            assert!(!agent.deactivate_skill("greet"));
-        }
-
-        #[tokio::test]
-        async fn activate_skill_failure_paths() {
-            // Nonexistent / outside the allowlist → false; repeated activation
-            // is idempotent → true.
-            let mut whitelisted = agent(SharedFake::new([FakeReply::Text("OK".into())]), "")
-                .with_skills(skill_registry(&[("greet", "Say hello", "Hello body")]))
-                .with_enabled_skills(&["greet"]);
-            assert!(!whitelisted.activate_skill("ghost"));
-            assert!(!whitelisted.activate_skill("other"));
-            assert!(whitelisted.activate_skill("greet"));
-            assert!(whitelisted.activate_skill("greet"));
-
-            // Inline mode: pre-activation has no effect.
-            let mut inline = agent(SharedFake::new([FakeReply::Text("OK".into())]), "")
-                .with_skills_inline(skill_registry(&[("greet", "Say hello", "Hello body")]));
-            assert!(!inline.activate_skill("greet"));
-            assert!(!inline.deactivate_skill("greet"));
-        }
-
-        #[tokio::test]
-        async fn empty_skills_registry_zero_cost() {
-            let fake = SharedFake::new([FakeReply::Text("OK".into())]);
-            let mut agent =
-                agent(fake.clone(), "You are an assistant").with_skills(SkillRegistry::new());
-            agent.run("Are you there").await.unwrap();
-            // Empty registry: the system prompt is unchanged.
-            assert_eq!(system_text(&fake), "You are an assistant");
-            // load_skill is registered: hot-swapping from empty to populated
-            // lets the model load immediately.
-            assert!(agent.registry.names().contains(&"load_skill".to_string()));
-        }
-
-        #[tokio::test]
-        async fn skills_hot_swap_takes_effect_next_request() {
-            let fake = SharedFake::new([
-                FakeReply::Text("first round".into()),
-                FakeReply::Text("second round".into()),
-            ]);
-            let mut swap_agent =
-                agent(fake.clone(), "You are an assistant").with_skills(SkillRegistry::new());
-
-            swap_agent.run("Are you there").await.unwrap();
-            // The application side hot-swaps via the pub skills handle: it takes
-            // effect on the next request.
-            swap_agent
-                .skills
-                .add(skill("late", "Skill added later", "Late body"));
-            swap_agent.run("Once more").await.unwrap();
-            assert!(system_text(&fake).contains("- late: Skill added later"));
-
-            // load_skill looks up by name at call time: newly hot-swapped skills
-            // load immediately.
-            let fake2 = SharedFake::new([
-                FakeReply::ToolCalls {
-                    content: "".into(),
-                    calls: vec![call("c1", "load_skill", r#"{"name":"late"}"#)],
-                },
-                FakeReply::Text("Done".into()),
-            ]);
-            let mut late_agent =
-                agent(fake2.clone(), "You are an assistant").with_skills(SkillRegistry::new());
-            late_agent
-                .skills
-                .add(skill("late", "Skill added later", "Late body"));
-            late_agent.run("Load").await.unwrap();
-            tool_result_contains(&fake2, "Late body");
-        }
-
-        #[tokio::test]
-        async fn with_skills_inline_overrides_with_skills() {
-            let fake = SharedFake::new([FakeReply::Text("OK".into())]);
-            let mut agent = agent(fake.clone(), "You are an assistant")
-                .with_skills(skill_registry(&[("a", "A", "Body-a")]))
-                .with_skills_inline(skill_registry(&[("b", "B", "Body-b")]));
-            // Dynamic → inline switch: load_skill is removed.
-            assert!(!agent.registry.names().contains(&"load_skill".to_string()));
-
-            agent.run("Are you there").await.unwrap();
-            let system = system_text(&fake);
-            assert!(system.contains("[Skill b]\nBody-b"));
-            assert!(!system.contains("Body-a"));
-        }
-
-        #[tokio::test]
-        async fn load_skill_content_survives_window_trim() {
-            // Small budget window: skill bodies (protected) stay resident while
-            // regular conversation rounds are trimmed as usual.
+        async fn explicit_load_skill_content_survives_window_trim() {
             let fake = SharedFake::new([
                 FakeReply::ToolCalls {
                     content: "".into(),
@@ -6384,21 +6039,18 @@ mod tests {
                 FakeReply::Text("round two".into()),
                 FakeReply::Text("round three".into()),
             ]);
-            let mut agent = agent(fake.clone(), "You are an assistant")
-                .with_memory(crate::memory::WindowMemory::new(3))
-                .with_skills(skill_registry(&[(
-                    "greet",
-                    "Say hello",
-                    "Skill body content",
-                )]));
+            let mut agent = explicit_skill_agent(
+                fake.clone(),
+                "You are an assistant",
+                skill_registry(&[("greet", "Say hello", "Skill body content")]),
+                |layer| layer,
+            )
+            .with_memory(crate::memory::WindowMemory::new(3));
 
             agent.run("Load").await.unwrap();
             agent.run("round two").await.unwrap();
             agent.run("round three").await.unwrap();
 
-            // Context of the last request: the protected first round (skill
-            // body) and the latest round are kept; the middle regular rounds
-            // are trimmed.
             let requests = fake.requests();
             let last = requests.last().unwrap();
             let texts: Vec<String> = last
@@ -6419,40 +6071,9 @@ mod tests {
                 })
                 .collect();
             let joined = texts.join("|");
-            assert!(
-                joined.contains("Skill body content"),
-                "skill body should stay resident: {joined}"
-            );
-            assert!(
-                joined.contains("round three"),
-                "latest round should be kept: {joined}"
-            );
-            assert!(
-                !joined.contains("round two"),
-                "middle regular rounds should be trimmed: {joined}"
-            );
-        }
-
-        #[tokio::test]
-        async fn enabled_skills_before_with_skills_order_independent() {
-            // Allowlist set before assembly: with_skills reads the allowlist
-            // when registering load_skill.
-            let fake = SharedFake::new([
-                FakeReply::ToolCalls {
-                    content: "".into(),
-                    calls: vec![call("c1", "load_skill", r#"{"name":"other"}"#)],
-                },
-                FakeReply::Text("Understood".into()),
-            ]);
-            let mut agent = agent(fake.clone(), "You are an assistant")
-                .with_enabled_skills(&["greet"])
-                .with_skills(skill_registry(&[
-                    ("greet", "Say hello", "Hello body"),
-                    ("other", "Another", "Other content"),
-                ]));
-
-            agent.run("Load").await.unwrap();
-            tool_result_contains(&fake, "not enabled");
+            assert!(joined.contains("Skill body content"));
+            assert!(joined.contains("round three"));
+            assert!(!joined.contains("round two"));
         }
     }
 }

@@ -5,9 +5,8 @@
 //! Plan & Execute / ...) are provided by each implementation.
 //!
 //! This module provides:
-//! - Interfaces: [`Agent`] reasoning-loop trait, [`CancellableAgent`]
-//!   optional cooperative cancellation, [`AgentEvent`] application-level
-//!   event interface, [`AgentError`] run-failure reasons;
+//! - Interfaces: [`Agent`] reasoning-loop trait, [`AgentEvent`]
+//!   application-level event interface, [`AgentError`] run-failure reasons;
 //! - The classic assembly: [`ReActAgent`] generic ReAct loop and its
 //!   convenience macro [`react_agent!`](crate::react_agent);
 //! - Sub-agent parts: [`SubAgentTool`] sub-agent as a tool, [`SubAgentPool`]
@@ -75,7 +74,6 @@ use crate::run::TypedRunOutput;
 use crate::run::{RunContext, RunMetadata, RunOutput, RunRequest};
 use futures::stream::BoxStream;
 use std::fmt;
-use tokio_util::sync::CancellationToken;
 
 pub use crate::run::RunSummary;
 
@@ -207,8 +205,8 @@ pub trait AgentKernel: Send {
 /// reasoning loop, and returns the final answer.
 ///
 /// Every reasoning loop (the built-in [`ReActAgent`] and custom
-/// implementations) implements this trait; implementations that want
-/// cooperative cancellation additionally implement [`CancellableAgent`].
+/// implementations) implements this trait. Cooperative cancellation and
+/// deadlines are carried through [`RunContext`].
 ///
 /// The streaming and non-streaming entry points share the same semantics:
 /// the reply is either given whole ([`run`](Agent::run)) or returned as a
@@ -224,8 +222,7 @@ pub trait Agent {
     /// [`AgentError::Provider`] when communicating with the LLM fails;
     /// [`AgentError::TooManyToolRounds`] when the model keeps requesting
     /// tools beyond [`AgentConfig::max_tool_rounds`] without a final answer;
-    /// [`AgentError::Cancelled`] when the run is cooperatively cancelled
-    /// (the passed [`CancellationToken`] is requested);
+    /// [`AgentError::Cancelled`] when the run is cooperatively cancelled;
     /// [`AgentError::DeadlineExceeded`] when the run-level deadline elapses.
     async fn run_request_with_context(
         &mut self,
@@ -285,100 +282,9 @@ pub trait Agent {
     }
 }
 
-/// Optional capability: cooperative cancellation.
-///
-/// opt-in — implementations that don't need cancellation don't implement
-/// this trait (the methods don't even exist at compile time, so there's no
-/// fake cancellation where "the default implementation ignores the token");
-/// callers that need cancellation (such as interactive apps) call
-/// [`run_cancellable`](CancellableAgent::run_cancellable)
-/// / [`run_stream_cancellable`](CancellableAgent::run_stream_cancellable)
-/// directly on the concrete type.
-///
-/// Each run carries a [`CancellationToken`], the cooperative cancellation
-/// source for this run — any holder can cancel the same token (UI button /
-/// timeout / external signal); implementations should check at safe points
-/// and terminate promptly: `run_cancellable` returns
-/// `Err([`AgentError::Cancelled`])`, while `run_stream_cancellable`
-/// terminates with a [`MessageChunk::Cancelled`] terminal chunk (no `Done`).
-/// Messages already recorded are kept, not rolled back.
-///
-/// # Examples
-///
-/// An already-cancelled token makes the run fail immediately; a fresh token
-/// lets it proceed:
-///
-/// ```
-/// # #[tokio::main]
-/// # async fn main() -> Result<(), molo::AgentError> {
-/// use molo::agent::{CancellableAgent, ReActAgent};
-/// use molo::provider::{FakeProvider, FakeReply};
-/// use molo::tool::ToolRegistry;
-/// use molo::CancellationToken;
-///
-/// let mut agent = ReActAgent::new(
-///     FakeProvider::new([FakeReply::Text("Hello".into())]),
-///     ToolRegistry::new(),
-///     "",
-/// );
-///
-/// let cancelled = CancellationToken::new();
-/// cancelled.cancel();
-/// // Cancelled token: run returns Err(AgentError::Cancelled) immediately
-/// assert!(agent.run_cancellable("hi", &cancelled).await.is_err());
-///
-/// // Fresh token: completes normally
-/// let fresh = CancellationToken::new();
-/// assert_eq!(agent.run_cancellable("hi", &fresh).await?, "Hello");
-/// # Ok(())
-/// # }
-/// ```
-#[async_trait::async_trait]
-pub trait CancellableAgent: Agent {
-    /// Run with a cancellation source. Returns `Err(AgentError::Cancelled)`
-    /// on cancellation.
-    async fn run_cancellable(
-        &mut self,
-        input: &str,
-        token: &CancellationToken,
-    ) -> Result<String, AgentError> {
-        let context = RunContext::generated().with_cancellation(token.clone());
-        Ok(self
-            .run_request_with_context(RunRequest::text(input), context)
-            .await?
-            .answer)
-    }
-
-    /// Streaming run with a cancellation source: same semantics as
-    /// [`run_cancellable`](CancellableAgent::run_cancellable); when
-    /// cancelled, terminates with a [`MessageChunk::Cancelled`] terminal
-    /// chunk (no `Done`).
-    ///
-    /// The default implementation is not truly streaming — the whole answer
-    /// is given as a single [`MessageChunk::Delta`] chunk; implementations
-    /// that need per-character streaming should override this method.
-    async fn run_stream_cancellable<'a>(
-        &'a mut self,
-        input: &'a str,
-        token: &CancellationToken,
-    ) -> Result<BoxStream<'a, Result<MessageChunk, AgentError>>, AgentError> {
-        let context = RunContext::generated().with_cancellation(token.clone());
-        match self
-            .run_stream_request_with_context(RunRequest::text(input), context)
-            .await
-        {
-            Ok(stream) => Ok(stream),
-            Err(AgentError::Cancelled) => Ok(Box::pin(futures::stream::iter([Ok(
-                MessageChunk::Cancelled,
-            )]))),
-            Err(e) => Err(e),
-        }
-    }
-}
-
 /// Optional capability: typed output (opt-in — implementations that don't
 /// need it don't implement it; the method doesn't even exist at compile
-/// time, the same pattern as [`CancellableAgent`]).
+/// time).
 ///
 /// [`run_typed`](TypedAgent::run_typed) has the same semantics as
 /// [`Agent::run`] (records input, drives the reasoning loop), but
@@ -586,8 +492,7 @@ pub enum AgentError {
     Provider(#[from] ProviderError),
     /// The model kept requesting tools past the implementation's maximum
     /// number of rounds without giving a final answer. Increase via
-    /// [`AgentConfig::max_tool_rounds`](crate::agent::AgentConfig) (chained
-    /// `with_config(AgentConfig { max_tool_rounds: N, ..Default::default() })`).
+    /// [`AgentConfig::with_max_tool_rounds`](crate::agent::AgentConfig::with_max_tool_rounds).
     #[error(
         "model requested tools for more than {0} rounds; increase AgentConfig::max_tool_rounds (via with_config) if intended"
     )]
@@ -606,9 +511,7 @@ pub enum AgentError {
     StructuredParse(String),
     /// Structured output: validation failed more times than the configured
     /// limit. Increase via
-    /// [`AgentConfig::max_structured_retries`](crate::agent::AgentConfig)
-    /// (chained
-    /// `with_config(AgentConfig { max_structured_retries: N, ..Default::default() })`).
+    /// [`AgentConfig::with_max_structured_retries`](crate::agent::AgentConfig::with_max_structured_retries).
     #[error(
         "structured output failed validation for more than {0} attempts; increase AgentConfig::max_structured_retries (via with_config) if intended"
     )]

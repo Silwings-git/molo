@@ -29,10 +29,11 @@ pub enum EnvPolicy {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[non_exhaustive]
 pub enum PtyMode {
-    /// No PTY. This is the Phase 5 baseline implementation.
+    /// No PTY. The local executor supports one-shot, non-interactive commands.
     #[default]
     Disabled,
-    /// Request a PTY. The baseline local executor returns unsupported.
+    /// Request a PTY. The local executor returns unsupported when PTY support
+    /// is unavailable.
     Enabled,
 }
 

@@ -7,6 +7,7 @@
 //! `Default`.
 
 use crate::provider::ModelOptions;
+use serde::{Deserialize, Serialize};
 
 /// Optional behavior configuration for an Agent.
 ///
@@ -23,14 +24,13 @@ use crate::provider::ModelOptions;
 /// use molo::provider::{FakeProvider, FakeReply, ModelOptions};
 /// use molo::tool::ToolRegistry;
 ///
-/// let config = AgentConfig {
-///     max_tool_rounds: 20,
-///     max_structured_retries: 5,
-///     options: ModelOptions {
+/// let config = AgentConfig::default()
+///     .with_max_tool_rounds(20)
+///     .with_max_structured_retries(5)
+///     .with_options(ModelOptions {
 ///         temperature: Some(0.2),
 ///         ..Default::default()
-///     },
-/// };
+///     });
 ///
 /// let agent = ReActAgent::new(
 ///     FakeProvider::new([FakeReply::Text("Hello".into())]),
@@ -39,24 +39,26 @@ use crate::provider::ModelOptions;
 /// )
 /// .with_config(config);
 /// ```
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+#[non_exhaustive]
 pub struct AgentConfig {
     /// Maximum number of rounds in which the model requests tools; if it
     /// still hasn't answered directly when this is reached, the run fails
     /// ([`AgentError::TooManyToolRounds`](crate::agent::AgentError)).
     /// Prevents the model from getting stuck requesting tools in a loop.
     /// Default: 10.
-    pub max_tool_rounds: usize,
+    pub(crate) max_tool_rounds: usize,
     /// Maximum number of retries after structured output validation fails;
     /// if it still fails when this is reached, the run fails
     /// ([`AgentError::StructuredRetriesExhausted`](crate::agent::AgentError)).
     /// Counted **independently** of the tool-round limit (each failure mode
     /// has its own clear error semantics). Default: 3.
-    pub max_structured_retries: usize,
+    pub(crate) max_structured_retries: usize,
     /// Model parameters carried on every round of conversation (temperature /
     /// max_tokens / extra parameters);
     /// `Default` = all empty, using the vendor defaults.
-    pub options: ModelOptions,
+    pub(crate) options: ModelOptions,
 }
 
 impl Default for AgentConfig {
@@ -66,5 +68,45 @@ impl Default for AgentConfig {
             max_structured_retries: 3,
             options: ModelOptions::default(),
         }
+    }
+}
+
+impl AgentConfig {
+    /// Constructs a config with default values.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Maximum tool-call rounds before a run fails.
+    pub fn max_tool_rounds(&self) -> usize {
+        self.max_tool_rounds
+    }
+
+    /// Returns a config with an updated tool-round limit.
+    pub fn with_max_tool_rounds(mut self, max_tool_rounds: usize) -> Self {
+        self.max_tool_rounds = max_tool_rounds;
+        self
+    }
+
+    /// Maximum structured-output validation retries before a run fails.
+    pub fn max_structured_retries(&self) -> usize {
+        self.max_structured_retries
+    }
+
+    /// Returns a config with an updated structured-output retry limit.
+    pub fn with_max_structured_retries(mut self, max_structured_retries: usize) -> Self {
+        self.max_structured_retries = max_structured_retries;
+        self
+    }
+
+    /// Model options sent on each provider request unless a run overrides them.
+    pub fn options(&self) -> &ModelOptions {
+        &self.options
+    }
+
+    /// Returns a config with updated model options.
+    pub fn with_options(mut self, options: ModelOptions) -> Self {
+        self.options = options;
+        self
     }
 }

@@ -1,4 +1,4 @@
-//! Phase 9 benchmarks for coding-workload primitives.
+//! Runtime benchmarks for coding-workload primitives.
 //!
 //! These benches operate on generated temporary fixtures only.
 
@@ -118,12 +118,12 @@ fn bench_command_output_truncation(c: &mut Criterion) {
                     let output = executor
                         .execute(
                             request,
-                            &molo::ExecutionPolicy {
-                                sandbox: SandboxPolicy::ReadOnly,
-                                network: NetworkPolicy::Deny,
-                                timeout: Some(Duration::from_secs(5)),
-                                output_limit: molo::OutputLimit::default(),
-                            },
+                            &molo::ExecutionPolicy::new(
+                                SandboxPolicy::ReadOnly,
+                                NetworkPolicy::Deny,
+                            )
+                            .with_timeout(Some(Duration::from_secs(5)))
+                            .with_output_limit(molo::OutputLimit::default()),
                             &RunContext::new("bench-command"),
                         )
                         .await
@@ -195,12 +195,12 @@ fn coding_effect_fixture() -> (PathBuf, CodingBenchHarness, molo::EffectRequest,
         molo::NoopAuditSink,
         molo::NoopTranscriptStore,
     )
-    .with_config(HarnessConfig {
-        default_sandbox: SandboxPolicy::WorkspaceWrite,
-        default_network: NetworkPolicy::Deny,
-        default_timeout: Duration::from_secs(5),
-        ..HarnessConfig::default()
-    });
+    .with_config(
+        HarnessConfig::default()
+            .with_default_sandbox(SandboxPolicy::WorkspaceWrite)
+            .with_default_network(NetworkPolicy::Deny)
+            .with_default_timeout(Duration::from_secs(5)),
+    );
     let effect = WriteFilePayload {
         path: WorkspacePath::parse("src/generated.rs").expect("path"),
         content: FileWriteContent::Text("pub const VALUE: i32 = 42;\n".to_string()),

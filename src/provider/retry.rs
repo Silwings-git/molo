@@ -44,18 +44,19 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 /// Default backoff: initial 0.5s / factor 2.0 / cap 10s / jitter on (full
 /// jitter, to prevent thundering herds).
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub struct RetryPolicy {
     /// Total attempts (including the first); default 3 (i.e. at most 2
     /// retries after a failure).
-    pub max_attempts: usize,
+    pub(crate) max_attempts: usize,
     /// Backoff strategy (how long to wait before retrying after each
     /// failure).
-    pub backoff: Backoff,
+    pub(crate) backoff: Backoff,
     /// Which errors are retryable; the default is [`Retryable::Default`].
-    pub retryable: Retryable,
+    pub(crate) retryable: Retryable,
     /// When rate limited, prefer waiting the vendor's `Retry-After` duration
     /// (overrides backoff); default true.
-    pub respect_retry_after: bool,
+    pub(crate) respect_retry_after: bool,
 }
 
 impl Default for RetryPolicy {
@@ -71,6 +72,57 @@ impl Default for RetryPolicy {
             retryable: Retryable::Default,
             respect_retry_after: true,
         }
+    }
+}
+
+impl RetryPolicy {
+    /// Constructs the default retry policy.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Total attempts, including the first call.
+    pub fn max_attempts(&self) -> usize {
+        self.max_attempts
+    }
+
+    /// Returns a policy with an updated attempt limit.
+    pub fn with_max_attempts(mut self, max_attempts: usize) -> Self {
+        self.max_attempts = max_attempts;
+        self
+    }
+
+    /// Backoff strategy used between retry attempts.
+    pub fn backoff(&self) -> &Backoff {
+        &self.backoff
+    }
+
+    /// Returns a policy with an updated backoff strategy.
+    pub fn with_backoff(mut self, backoff: Backoff) -> Self {
+        self.backoff = backoff;
+        self
+    }
+
+    /// Retryability predicate.
+    pub fn retryable(&self) -> &Retryable {
+        &self.retryable
+    }
+
+    /// Returns a policy with an updated retryability predicate.
+    pub fn with_retryable(mut self, retryable: Retryable) -> Self {
+        self.retryable = retryable;
+        self
+    }
+
+    /// Whether vendor-provided `Retry-After` durations override backoff.
+    pub fn respect_retry_after(&self) -> bool {
+        self.respect_retry_after
+    }
+
+    /// Returns a policy with updated `Retry-After` handling.
+    pub fn with_respect_retry_after(mut self, respect_retry_after: bool) -> Self {
+        self.respect_retry_after = respect_retry_after;
+        self
     }
 }
 
@@ -249,12 +301,12 @@ impl Retryable {
 /// further attempts are made. An already-issued inner request is cancelled
 /// together with the future (whether the network request continues at the
 /// transport layer depends on the underlying client).
-pub struct RetryProvider<I: Provider> {
+pub struct RetryProvider<I> {
     inner: I,
     policy: RetryPolicy,
 }
 
-impl<I: Provider> std::fmt::Debug for RetryProvider<I> {
+impl<I> std::fmt::Debug for RetryProvider<I> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         // inner is a generic Provider without Debug; print the type name and
         // policy (in the same style as ReActAgent).
@@ -265,7 +317,7 @@ impl<I: Provider> std::fmt::Debug for RetryProvider<I> {
     }
 }
 
-impl<I: Provider> RetryProvider<I> {
+impl<I> RetryProvider<I> {
     /// Wraps with the default policy (3 attempts / exponential backoff +
     /// jitter / default retry judgment).
     pub fn new(inner: I) -> Self {
@@ -287,12 +339,10 @@ impl<I: Provider> RetryProvider<I> {
     /// use molo::{Backoff, FakeProvider, RetryPolicy, RetryProvider};
     ///
     /// let provider = RetryProvider::new(FakeProvider::new([])).with_policy(
-    ///     RetryPolicy {
-    ///         max_attempts: 2,
-    ///         backoff: Backoff::Fixed(Duration::from_millis(10)),
-    ///         respect_retry_after: false,
-    ///         ..Default::default()
-    ///     },
+    ///     RetryPolicy::default()
+    ///         .with_max_attempts(2)
+    ///         .with_backoff(Backoff::Fixed(Duration::from_millis(10)))
+    ///         .with_respect_retry_after(false),
     /// );
     /// ```
     pub fn with_policy(mut self, policy: RetryPolicy) -> Self {
@@ -301,7 +351,7 @@ impl<I: Provider> RetryProvider<I> {
     }
 }
 
-impl<I: Provider> RetryProvider<I> {
+impl<I> RetryProvider<I> {
     /// Retry decision and wait for one failure: whether another attempt is
     /// possible, and if so how long to wait.
     ///

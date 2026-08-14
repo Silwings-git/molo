@@ -273,8 +273,8 @@ pub(crate) fn generated_run_id() -> String {
 
 /// A handle to an artifact produced by a run.
 ///
-/// Phase 1 treats artifacts as references, not storage: this type carries no
-/// bytes and does not define persistence, cleanup, or permissions.
+/// Artifacts are references, not storage: this type carries no bytes and does
+/// not define persistence, cleanup, or permissions.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Artifact {
     /// Artifact id, unique within the producing application or store.

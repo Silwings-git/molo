@@ -7,12 +7,11 @@
 //!
 //! molo is a library, not an end-user agent product. You assemble agents
 //! from its building blocks — model interaction, reasoning loop, memory,
-//! tools, structured output, and observability. The target architecture also
-//! includes an optional harness layer (approval, sandbox, audit, transcript)
-//! that governs and executes side effects, and an optional coding-workload
-//! SDK (workspace, shell, git, patch, repo context). Public API breaking
-//! changes are expected throughout 0.x when they serve the target
-//! architecture, and each one ships with a migration path.
+//! tools, structured output, and observability. Optional harness and coding
+//! layers provide governed side-effect execution (approval, sandbox, audit,
+//! transcript) and coding-workload primitives (workspace, shell, git, patch,
+//! repo context). Public API breaking changes are expected throughout 0.x as
+//! these layers mature, and each one ships with a migration path.
 //!
 //! # Feature Flags
 //!
@@ -72,7 +71,7 @@
 //! most cases without digging into module paths:
 //!
 //! - [`agent`] — the agent interface and reasoning loop — [`Agent`] /
-//!   [`CancellableAgent`] / [`AgentError`], typed output via [`TypedAgent`]
+//!   [`AgentError`], typed output via [`TypedAgent`]
 //!   with the validator [`StructuredValidator`] when the `structured`
 //!   feature is enabled, the [`ReActAgent`] assembly with the
 //!   [`react_agent!`] macro, sub-agent parts
@@ -130,10 +129,8 @@
 //! - molo targets the tokio ecosystem: all async APIs require a tokio
 //!   runtime; the library ships no runtime of its own, so callers bring
 //!   their own (examples uniformly use `#[tokio::main]`);
-//! - cancellation is cooperative and opt-in: agents that support it
-//!   implement [`CancellableAgent`]; each run carries a
-//!   [`CancellationToken`] that any holder may request, and the loop
-//!   responds at safe points;
+//! - cancellation is cooperative: callers pass a [`RunContext`] with a
+//!   [`CancellationToken`] for the run, and the loop responds at safe points;
 //! - tool execution failure does not abort the reasoning loop: the error
 //!   text is passed back to the model, which decides what to do next.
 
@@ -169,8 +166,8 @@ pub use async_trait::async_trait;
 pub use molo_macros::tool;
 
 pub use agent::{
-    Agent, AgentAction, AgentConfig, AgentError, AgentEvent, AgentKernel, CancellableAgent,
-    MessageChunk, ModelObservation, ModelRequest, Observation, ReActAgent, ReActEvent,
+    Agent, AgentAction, AgentConfig, AgentError, AgentEvent, AgentKernel, MessageChunk,
+    ModelObservation, ModelRequest, Observation, ReActAgent, ReActEvent,
 };
 #[cfg(feature = "structured")]
 pub use agent::{StructuredOutcome, StructuredValidator, TypedAgent};
@@ -217,7 +214,7 @@ pub use harness::{
 };
 #[cfg(feature = "mcp")]
 pub use mcp::{
-    McpCacheHint, McpClient, McpDirectTool, McpError, McpServerId, McpTool, McpToolCatalog,
+    McpCacheHint, McpClient, McpDirectTool, McpError, McpServerId, McpToolCatalog,
     McpToolDescriptor, McpToolId, McpToolMode,
 };
 #[cfg(all(feature = "mcp", feature = "harness"))]
@@ -259,8 +256,6 @@ pub use tool::{
     ToolResult, ToolSchema, ToolSource, ToolTrustLevel,
 };
 
-// Cooperative cancellation primitive (a standard tokio-util component):
-// `CancellableAgent::run_cancellable` / `run_stream_cancellable` use it as
-// the cancellation source for each run; also re-exported for transitive
-// dependencies (tokio-util, licensed MIT OR Apache-2.0).
+// Cooperative cancellation primitive (a standard tokio-util component), re-exported
+// so callers can build RunContext values without depending on tokio-util directly.
 pub use tokio_util::sync::CancellationToken;

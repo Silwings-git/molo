@@ -418,17 +418,17 @@ async fn run_case(
         audit.clone(),
         transcript.clone(),
     )
-    .with_config(HarnessConfig {
-        default_sandbox: sandbox_policy(&case.policy.sandbox)?,
-        default_network: network_policy(&case.policy.network)?,
-        default_timeout: Duration::from_millis(case.policy.timeout_ms),
-        output_limit: OutputLimit {
-            model_bytes: case.policy.output_model_bytes,
-            display_bytes: case.policy.output_display_bytes,
-            debug_bytes: case.policy.output_debug_bytes,
-        },
-        ..HarnessConfig::default()
-    })
+    .with_config(
+        HarnessConfig::default()
+            .with_default_sandbox(sandbox_policy(&case.policy.sandbox)?)
+            .with_default_network(network_policy(&case.policy.network)?)
+            .with_default_timeout(Duration::from_millis(case.policy.timeout_ms))
+            .with_output_limit(OutputLimit::new(
+                case.policy.output_model_bytes,
+                case.policy.output_display_bytes,
+                case.policy.output_debug_bytes,
+            )),
+    )
     .with_redactor(PatternRedactor::new(case.redaction_patterns.clone()));
 
     let context =
@@ -759,12 +759,9 @@ async fn run_verification(
                     command: request,
                     name: command.name.clone(),
                 },
-                &ExecutionPolicy {
-                    sandbox: SandboxPolicy::ReadOnly,
-                    network: NetworkPolicy::Deny,
-                    timeout: Some(Duration::from_secs(10)),
-                    output_limit: OutputLimit::default(),
-                },
+                &ExecutionPolicy::new(SandboxPolicy::ReadOnly, NetworkPolicy::Deny)
+                    .with_timeout(Some(Duration::from_secs(10)))
+                    .with_output_limit(OutputLimit::default()),
                 context,
             )
             .await
@@ -825,7 +822,7 @@ fn validate_case(path: &Path, case: &EvalCase) -> Result<(), String> {
     }
     if case.raw_capture {
         return Err(format!(
-            "{} enables raw_capture; Phase 9 defaults require false",
+            "{} enables raw_capture; default validation requires false",
             case.id
         ));
     }

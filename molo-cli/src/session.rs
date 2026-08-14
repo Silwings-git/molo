@@ -8,7 +8,7 @@ use molo::{
 use serde::{Deserialize, Serialize};
 use std::fs::{self, OpenOptions};
 use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 static SESSION_COUNTER: AtomicU64 = AtomicU64::new(1);
@@ -208,11 +208,6 @@ impl CliSessionStore {
     /// Constructs a session store.
     pub fn new(root: impl Into<PathBuf>) -> Self {
         Self { root: root.into() }
-    }
-
-    /// Returns the root directory.
-    pub fn root(&self) -> &Path {
-        &self.root
     }
 
     /// Creates the store root.

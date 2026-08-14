@@ -1,7 +1,7 @@
 use crate::harness::{EffectExecutor, ExecutionError, ExecutionPolicy, RawEffectOutput};
 use crate::{EffectKind, EffectRequest, RunContext};
 use async_trait::async_trait;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use super::command::CommandExecutor;
 use super::error::CodingError;
@@ -14,15 +14,17 @@ use super::search::{RepoSearchRequest, RepoSearcher, SearchMode};
 use super::workspace::{FileBody, FileReadOptions, PatchRequest, Workspace};
 
 /// Configuration for [`CodingEffectExecutor`].
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+#[non_exhaustive]
 pub struct CodingExecutorConfig {
     /// Whether write and patch effects may execute under
     /// `SandboxPolicy::ReadOnly`. The default is false.
-    pub allow_write_in_read_only_policy: bool,
+    pub(crate) allow_write_in_read_only_policy: bool,
     /// Default read max bytes when payload omits it.
-    pub default_read_max_bytes: usize,
+    pub(crate) default_read_max_bytes: usize,
     /// Default search matches when payload omits it.
-    pub default_search_max_matches: usize,
+    pub(crate) default_search_max_matches: usize,
 }
 
 impl Default for CodingExecutorConfig {
@@ -32,6 +34,49 @@ impl Default for CodingExecutorConfig {
             default_read_max_bytes: 64 * 1024,
             default_search_max_matches: 100,
         }
+    }
+}
+
+impl CodingExecutorConfig {
+    /// Constructs a config with default values.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Whether write and patch effects may execute under read-only sandbox policy.
+    pub fn allow_write_in_read_only_policy(&self) -> bool {
+        self.allow_write_in_read_only_policy
+    }
+
+    /// Returns a config with updated read-only write behavior.
+    pub fn with_allow_write_in_read_only_policy(
+        mut self,
+        allow_write_in_read_only_policy: bool,
+    ) -> Self {
+        self.allow_write_in_read_only_policy = allow_write_in_read_only_policy;
+        self
+    }
+
+    /// Default read max bytes when payload omits it.
+    pub fn default_read_max_bytes(&self) -> usize {
+        self.default_read_max_bytes
+    }
+
+    /// Returns a config with an updated default read byte cap.
+    pub fn with_default_read_max_bytes(mut self, default_read_max_bytes: usize) -> Self {
+        self.default_read_max_bytes = default_read_max_bytes;
+        self
+    }
+
+    /// Default search matches when payload omits it.
+    pub fn default_search_max_matches(&self) -> usize {
+        self.default_search_max_matches
+    }
+
+    /// Returns a config with an updated default search match cap.
+    pub fn with_default_search_max_matches(mut self, default_search_max_matches: usize) -> Self {
+        self.default_search_max_matches = default_search_max_matches;
+        self
     }
 }
 

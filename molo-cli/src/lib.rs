@@ -6,24 +6,18 @@
 //! application. CLI config, sessions, approval prompts, and final summaries
 //! are intentionally private to this crate.
 
-/// Terminal approval broker implementation.
-pub mod approval;
-/// Argument parsing for the reference CLI.
-pub mod args;
-/// Command implementations.
-pub mod commands;
-/// Effective config and provider assembly.
-pub mod config;
-/// CLI error type.
-pub mod error;
-/// User-facing and JSON final summaries.
-pub mod output;
-/// Session, audit, and transcript storage.
-pub mod session;
+mod approval;
+mod args;
+mod commands;
+mod config;
+mod error;
+mod output;
+mod session;
 
 use crate::args::CliArgs;
 use crate::config::CliConfig;
-use crate::error::CliError;
+
+pub use crate::error::CliError;
 
 /// Runs the CLI from an iterator of argument strings on a current-thread
 /// tokio runtime.

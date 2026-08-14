@@ -232,8 +232,8 @@ impl ToolSchema {
 
 /// Tool policy metadata declared by the tool author.
 ///
-/// This is an input to registry events and future harness policy; it is not
-/// an authorization decision.
+/// This is an input to registry events and harness policy; it is not an
+/// authorization decision.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ToolPolicy {
     /// Declared side-effect level.

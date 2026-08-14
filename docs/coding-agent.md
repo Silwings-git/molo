@@ -115,11 +115,11 @@ tool payload -> EffectRequest -> Harness policy/approval/audit -> CodingEffectEx
 parsing. Shell syntax is an explicit command such as `["sh", "-c", "..."]`,
 which is classified as higher risk by the typed payload builder.
 
-`LocalCommandExecutor` is a non-PTY, one-shot baseline. It resolves `cwd`
-through the workspace, uses explicit environment policy, requires a timeout,
-captures stdout/stderr separately, and reports truncation. OS-level sandbox and
-network enforcement are host-dependent; unsupported policy fails closed unless
-the host opts into advisory mode.
+`LocalCommandExecutor` is a non-PTY, one-shot local executor. It resolves
+`cwd` through the workspace, uses explicit environment policy, requires a
+timeout, captures stdout/stderr separately, and reports truncation. OS-level
+sandbox and network enforcement are host-dependent; unsupported policy fails
+closed unless the host opts into advisory mode.
 
 `GitInspector` is read-only in the coding SDK. Mutating git operations such as
 commit, checkout, reset, push, or force-push should be represented as command

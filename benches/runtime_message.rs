@@ -1,4 +1,4 @@
-//! Phase 9 runtime benchmarks for core agent data paths.
+//! Runtime benchmarks for core agent data paths.
 //!
 //! These benches use deterministic in-process fixtures only. They do not
 //! contact a live provider and should be suitable for release preflight trend

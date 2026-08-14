@@ -41,7 +41,9 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 /// }));
 ///
 /// let mut rx = channel.subscribe();
-/// let event = rx.recv().await.unwrap();
+/// let Some(event) = rx.recv().await else {
+///     panic!("expected buffered event");
+/// };
 /// assert_eq!(event.name(), "run.started");
 /// # }
 /// ```

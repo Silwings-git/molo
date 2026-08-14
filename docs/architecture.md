@@ -1,7 +1,7 @@
 # molo 架构
 
-本文档描述 molo 的目标架构：长期的分层边界、依赖方向与副作用执行模型。
-它是给贡献者和集成者的指南，不是变更日志或设计争论记录。
+本文档描述 molo 的公开架构：分层边界、依赖方向与副作用执行模型。
+它面向贡献者和集成者，说明如何使用和扩展 molo 的公开边界。
 
 ## 定位
 
@@ -101,17 +101,17 @@ model -> tool/effect request -> risk classification -> policy check
 - 不是其运行所在的 OS / 容器 / sandbox 安全能力的替代品；molo 在其之上
   叠加策略与审计。
 
-## 现状与目标
+## 现状
 
 `0.3.x` 是单个 `molo` crate 加 `molo-macros`，交付的是 agent-runtime 一侧、
-可选 harness runtime 与 feature-gated coding SDK baseline：`ReActAgent` loop、
-provider、memory、tool registry、effect protocol、`HarnessRuntime`、
-`BasicHarness`、`LocalWorkspace`、typed coding effect payload、
+可选 harness runtime 与 feature-gated coding SDK：`ReActAgent` loop、provider、
+memory、tool registry、effect protocol、`HarnessRuntime`、`BasicHarness`、
+`LocalWorkspace`、typed coding effect payload、
 `CodingEffectExecutor`、command/git/search/instruction/context primitives、MCP、
 skills、structured output、event 与 cancellation。coding workload 层尚未成为
 独立 crate，当前通过 `coding` feature 按目标边界隔离。
 
 上述拆分是演进方向，将逐步抽取，而不是一次性完成。在 1.0 之前，当目标
 架构需要时，public API 允许跨 0.x minor 破坏性变更，每次 breaking change
-都附带迁移路径。治理细节——API 稳定性分级、发布规则与 harness 威胁模型——
-由项目维护者随开发路线图一起维护。
+都附带迁移路径。治理细节，包括 API 稳定性分级、发布规则与 harness 威胁模型，
+会随版本说明和用户文档一起更新。

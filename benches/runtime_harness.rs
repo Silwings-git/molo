@@ -1,4 +1,4 @@
-//! Phase 9 benchmarks for governed effect lifecycle hot paths.
+//! Runtime benchmarks for governed effect lifecycle hot paths.
 
 use criterion::{BatchSize, Criterion, criterion_group, criterion_main};
 use molo::{
@@ -105,17 +105,13 @@ fn harness_fixture() -> (
         VecAuditSink::new(),
         VecTranscriptStore::new(),
     )
-    .with_config(HarnessConfig {
-        default_sandbox: SandboxPolicy::ReadOnly,
-        default_network: NetworkPolicy::Deny,
-        default_timeout: Duration::from_secs(5),
-        output_limit: OutputLimit {
-            model_bytes: 4096,
-            display_bytes: 4096,
-            debug_bytes: 1024,
-        },
-        ..HarnessConfig::default()
-    })
+    .with_config(
+        HarnessConfig::default()
+            .with_default_sandbox(SandboxPolicy::ReadOnly)
+            .with_default_network(NetworkPolicy::Deny)
+            .with_default_timeout(Duration::from_secs(5))
+            .with_output_limit(OutputLimit::new(4096, 4096, 1024)),
+    )
     .with_redactor(PatternRedactor::new(["secret-token"]));
     let request =
         EffectRequest::new(EffectKind::ReadFile, "read fixture", json!({})).with_id("effect-1");
