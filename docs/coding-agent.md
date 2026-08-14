@@ -85,7 +85,7 @@ use molo::{
 # #[tokio::main(flavor = "current_thread")]
 # async fn main() -> Result<(), Box<dyn std::error::Error>> {
 let workspace = LocalWorkspace::new(std::env::current_dir()?)?;
-let commands = LocalCommandExecutor::new(workspace.clone()).with_advisory_policy(true);
+let commands = LocalCommandExecutor::new(workspace.clone());
 let git = molo::CliGitInspector::new(commands.clone());
 let searcher = WorkspaceSearcher::new(workspace.clone());
 let executor = CodingEffectExecutor::new(workspace, commands, git, searcher);
@@ -120,6 +120,56 @@ which is classified as higher risk by the typed payload builder.
 timeout, captures stdout/stderr separately, and reports truncation. OS-level
 sandbox and network enforcement are host-dependent; unsupported policy fails
 closed unless the host opts into advisory mode.
+
+`LocalCommandExecutor` is not an OS sandbox. It is useful for local prototypes,
+tests, and reference CLI dogfooding, but production coding-agent products should
+inject a host-provided `CommandExecutor` that can actually enforce the requested
+filesystem, network, process, and resource boundaries.
+
+The production boundary is the trait, not the local executor:
+
+```rust
+use molo::{
+    CommandError, CommandExecutor, CommandExecutorCapabilities, CommandOutput,
+    CommandRequest, ExecutionPolicy, RunContext,
+};
+
+#[derive(Debug)]
+struct IsolatedCommandExecutor {
+    // Store handles for a container, VM, remote worker, or platform sandbox.
+}
+
+#[molo::async_trait]
+impl CommandExecutor for IsolatedCommandExecutor {
+    fn capabilities(&self) -> CommandExecutorCapabilities {
+        CommandExecutorCapabilities {
+            one_shot: true,
+            pty: false,
+            sandbox_enforcement: true,
+            network_enforcement: true,
+        }
+    }
+
+    async fn execute(
+        &self,
+        request: CommandRequest,
+        policy: &ExecutionPolicy,
+        context: &RunContext,
+    ) -> Result<CommandOutput, CommandError> {
+        // Run `request.argv` in the isolated backend, enforce `policy`, honor
+        // `context` cancellation/deadline, then return stdout/stderr and the
+        // policy enforcement report.
+        todo!("host executor implementation")
+    }
+}
+```
+
+A production executor should fail closed when it cannot enforce the requested
+`SandboxPolicy` or `NetworkPolicy`, unless the host explicitly opts into an
+advisory mode and records that downgrade in audit/transcript output. It should
+also report executor identity/version, cwd and mount/write roots, inherited env
+keys, timeout/resource limits, output limits, and whether cancellation/timeout
+terminated the full process tree.
 
 `GitInspector` is read-only in the coding SDK. Mutating git operations such as
 commit, checkout, reset, push, or force-push should be represented as command
