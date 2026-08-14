@@ -7,8 +7,9 @@
 //! This module provides:
 //! - Interfaces: [`Agent`] reasoning-loop trait, [`AgentEvent`]
 //!   application-level event interface, [`AgentError`] run-failure reasons;
-//! - The classic assembly: [`ReActAgent`] generic ReAct loop and its
-//!   convenience macro [`react_agent!`](crate::react_agent);
+//! - The classic assembly: [`ReActAgent`] generic ReAct loop,
+//!   [`ReActAgentBuilder`] for component assembly, and the convenience macro
+//!   [`react_agent!`](crate::react_agent);
 //! - Sub-agent parts: [`SubAgentTool`] sub-agent as a tool, [`SubAgentPool`]
 //!   named sub-agent pool (the main loop delegates sub-loops via tools);
 //! - Structured output: [`TypedAgent`] typed-output interface,
@@ -57,7 +58,8 @@ mod sub_agent;
 pub use config::AgentConfig;
 pub use events::ReActEvent;
 pub use react::{
-    ReActAgent, SerialToolRoundExecutor, ToolCallOutcome, ToolRoundCtx, ToolRoundExecutor,
+    ReActAgent, ReActAgentBuilder, SerialToolRoundExecutor, ToolCallOutcome, ToolRoundCtx,
+    ToolRoundExecutor,
 };
 #[cfg(feature = "structured")]
 pub use structured::{

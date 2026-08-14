@@ -2691,6 +2691,60 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn redacted_effect_output_is_used_for_observation_audit_and_transcript() {
+        let audit = VecAuditSink::new();
+        let transcript = VecTranscriptStore::new();
+        let mut metadata = RunMetadata::new();
+        metadata.insert(
+            "token".to_string(),
+            serde_json::Value::String("secret-token".to_string()),
+        );
+        let harness = BasicHarness::new(
+            StaticEffectExecutor::new().with_output(
+                "effect-1",
+                RawEffectOutput::text("model sees secret-token")
+                    .with_display(DisplayOutput::new(
+                        crate::effect::DisplayFormat::PlainText,
+                        "display sees secret-token",
+                    ))
+                    .with_metadata(metadata)
+                    .with_debug("debug sees secret-token"),
+            ),
+            DefaultPolicyEngine,
+            AlwaysAllowApprovalBroker,
+            audit.clone(),
+            transcript.clone(),
+        )
+        .with_redactor(PatternRedactor::new(["secret-token"]));
+
+        let observation = harness
+            .execute(
+                EffectRequest::new(EffectKind::ReadFile, "read", json!({})).with_id("effect-1"),
+                &RunContext::new("run-redaction-records"),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(observation.status, EffectStatus::Succeeded);
+        let observation_json = serde_json::to_string(&observation).unwrap();
+        assert!(!observation_json.contains("secret-token"));
+        assert!(observation_json.contains("[REDACTED]"));
+        assert!(
+            observation
+                .metadata
+                .get("redactions_applied")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or_default()
+                > 0
+        );
+
+        let audit_json = serde_json::to_string(&audit.events()).unwrap();
+        assert!(!audit_json.contains("secret-token"));
+        let transcript_json = serde_json::to_string(&transcript.records()).unwrap();
+        assert!(!transcript_json.contains("secret-token"));
+    }
+
     #[derive(Debug, Default, Clone, Copy)]
     struct FailingAuditSink;
 

@@ -167,7 +167,7 @@ pub use molo_macros::tool;
 
 pub use agent::{
     Agent, AgentAction, AgentConfig, AgentError, AgentEvent, AgentKernel, MessageChunk,
-    ModelObservation, ModelRequest, Observation, ReActAgent, ReActEvent,
+    ModelObservation, ModelRequest, Observation, ReActAgent, ReActAgentBuilder, ReActEvent,
 };
 #[cfg(feature = "structured")]
 pub use agent::{StructuredOutcome, StructuredValidator, TypedAgent};

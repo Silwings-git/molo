@@ -1,0 +1,49 @@
+error: #[molo::tool] can only be applied to async fns
+ --> tests/ui/tool_macro/invalid_signatures.rs:6:4
+  |
+6 | fn sync_fn() -> Result<String, ToolError> {
+  |    ^^^^^^^
+
+error: #[molo::tool] does not support generic functions
+  --> tests/ui/tool_macro/invalid_signatures.rs:11:10
+   |
+11 | async fn generic_fn<T>(_value: T) -> Result<String, ToolError> {
+   |          ^^^^^^^^^^
+
+error: #[molo::tool] does not support self (tools are stateless functions)
+  --> tests/ui/tool_macro/invalid_signatures.rs:16:10
+   |
+16 | async fn self_receiver(&self) -> Result<String, ToolError> {
+   |          ^^^^^^^^^^^^^
+
+error: too many parameters: at most one business parameter + optional &SharedState; define a parameter struct for multiple fields (derive JsonSchema)
+  --> tests/ui/tool_macro/invalid_signatures.rs:21:58
+   |
+21 | async fn too_many_business_params(_left: String, _right: String) -> Result<String, ToolError> {
+   |                                                          ^^^^^^
+
+error: &SharedState must be the last parameter (optional trailing position)
+  --> tests/ui/tool_macro/invalid_signatures.rs:26:1
+   |
+26 | async fn shared_state_not_last(_state: &SharedState, _value: String) -> Result<String, ToolError> {
+   | ^^^^^
+
+error: &SharedState requires an immutable reference (tool state injection uses `&SharedState`, not `&mut`)
+  --> tests/ui/tool_macro/invalid_signatures.rs:31:39
+   |
+31 | async fn mutable_shared_state(_state: &mut SharedState) -> Result<String, ToolError> {
+   |                                       ^
+
+error: parameters must be simple identifiers
+  --> tests/ui/tool_macro/invalid_signatures.rs:36:29
+   |
+36 | async fn destructured_param((_left, _right): (String, String)) -> Result<String, ToolError> {
+   |                             ^^^^^^^^^^^^^^^
+
+warning: unused imports: `SharedState` and `ToolError`
+ --> tests/ui/tool_macro/invalid_signatures.rs:3:18
+  |
+3 | use molo::tool::{SharedState, ToolError};
+  |                  ^^^^^^^^^^^  ^^^^^^^^^
+  |
+  = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default

@@ -1,0 +1,33 @@
+error: missing required attribute description
+ --> tests/ui/tool_macro/invalid_attributes.rs:5:1
+  |
+5 | #[molo::tool(name = "missing_description")]
+  | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  |
+  = note: this error originates in the attribute macro `molo::tool` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+error: unknown attribute unknown: only description / name / protected / side_effects / risk / requires_confirmation / timeout_secs are supported
+  --> tests/ui/tool_macro/invalid_attributes.rs:10:39
+   |
+10 | #[molo::tool(description = "unknown", unknown = "value")]
+   |                                       ^^^^^^^
+
+error: invalid risk value "severe": expected low / medium / high / critical
+  --> tests/ui/tool_macro/invalid_attributes.rs:15:47
+   |
+15 | #[molo::tool(description = "bad risk", risk = "severe")]
+   |                                               ^^^^^^^^
+
+error: invalid side_effects value "destructive": expected pure / read_only / write / external
+  --> tests/ui/tool_macro/invalid_attributes.rs:20:63
+   |
+20 | #[molo::tool(description = "bad side effects", side_effects = "destructive")]
+   |                                                               ^^^^^^^^^^^^^
+
+warning: unused import: `molo::tool::ToolError`
+ --> tests/ui/tool_macro/invalid_attributes.rs:3:5
+  |
+3 | use molo::tool::ToolError;
+  |     ^^^^^^^^^^^^^^^^^^^^^
+  |
+  = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default

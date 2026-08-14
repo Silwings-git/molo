@@ -40,7 +40,7 @@ use crate::provider::{
 #[cfg(feature = "structured")]
 use crate::run::TypedRunOutput;
 use crate::run::{Artifact, RunContext, RunMetadata, RunOutput, RunRequest};
-use crate::tool::{SharedState, ToolMemoryPolicy, ToolOutput, ToolRegistry, ToolResult};
+use crate::tool::{SharedState, Tool, ToolMemoryPolicy, ToolOutput, ToolRegistry, ToolResult};
 use futures::StreamExt;
 use futures::stream::BoxStream;
 #[cfg(feature = "structured")]
@@ -251,7 +251,201 @@ const MAX_ROUND_TEXT: usize = 4 << 20;
 /// [`with_memory`](ReActAgent::with_memory).
 const DEFAULT_MEMORY_TOKENS: usize = 128_000;
 
+/// Builder for assembling a [`ReActAgent`] from the same components used by
+/// [`ReActAgent::new`], plus optional runtime configuration.
+///
+/// The builder is only an assembly helper: provider calls still go through
+/// the agent loop, immediate tools still run through the tool registry, and
+/// governed side effects still belong to the outer harness/kernel path.
+/// With the `skills` feature, `with_skill_layer` consumes a `SkillLayer`
+/// assembly without making `ReActAgent` own skill policy.
+///
+/// # Examples
+///
+/// ```
+/// # #[tokio::main]
+/// # async fn main() -> Result<(), molo::AgentError> {
+/// use molo::{Agent, FakeProvider, FakeReply, ReActAgent};
+///
+/// let mut agent = ReActAgent::builder(FakeProvider::new([
+///     FakeReply::Text("Hello".into()),
+/// ]))
+/// .with_system_prompt("You are a helpful assistant")
+/// .build();
+///
+/// assert_eq!(agent.run("Are you there").await?, "Hello");
+/// # Ok(())
+/// # }
+/// ```
+pub struct ReActAgentBuilder {
+    provider: Box<dyn Provider>,
+    memory: Box<dyn Memory>,
+    tools: ToolRegistry,
+    system_prompt: String,
+    config: AgentConfig,
+    state: SharedState,
+    events: Option<Arc<dyn EventChannel>>,
+    executor: Box<dyn ToolRoundExecutor>,
+}
+
+impl ReActAgentBuilder {
+    /// Starts a builder with a provider and default optional components.
+    pub fn new(provider: impl Provider + 'static) -> Self {
+        Self {
+            provider: Box::new(provider),
+            memory: Box::new(WindowMemory::new(DEFAULT_MEMORY_TOKENS)),
+            tools: ToolRegistry::new(),
+            system_prompt: String::new(),
+            config: AgentConfig::default(),
+            state: SharedState::default(),
+            events: None,
+            executor: Box::new(SerialToolRoundExecutor),
+        }
+    }
+
+    /// Replaces the provider.
+    pub fn with_provider(mut self, provider: impl Provider + 'static) -> Self {
+        self.provider = Box::new(provider);
+        self
+    }
+
+    /// Replaces the tool registry.
+    pub fn with_tools(mut self, tools: ToolRegistry) -> Self {
+        self.tools = tools;
+        self
+    }
+
+    /// Registers one tool into the builder's registry.
+    pub fn with_tool(mut self, tool: impl Tool + 'static) -> Self {
+        self.tools.register(tool);
+        self
+    }
+
+    /// Sets the system prompt. Empty means no system message is assembled.
+    pub fn with_system_prompt(mut self, system_prompt: impl Into<String>) -> Self {
+        self.system_prompt = system_prompt.into();
+        self
+    }
+
+    /// Merges a skill layer assembly into the system prompt and tool
+    /// registry.
+    ///
+    /// This is a thin assembly helper over
+    /// [`SkillLayer::assemble`](crate::skill::SkillLayer::assemble): the
+    /// resulting prompt fragment is appended to the builder's system
+    /// prompt, and the optional `load_skill` tool is registered with source
+    /// metadata. Skill activation state and policy remain owned by the
+    /// layer.
+    ///
+    /// # Errors
+    ///
+    /// Returns a registry error when the produced `load_skill` tool collides
+    /// with an existing tool from another namespace.
+    #[cfg(feature = "skills")]
+    pub fn with_skill_layer(
+        mut self,
+        layer: crate::skill::SkillLayer,
+    ) -> Result<Self, crate::tool::RegistryError> {
+        let assembly = layer.assemble();
+        if let Some(tool) = assembly.load_skill_tool {
+            self.tools
+                .register_with_source(tool, layer.load_skill_source())?;
+        }
+        self.append_system_prompt_fragment(assembly.prompt_fragment);
+        Ok(self)
+    }
+
+    /// Replaces the default Memory.
+    pub fn with_memory(mut self, memory: impl Memory + 'static) -> Self {
+        self.memory = Box::new(memory);
+        self
+    }
+
+    /// Replaces the agent config.
+    pub fn with_config(mut self, config: AgentConfig) -> Self {
+        self.config = config;
+        self
+    }
+
+    /// Enables structured output for [`Agent::run`](crate::agent::Agent::run).
+    #[cfg(feature = "structured")]
+    pub fn with_structured_output(mut self, schema: serde_json::Value) -> Self {
+        self.config.options.structured = Some(schema);
+        self
+    }
+
+    /// Attaches shared state for tool calls.
+    pub fn with_state(mut self, state: SharedState) -> Self {
+        self.state = state;
+        self
+    }
+
+    /// Attaches an observation channel.
+    pub fn with_event_channel(mut self, channel: impl EventChannel + 'static) -> Self {
+        self.events = Some(Arc::new(channel));
+        self
+    }
+
+    /// Replaces the tool-round executor.
+    pub fn with_tool_round_executor(mut self, executor: impl ToolRoundExecutor + 'static) -> Self {
+        self.executor = Box::new(executor);
+        self
+    }
+
+    /// Builds the agent.
+    pub fn build(self) -> ReActAgent {
+        ReActAgent {
+            provider: self.provider,
+            memory: self.memory,
+            registry: self.tools,
+            system_prompt: self.system_prompt,
+            config: self.config,
+            state: self.state,
+            events: self.events,
+            executor: self.executor,
+            kernel_state: None,
+        }
+    }
+
+    #[cfg(feature = "skills")]
+    fn append_system_prompt_fragment(&mut self, fragment: String) {
+        if fragment.is_empty() {
+            return;
+        }
+        if !self.system_prompt.is_empty() {
+            self.system_prompt.push_str("\n\n");
+        }
+        self.system_prompt.push_str(&fragment);
+    }
+}
+
+impl fmt::Debug for ReActAgentBuilder {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut debug = f.debug_struct("ReActAgentBuilder");
+        debug
+            .field("provider", &"Box<dyn Provider>")
+            .field("memory", &"Box<dyn Memory>")
+            .field("tools", &self.tools)
+            .field("system_prompt", &self.system_prompt)
+            .field("config", &self.config)
+            .field("state", &self.state)
+            .field(
+                "events",
+                &match &self.events {
+                    Some(_) => "Some<dyn EventChannel>",
+                    None => "None",
+                },
+            );
+        debug.finish()
+    }
+}
+
 impl ReActAgent {
+    /// Starts a [`ReActAgentBuilder`] with a provider.
+    pub fn builder(provider: impl Provider + 'static) -> ReActAgentBuilder {
+        ReActAgentBuilder::new(provider)
+    }
+
     /// Simple construction: three required parameters — provider
     /// ([`Provider`]) + tools ([`ToolRegistry`]) + system_prompt (empty
     /// string = no system prompt); `run` returns the model's answer text
@@ -2755,6 +2949,30 @@ mod tests {
 
     fn cancellation_context(token: &CancellationToken) -> RunContext {
         RunContext::generated().with_cancellation(token.clone())
+    }
+
+    #[tokio::test]
+    async fn builder_assembles_agent_components() {
+        let fake = SharedFake::new([FakeReply::Text("built".into())]);
+        let (tool, _calls) = FakeTool::new("builder_tool", "unused");
+        let mut agent = ReActAgent::builder(fake.clone())
+            .with_tool(tool)
+            .with_system_prompt("Builder system")
+            .with_config(AgentConfig {
+                options: ModelOptions {
+                    temperature: Some(0.4),
+                    ..Default::default()
+                },
+                ..Default::default()
+            })
+            .build();
+
+        assert_eq!(agent.run("hi").await.unwrap(), "built");
+        let request = &fake.requests()[0];
+        assert_eq!(request.messages[0], Message::system("Builder system"));
+        assert_eq!(request.tools.len(), 1);
+        assert_eq!(request.tools[0].name, "builder_tool");
+        assert_eq!(request.options.temperature, Some(0.4));
     }
 
     #[tokio::test]
@@ -5972,6 +6190,29 @@ mod tests {
             let system = system_text(&fake);
             assert!(system.starts_with("You are an assistant"));
             assert!(system.contains("- code-review: Review code"));
+            assert!(system.contains("- greet: Say hello"));
+            assert!(
+                fake.requests()[0]
+                    .tools
+                    .iter()
+                    .any(|tool| tool.name == "load_skill")
+            );
+        }
+
+        #[tokio::test]
+        async fn builder_attaches_progressive_skill_layer() {
+            let fake = SharedFake::new([FakeReply::Text("OK".into())]);
+            let registry = Arc::new(skill_registry(&[("greet", "Say hello", "Hello")]));
+            let layer = SkillLayer::new(registry);
+            let mut agent = ReActAgent::builder(fake.clone())
+                .with_system_prompt("You are an assistant")
+                .with_skill_layer(layer)
+                .unwrap()
+                .build();
+
+            agent.run("Are you there").await.unwrap();
+            let system = system_text(&fake);
+            assert!(system.starts_with("You are an assistant"));
             assert!(system.contains("- greet: Say hello"));
             assert!(
                 fake.requests()[0]

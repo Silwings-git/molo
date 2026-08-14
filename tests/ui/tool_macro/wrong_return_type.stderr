@@ -1,0 +1,19 @@
+error[E0277]: the trait bound `molo::ToolResult: From<u32>` is not satisfied
+ --> tests/ui/tool_macro/wrong_return_type.rs:5:1
+  |
+5 | #[molo::tool(description = "wrong return")]
+  | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ the trait `From<u32>` is not implemented for `molo::ToolResult`
+  |
+help: `molo::ToolResult` implements trait `From<T>`
+ --> src/tool/mod.rs
+  |
+  | impl From<ToolOutput> for ToolResult {
+  | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ `From<ToolOutput>`
+...
+  | impl From<String> for ToolResult {
+  | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ `From<std::string::String>`
+...
+  | impl From<&str> for ToolResult {
+  | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ `From<&str>`
+  = note: required for `u32` to implement `Into<molo::ToolResult>`
+  = note: this error originates in the attribute macro `molo::tool` (in Nightly builds, run with -Z macro-backtrace for more info)
