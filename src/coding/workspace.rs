@@ -135,6 +135,16 @@ impl WorkspacePath {
                 message: "workspace path contains an empty component".to_string(),
             });
         }
+        if path.split('/').any(|component| component == ".") {
+            return Err(WorkspaceError::InvalidPath {
+                message: "workspace path must not contain `.`".to_string(),
+            });
+        }
+        if path.split('/').any(|component| component == "..") {
+            return Err(WorkspaceError::InvalidPath {
+                message: "workspace path must not contain `..`".to_string(),
+            });
+        }
 
         let candidate = Path::new(path);
         if candidate.is_absolute() {
@@ -1774,6 +1784,37 @@ mod tests {
         );
     }
 
+    #[test]
+    fn workspace_path_rejects_escape_corpus() {
+        let invalid = [
+            "..",
+            "../a",
+            "a/../b",
+            "a/./b",
+            "./a",
+            "/absolute",
+            "a//b",
+            "a\\b",
+            "a/\0/b",
+            "a/",
+            "/",
+        ];
+        for candidate in invalid {
+            assert!(
+                WorkspacePath::parse(candidate).is_err(),
+                "candidate must be rejected: {candidate:?}"
+            );
+        }
+
+        let valid = ["", "src/lib.rs", "nested/path/file.txt", "unicode/你好.txt"];
+        for candidate in valid {
+            assert_eq!(
+                WorkspacePath::parse(candidate).unwrap().display(),
+                candidate
+            );
+        }
+    }
+
     #[tokio::test]
     async fn local_workspace_rejects_outside_symlink() {
         let root = temp_dir("symlink");
@@ -1790,6 +1831,39 @@ mod tests {
         let err = workspace
             .read_file(
                 &WorkspacePath::parse("link").unwrap(),
+                FileReadOptions::default(),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, WorkspaceError::SymlinkEscapesRoot { .. }));
+        let _ = std::fs::remove_dir_all(root);
+        let _ = std::fs::remove_dir_all(outside);
+    }
+
+    #[tokio::test]
+    async fn local_workspace_rejects_symlink_chain_escape() {
+        let root = temp_dir("symlink-chain");
+        let outside = root.with_extension("outside-chain");
+        let _ = std::fs::remove_dir_all(&outside);
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("secret"), "secret").unwrap();
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(outside.join("secret"), root.join("outside-link")).unwrap();
+            std::os::unix::fs::symlink(root.join("outside-link"), root.join("chain-link")).unwrap();
+        }
+        #[cfg(windows)]
+        {
+            std::os::windows::fs::symlink_file(outside.join("secret"), root.join("outside-link"))
+                .unwrap();
+            std::os::windows::fs::symlink_file(root.join("outside-link"), root.join("chain-link"))
+                .unwrap();
+        }
+
+        let workspace = LocalWorkspace::new(&root).unwrap();
+        let err = workspace
+            .read_file(
+                &WorkspacePath::parse("chain-link").unwrap(),
                 FileReadOptions::default(),
             )
             .await
@@ -1865,6 +1939,48 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(root.join("a.txt")).unwrap(),
             "alpha"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn patch_stale_precondition_reports_conflict_without_write() {
+        let root = temp_dir("patch-stale");
+        std::fs::write(root.join("a.txt"), "alpha").unwrap();
+        let workspace = LocalWorkspace::new(&root).unwrap();
+        let path = WorkspacePath::parse("a.txt").unwrap();
+        let content = workspace
+            .read_file(&path, FileReadOptions::default())
+            .await
+            .unwrap();
+        std::fs::write(root.join("a.txt"), "changed by user").unwrap();
+
+        let result = workspace
+            .apply_patch(PatchRequest {
+                patch: Patch {
+                    files: vec![FilePatch {
+                        path: path.clone(),
+                        operation: PatchOperation::Modify,
+                        expected_version: Some(content.version),
+                        hunks: vec![PatchHunk {
+                            old_text: "alpha".to_string(),
+                            new_text: "ALPHA".to_string(),
+                        }],
+                    }],
+                    original_text: None,
+                    metadata: RunMetadata::new(),
+                },
+                dry_run: false,
+                allow_partial: false,
+            })
+            .await
+            .unwrap();
+
+        assert!(!result.applied);
+        assert_eq!(result.conflicts.len(), 1);
+        assert_eq!(
+            std::fs::read_to_string(root.join("a.txt")).unwrap(),
+            "changed by user"
         );
         let _ = std::fs::remove_dir_all(root);
     }

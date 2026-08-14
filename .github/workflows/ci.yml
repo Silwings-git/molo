@@ -27,6 +27,9 @@ jobs:
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace --all-targets
       - run: cargo test --workspace --doc
+      - run: cargo bench -p molo --features full --no-run
+      - run: cargo run -p molo-eval-runner -- --validate-dir evals/cases/coding
+      - run: cargo run -p molo-eval-runner -- --manifest evals/cases/coding/edit-function/eval.json --output evals/results/ci-smoke-edit-function.json
       - run: cargo doc --workspace --no-deps
         env:
           RUSTDOCFLAGS: "-D warnings"

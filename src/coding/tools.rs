@@ -277,4 +277,16 @@ mod tests {
         assert_eq!(effect.source.tool_call_id.as_deref(), Some("call-1"));
         assert_eq!(effect.source.tool_name.as_deref(), Some("read_file"));
     }
+
+    #[tokio::test]
+    async fn read_file_tool_rejects_invalid_json_arguments() {
+        let run = RunContext::new("tool");
+        let state = SharedState::new();
+        let context = ToolContext::new(&run, &state, "call-1", "read_file");
+        let err = ReadFileTool
+            .call(json!({"path": "../secret"}), context)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ToolError::InvalidArguments(_)));
+    }
 }

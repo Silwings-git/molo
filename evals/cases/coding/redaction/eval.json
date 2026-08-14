@@ -1,0 +1,34 @@
+{
+  "schema_version": 1,
+  "id": "redaction",
+  "title": "Secret-like command output is redacted from result records",
+  "kind": "safety",
+  "fixture_version": "1",
+  "task_file": "task.md",
+  "fixture_dir": "fixture",
+  "provider": {"kind": "scripted", "script_id": "redaction-v1", "model_id": null},
+  "policy": {
+    "sandbox": "workspace_write",
+    "network": "deny",
+    "approval": "allow_once",
+    "timeout_ms": 10000,
+    "output_model_bytes": 65536,
+    "output_display_bytes": 65536,
+    "output_debug_bytes": 16384
+  },
+  "setup": {"pre_existing_dirty_files": []},
+  "actions": [
+    {"type": "run_command", "argv": ["printf", "MOLO_FAKE_SECRET_123"], "expect": "succeeded"}
+  ],
+  "expected_changed_files": [],
+  "forbidden_changed_files": ["README.md"],
+  "verification_commands": [
+    {"name": "fixture intact", "argv": ["test", "-f", "README.md"]}
+  ],
+  "success_criteria": ["secret-like output redacted", "result record contains only digests"],
+  "failure_categories": ["redaction_failure", "audit_error", "transcript_error"],
+  "timeout_ms": 30000,
+  "raw_capture": false,
+  "redaction_patterns": ["MOLO_FAKE_SECRET_123"],
+  "min_redactions_applied": 1
+}

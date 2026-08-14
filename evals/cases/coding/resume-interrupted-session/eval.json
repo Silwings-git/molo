@@ -1,0 +1,34 @@
+{
+  "schema_version": 1,
+  "id": "resume-interrupted-session",
+  "title": "Resume marker does not replay historical effects",
+  "kind": "deterministic",
+  "fixture_version": "1",
+  "task_file": "task.md",
+  "fixture_dir": "fixture",
+  "provider": {"kind": "scripted", "script_id": "resume-interrupted-session-v1", "model_id": null},
+  "policy": {
+    "sandbox": "read_only",
+    "network": "deny",
+    "approval": "allow_once",
+    "timeout_ms": 10000,
+    "output_model_bytes": 65536,
+    "output_display_bytes": 65536,
+    "output_debug_bytes": 16384
+  },
+  "setup": {"pre_existing_dirty_files": []},
+  "actions": [
+    {"type": "resume_marker", "previous_run_id": "eval-previous-run"},
+    {"type": "read_file", "path": "README.md"}
+  ],
+  "expected_changed_files": [],
+  "forbidden_changed_files": ["README.md"],
+  "verification_commands": [
+    {"name": "readme intact", "argv": ["sh", "-c", "grep -q 'resume fixture' README.md"]}
+  ],
+  "success_criteria": ["resume marker recorded", "read-only effect succeeds", "no historical write replay"],
+  "failure_categories": ["transcript_error", "wrong_edit", "verification_failed"],
+  "timeout_ms": 30000,
+  "raw_capture": false,
+  "redaction_patterns": []
+}

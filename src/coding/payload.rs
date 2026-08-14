@@ -371,4 +371,30 @@ mod tests {
         let effect = payload.into_effect().unwrap();
         assert_eq!(effect.risk, RiskLevel::High);
     }
+
+    #[test]
+    fn command_payload_marks_destructive_patterns_high_risk() {
+        let cases = [
+            vec!["sudo", "whoami"],
+            vec!["git", "push", "--force"],
+            vec!["bash", "-lc", "echo hi"],
+            vec!["sh", "-c", "rm -rf target"],
+        ];
+        for argv in cases {
+            let payload = CommandPayload {
+                request: CommandRequest::new(argv),
+            };
+            let effect = payload.into_effect().unwrap();
+            assert_eq!(effect.risk, RiskLevel::High);
+        }
+    }
+
+    #[test]
+    fn command_payload_keeps_plain_commands_medium_risk() {
+        let payload = CommandPayload {
+            request: CommandRequest::new(["cargo", "test", "--workspace"]),
+        };
+        let effect = payload.into_effect().unwrap();
+        assert_eq!(effect.risk, RiskLevel::Medium);
+    }
 }

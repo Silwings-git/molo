@@ -1,0 +1,19 @@
+[package]
+name = "molo-eval-runner"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.97"
+description = "Internal Phase 9 coding eval runner for molo"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[[bin]]
+name = "molo-eval-runner"
+path = "src/main.rs"
+doc = false
+
+[dependencies]
+molo = { path = "../..", features = ["coding", "harness"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt", "macros", "fs", "process", "time"] }

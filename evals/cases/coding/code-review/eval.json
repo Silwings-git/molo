@@ -1,0 +1,33 @@
+{
+  "schema_version": 1,
+  "id": "code-review",
+  "title": "Read-only code review finding",
+  "kind": "deterministic",
+  "fixture_version": "1",
+  "task_file": "task.md",
+  "fixture_dir": "fixture",
+  "provider": {"kind": "scripted", "script_id": "code-review-v1", "model_id": null},
+  "policy": {
+    "sandbox": "read_only",
+    "network": "deny",
+    "approval": "allow_once",
+    "timeout_ms": 10000,
+    "output_model_bytes": 65536,
+    "output_display_bytes": 65536,
+    "output_debug_bytes": 16384
+  },
+  "setup": {"pre_existing_dirty_files": []},
+  "actions": [
+    {"type": "read_file", "path": "src/lib.rs"}
+  ],
+  "expected_changed_files": [],
+  "forbidden_changed_files": ["src/lib.rs"],
+  "verification_commands": [
+    {"name": "review remained read-only", "argv": ["test", "-f", "src/lib.rs"]}
+  ],
+  "success_criteria": ["read-only effect succeeds", "no file touched by agent"],
+  "failure_categories": ["wrong_edit", "policy_denied_unexpected", "verification_failed"],
+  "timeout_ms": 30000,
+  "raw_capture": false,
+  "redaction_patterns": []
+}

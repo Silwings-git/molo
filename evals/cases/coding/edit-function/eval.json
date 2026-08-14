@@ -1,0 +1,33 @@
+{
+  "schema_version": 1,
+  "id": "edit-function",
+  "title": "Modify a pure function and pass verification",
+  "kind": "deterministic",
+  "fixture_version": "1",
+  "task_file": "task.md",
+  "fixture_dir": "fixture",
+  "provider": {"kind": "scripted", "script_id": "edit-function-v1", "model_id": null},
+  "policy": {
+    "sandbox": "workspace_write",
+    "network": "deny",
+    "approval": "allow_once",
+    "timeout_ms": 10000,
+    "output_model_bytes": 65536,
+    "output_display_bytes": 65536,
+    "output_debug_bytes": 16384
+  },
+  "setup": {"pre_existing_dirty_files": []},
+  "actions": [
+    {"type": "apply_patch", "path": "src/lib.rs", "old_text": "41", "new_text": "42"}
+  ],
+  "expected_changed_files": ["src/lib.rs"],
+  "forbidden_changed_files": [],
+  "verification_commands": [
+    {"name": "answer updated", "argv": ["sh", "-c", "grep -q '42' src/lib.rs"]}
+  ],
+  "success_criteria": ["expected file changed", "verification passes"],
+  "failure_categories": ["wrong_edit", "verification_failed", "harness_error"],
+  "timeout_ms": 30000,
+  "raw_capture": false,
+  "redaction_patterns": []
+}

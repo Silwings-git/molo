@@ -665,4 +665,34 @@ mod tests {
         assert!(output.truncated);
         let _ = std::fs::remove_dir_all(root);
     }
+
+    #[tokio::test]
+    async fn local_command_truncation_handles_utf8_boundary() {
+        let root = temp_dir("truncate-utf8");
+        let workspace = LocalWorkspace::new(&root).unwrap();
+        let executor = LocalCommandExecutor::new(workspace);
+        let mut request = CommandRequest::new(["printf", "éé"]);
+        request.output_limit = CommandOutputLimit {
+            stdout_bytes: 3,
+            stderr_bytes: 3,
+        };
+        let output = executor
+            .execute(
+                request,
+                &ExecutionPolicy {
+                    sandbox: SandboxPolicy::ReadOnly,
+                    network: NetworkPolicy::Deny,
+                    timeout: Some(Duration::from_secs(5)),
+                    output_limit: OutputLimit::default(),
+                },
+                &RunContext::new("cmd"),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(output.stdout.bytes, 4);
+        assert!(output.stdout.truncated);
+        assert!(!output.stdout.text.is_empty());
+        let _ = std::fs::remove_dir_all(root);
+    }
 }

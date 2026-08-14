@@ -1074,7 +1074,6 @@ impl TranscriptStore for VecTranscriptStore {
 }
 
 /// Minimal in-process harness implementation.
-#[derive(Debug)]
 pub struct BasicHarness<E, P, A, S, T> {
     executor: E,
     policy: P,
@@ -1082,9 +1081,32 @@ pub struct BasicHarness<E, P, A, S, T> {
     audit: S,
     transcript: T,
     classifier: DefaultRiskClassifier,
-    redactor: NoopRedactor,
+    redactor: Arc<dyn Redactor>,
     session_approvals: Mutex<Vec<SessionApproval>>,
     config: HarnessConfig,
+}
+
+impl<E, P, A, S, T> fmt::Debug for BasicHarness<E, P, A, S, T>
+where
+    E: fmt::Debug,
+    P: fmt::Debug,
+    A: fmt::Debug,
+    S: fmt::Debug,
+    T: fmt::Debug,
+{
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("BasicHarness")
+            .field("executor", &self.executor)
+            .field("policy", &self.policy)
+            .field("approval", &self.approval)
+            .field("audit", &self.audit)
+            .field("transcript", &self.transcript)
+            .field("classifier", &self.classifier)
+            .field("redactor", &"dyn Redactor")
+            .field("session_approvals", &self.session_approvals)
+            .field("config", &self.config)
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1162,7 +1184,7 @@ where
             audit,
             transcript,
             classifier: DefaultRiskClassifier,
-            redactor: NoopRedactor,
+            redactor: Arc::new(NoopRedactor),
             session_approvals: Mutex::new(Vec::new()),
             config: HarnessConfig::default(),
         }
@@ -1176,7 +1198,14 @@ where
 
     /// Uses the default no-op redactor.
     pub fn with_noop_redactor(mut self) -> Self {
-        self.redactor = NoopRedactor;
+        self.redactor = Arc::new(NoopRedactor);
+        self
+    }
+
+    /// Replaces the output redactor used before observations are returned,
+    /// audited, or stored in transcripts.
+    pub fn with_redactor(mut self, redactor: impl Redactor + 'static) -> Self {
+        self.redactor = Arc::new(redactor);
         self
     }
 
@@ -1328,7 +1357,8 @@ where
         .await;
         match execution {
             Ok(raw) => {
-                let limited = limit_and_redact(raw, &self.config.output_limit, &self.redactor);
+                let limited =
+                    limit_and_redact(raw, &self.config.output_limit, self.redactor.as_ref());
                 self.audit(
                     AuditEvent::EffectCompleted {
                         effect_id: effect_id.clone(),
@@ -1337,11 +1367,20 @@ where
                     context,
                 )
                 .await?;
+                let mut observation_metadata = RunMetadata::new();
+                observation_metadata.insert(
+                    "truncated".to_string(),
+                    serde_json::json!(limited.truncated),
+                );
+                observation_metadata.insert(
+                    "redactions_applied".to_string(),
+                    serde_json::json!(limited.redactions.len()),
+                );
                 let observation = EffectObservation {
                     effect_id: effect_id.clone(),
                     status: EffectStatus::Succeeded,
                     output: limited.output,
-                    metadata: RunMetadata::new(),
+                    metadata: observation_metadata,
                 };
                 self.transcript(
                     TranscriptRecord::EffectObservation {
@@ -1728,7 +1767,7 @@ where
 fn limit_and_redact(
     raw: RawEffectOutput,
     limit: &OutputLimit,
-    redactor: &impl Redactor,
+    redactor: &(impl Redactor + ?Sized),
 ) -> LimitedOutput {
     let model_redacted = redactor.redact_model_text(&raw.observation_for_model);
     let (mut model_text, model_truncated) = truncate_with_marker(
@@ -2371,6 +2410,48 @@ mod tests {
         assert!(output.truncated);
         assert!(!output.output.observation_for_model.contains("secret-token"));
         assert!(output.output.observation_for_model.contains("[REDACTED]"));
+    }
+
+    #[tokio::test]
+    async fn basic_harness_uses_configured_redactor() {
+        let harness = BasicHarness::new(
+            StaticEffectExecutor::new()
+                .with_output("effect-1", RawEffectOutput::text("secret-token in output")),
+            DefaultPolicyEngine,
+            AlwaysAllowApprovalBroker,
+            NoopAuditSink,
+            NoopTranscriptStore,
+        )
+        .with_redactor(PatternRedactor::new(["secret-token"]));
+
+        let observation = harness
+            .execute(
+                EffectRequest::new(EffectKind::ReadFile, "read", json!({})).with_id("effect-1"),
+                &RunContext::new("run-redactor"),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(observation.status, EffectStatus::Succeeded);
+        assert!(
+            !observation
+                .output
+                .observation_for_model
+                .contains("secret-token")
+        );
+        assert!(
+            observation
+                .output
+                .observation_for_model
+                .contains("[REDACTED]")
+        );
+        assert_eq!(
+            observation
+                .metadata
+                .get("redactions_applied")
+                .and_then(serde_json::Value::as_u64),
+            Some(1)
+        );
     }
 
     #[derive(Debug, Default, Clone, Copy)]

@@ -1263,6 +1263,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "molo-eval-runner"
+version = "0.1.0"
+dependencies = [
+ "molo",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "molo-macros"
 version = "0.3.0"
 dependencies = [

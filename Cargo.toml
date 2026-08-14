@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "molo-macros", "molo-cli"]
+members = [".", "molo-macros", "molo-cli", "evals/runner"]
 resolver = "2"
 
 [package]
@@ -15,7 +15,14 @@ keywords = ["agent", "llm", "ai", "framework"]
 categories = ["artificial-intelligence"]
 authors = ["silwings"]
 # Internal project files are excluded from the published package
-exclude = [".example.env", "AGENTS.md", "CLAUDE.md", "docs/", ".github/"]
+exclude = [
+    ".example.env",
+    "AGENTS.md",
+    "CLAUDE.md",
+    "docs/",
+    "evals/",
+    ".github/",
+]
 
 [dependencies]
 # The path is stripped at publish time; the version is what crates.io resolves
@@ -90,6 +97,20 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 [[bench]]
 name = "bench"
 harness = false
+
+[[bench]]
+name = "runtime_message"
+harness = false
+
+[[bench]]
+name = "runtime_harness"
+harness = false
+required-features = ["harness"]
+
+[[bench]]
+name = "coding_primitives"
+harness = false
+required-features = ["coding"]
 
 [[example]]
 name = "agent"
