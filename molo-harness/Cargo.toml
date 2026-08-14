@@ -2,7 +2,7 @@
 name = "molo-harness"
 version = "0.3.0"
 edition = "2024"
-rust-version = "1.97"
+rust-version = "1.88"
 description = "Harness runtime and governed effect execution for molo"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/Silwings-git/molo.git"

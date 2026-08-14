@@ -12,7 +12,7 @@ workloads.
 [![docs.rs](https://docs.rs/molo/badge.svg)](https://docs.rs/molo)
 [![CI](https://github.com/Silwings-git/molo/actions/workflows/ci.yml/badge.svg)](https://github.com/Silwings-git/molo/actions/workflows/ci.yml)
 [![License](https://img.shields.io/crates/l/molo.svg)](LICENSE-APACHE)
-[![MSRV](https://img.shields.io/badge/rustc-1.97%2B-orange.svg)](https://github.com/Silwings-git/molo)
+[![MSRV](https://img.shields.io/badge/rustc-1.88%2B-orange.svg)](https://github.com/Silwings-git/molo)
 
 </div>
 

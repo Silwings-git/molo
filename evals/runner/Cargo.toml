@@ -2,7 +2,7 @@
 name = "molo-eval-runner"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.97"
+rust-version = "1.88"
 description = "Coding eval runner for molo"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/Silwings-git/molo.git"

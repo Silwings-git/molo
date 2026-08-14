@@ -2,7 +2,7 @@
 name = "molo-macros"
 version = "0.3.0"
 edition = "2024"
-rust-version = "1.97"
+rust-version = "1.88"
 description = "Procedural macros for molo: one-shot tool definitions (#[molo::tool])"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/Silwings-git/molo.git"
