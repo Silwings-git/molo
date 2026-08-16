@@ -468,7 +468,27 @@ pub fn validate_policy_enforcement_report(
     )
 }
 
-/// Local one-shot command executor.
+/// Local non-PTY, one-shot command executor backed by host process spawning.
+///
+/// This executor resolves [`CommandRequest::cwd`] through the [`Workspace`],
+/// starts `argv` directly without implicit shell parsing, applies
+/// [`EnvPolicy`], requires a timeout, captures stdout/stderr separately, and
+/// reports output truncation.
+///
+/// This executor is not an OS sandbox. It does not technically enforce
+/// [`SandboxPolicy`], [`NetworkPolicy`], network isolation, process-tree
+/// cleanup, or resource limits. Its capability report marks sandbox, network,
+/// and process cleanup as advisory, and resource limits as unsupported.
+///
+/// By default, command execution fails closed when the requested policy requires
+/// technical enforcement that this local process backend cannot provide.
+/// [`LocalCommandExecutor::with_advisory_policy`] and
+/// [`LocalCommandExecutor::with_policy_capability_mode`] can explicitly allow
+/// such execution to continue with advisory enforcement reports. That mode is
+/// intended for tests, local prototypes, and reference CLI dogfooding; production
+/// coding-agent hosts should inject a [`CommandExecutor`] backed by a container,
+/// VM, platform sandbox, or remote isolated worker that can enforce the
+/// requested policy.
 #[derive(Debug, Clone)]
 pub struct LocalCommandExecutor<W> {
     workspace: W,
@@ -484,8 +504,12 @@ impl<W> LocalCommandExecutor<W> {
         }
     }
 
-    /// Allows policy modes that cannot be technically enforced locally to be
-    /// reported as advisory instead of failing closed.
+    /// Allows policy requirements that cannot be technically enforced locally to
+    /// be reported as advisory instead of failing closed.
+    ///
+    /// Passing `true` does not enable sandboxing, network isolation, process-tree
+    /// cleanup, or resource limits. It only permits execution to continue while
+    /// recording the downgrade in the returned policy enforcement report.
     pub fn with_advisory_policy(mut self, allow: bool) -> Self {
         self.policy_capability_mode = if allow {
             PolicyCapabilityMode::AllowAdvisory
@@ -496,6 +520,10 @@ impl<W> LocalCommandExecutor<W> {
     }
 
     /// Sets how this executor handles policy/capability mismatches.
+    ///
+    /// [`PolicyCapabilityMode::RequireEnforced`] is the conservative default.
+    /// [`PolicyCapabilityMode::AllowAdvisory`] allows local execution to proceed
+    /// without technical enforcement and requires reports to say so explicitly.
     pub fn with_policy_capability_mode(mut self, mode: PolicyCapabilityMode) -> Self {
         self.policy_capability_mode = mode;
         self

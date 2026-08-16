@@ -6,4 +6,6 @@
 # Private files kept out of the public repository
 /CLAUDE.md
 /AGENTS.md
-# /docs/internal/
+
+# Nested internal docs repository; tracked and committed independently.
+/docs/internal/
