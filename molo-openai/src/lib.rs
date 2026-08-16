@@ -2822,17 +2822,43 @@ mod tests {
 
         let server = tokio::spawn(async move {
             let (mut socket, _) = listener.accept().await.unwrap();
+            let mut bytes = Vec::new();
             let mut buf = [0u8; 8192];
-            let n = socket.read(&mut buf).await.unwrap();
-            let req = String::from_utf8_lossy(&buf[..n]).to_string();
-            // A single read usually contains headers + the body (small
-            // requests); assert the wire shape item by item.
+            loop {
+                let n = socket.read(&mut buf).await.unwrap();
+                if n == 0 {
+                    break;
+                }
+                bytes.extend_from_slice(&buf[..n]);
+                let Some(headers_end) = bytes
+                    .windows(4)
+                    .position(|window| window == b"\r\n\r\n")
+                    .map(|index| index + 4)
+                else {
+                    continue;
+                };
+                let request = String::from_utf8_lossy(&bytes).to_string();
+                let content_length = request
+                    .lines()
+                    .find_map(|line| {
+                        let lower = line.to_ascii_lowercase();
+                        lower
+                            .strip_prefix("content-length:")
+                            .and_then(|value| value.trim().parse::<usize>().ok())
+                    })
+                    .unwrap_or(0);
+                if bytes.len() >= headers_end + content_length {
+                    break;
+                }
+            }
+            let req = String::from_utf8_lossy(&bytes).to_string();
+            // Assert the wire shape item by item.
             assert!(
                 req.starts_with("POST /chat/completions HTTP/1.1"),
                 "method/path: {req}"
             );
             assert!(
-                req.contains("authorization: Bearer sk-test"),
+                req.to_lowercase().contains("authorization: bearer sk-test"),
                 "auth header: {req}"
             );
             assert!(

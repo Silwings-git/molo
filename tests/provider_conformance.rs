@@ -279,8 +279,12 @@ mod openai_compatible {
             let request = String::from_utf8_lossy(&bytes).to_string();
             let content_length = request
                 .lines()
-                .find_map(|line| line.strip_prefix("content-length: "))
-                .and_then(|value| value.trim().parse::<usize>().ok())
+                .find_map(|line| {
+                    let lower = line.to_ascii_lowercase();
+                    lower
+                        .strip_prefix("content-length:")
+                        .and_then(|value| value.trim().parse::<usize>().ok())
+                })
                 .unwrap_or(0);
             if bytes.len() >= headers_end + content_length {
                 break;
@@ -346,7 +350,11 @@ mod openai_compatible {
         );
         let request = server.await.unwrap();
         assert!(request.starts_with("POST /chat/completions HTTP/1.1"));
-        assert!(request.contains("authorization: Bearer sk-test-secret"));
+        assert!(
+            request
+                .to_lowercase()
+                .contains("authorization: bearer sk-test-secret")
+        );
         assert!(request.contains(r#""model":"mock-model""#));
         assert!(request.contains(r#""response_format""#));
         assert!(request.contains(r#""json_schema""#));

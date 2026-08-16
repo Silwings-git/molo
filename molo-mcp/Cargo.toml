@@ -42,3 +42,6 @@ tracing = ["dep:tracing"]
 [dev-dependencies]
 rmcp = { version = "3.1.2", features = ["server", "transport-io"] }
 
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]

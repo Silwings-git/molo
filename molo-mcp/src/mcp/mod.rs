@@ -1494,18 +1494,36 @@ mod tests {
                 };
                 tokio::spawn(async move {
                     let mut buf = [0u8; 64 * 1024];
+                    let mut bytes = Vec::new();
                     loop {
                         let n = match socket.read(&mut buf).await {
                             Ok(0) => break,
                             Ok(n) => n,
                             Err(_) => break,
                         };
-                        let req = String::from_utf8_lossy(&buf[..n]).to_string();
-                        // The request body comes after the last blank line (a
-                        // single read usually contains the headers + a small
-                        // body).
-                        let body = req.split("\r\n\r\n").nth(1).unwrap_or("");
-                        let Ok(value) = serde_json::from_str::<serde_json::Value>(body) else {
+                        bytes.extend_from_slice(&buf[..n]);
+                        let Some(headers_end) = bytes
+                            .windows(4)
+                            .position(|window| window == b"\r\n\r\n")
+                            .map(|index| index + 4)
+                        else {
+                            continue;
+                        };
+                        let request = String::from_utf8_lossy(&bytes).to_string();
+                        let content_length = request
+                            .lines()
+                            .find_map(|line| {
+                                let lower = line.to_ascii_lowercase();
+                                lower
+                                    .strip_prefix("content-length:")
+                                    .and_then(|value| value.trim().parse::<usize>().ok())
+                            })
+                            .unwrap_or(0);
+                        if bytes.len() < headers_end + content_length {
+                            continue;
+                        }
+                        let body = String::from_utf8_lossy(&bytes[headers_end..]).to_string();
+                        let Ok(value) = serde_json::from_str::<serde_json::Value>(&body) else {
                             break;
                         };
                         let id = value["id"].clone();
@@ -1544,6 +1562,7 @@ mod tests {
                         if socket.write_all(resp.as_bytes()).await.is_err() {
                             break;
                         }
+                        bytes.clear();
                     }
                 });
             }
@@ -1586,17 +1605,35 @@ mod tests {
                 let respond = Arc::clone(&respond);
                 tokio::spawn(async move {
                     let mut buf = [0u8; 8192];
+                    let mut bytes = Vec::new();
                     loop {
                         let n = match socket.read(&mut buf).await {
                             Ok(0) | Err(_) => break,
                             Ok(n) => n,
                         };
-                        // The request body comes after the last blank line (a
-                        // single read usually contains the headers + a small
-                        // body).
-                        let req = String::from_utf8_lossy(&buf[..n]).to_string();
-                        let body = req.split("\r\n\r\n").nth(1).unwrap_or("");
-                        let request: serde_json::Value = match serde_json::from_str(body) {
+                        bytes.extend_from_slice(&buf[..n]);
+                        let Some(headers_end) = bytes
+                            .windows(4)
+                            .position(|window| window == b"\r\n\r\n")
+                            .map(|index| index + 4)
+                        else {
+                            continue;
+                        };
+                        let request = String::from_utf8_lossy(&bytes).to_string();
+                        let content_length = request
+                            .lines()
+                            .find_map(|line| {
+                                let lower = line.to_ascii_lowercase();
+                                lower
+                                    .strip_prefix("content-length:")
+                                    .and_then(|value| value.trim().parse::<usize>().ok())
+                            })
+                            .unwrap_or(0);
+                        if bytes.len() < headers_end + content_length {
+                            continue;
+                        }
+                        let body = String::from_utf8_lossy(&bytes[headers_end..]).to_string();
+                        let request: serde_json::Value = match serde_json::from_str(&body) {
                             Ok(v) => v,
                             Err(_) => break,
                         };
@@ -1626,6 +1663,7 @@ mod tests {
                         if socket.write_all(resp.as_bytes()).await.is_err() {
                             break;
                         }
+                        bytes.clear();
                     }
                 });
             }
