@@ -748,12 +748,19 @@ impl ReActAgent {
                         }
                         Err(e) => return Err(e),
                     };
-                #[cfg(feature = "tracing")]
-                {
-                    llm_span.record("usage.prompt_tokens", response.usage.prompt_tokens);
-                    llm_span.record("usage.completion_tokens", response.usage.completion_tokens);
+                // Usage may be absent (the endpoint didn't report it);
+                // reported parts are summed and omitted turns are tracked so
+                // the summary's sum is not misread as exact.
+                if let Some(usage) = response.usage {
+                    #[cfg(feature = "tracing")]
+                    {
+                        llm_span.record("usage.prompt_tokens", usage.prompt_tokens);
+                        llm_span.record("usage.completion_tokens", usage.completion_tokens);
+                    }
+                    counters.usage_total += usage;
+                } else {
+                    counters.usage_omitted = true;
                 }
-                counters.usage_total += response.usage;
                 let finish_reason = response.finish_reason.clone();
 
                 // Per the Provider contract, this round's reply is exactly
@@ -1311,8 +1318,11 @@ struct RunCounters {
     rounds: usize,
     /// Total number of tool executions.
     tool_calls_total: usize,
-    /// Sum of token usage across rounds.
+    /// Sum of token usage across rounds (reported parts only).
     usage_total: Usage,
+    /// `true` = at least one round's provider did not report usage, so
+    /// [`usage_total`](Self::usage_total) is a lower bound.
+    usage_omitted: bool,
 }
 
 struct FinalAnswer {
@@ -1509,7 +1519,11 @@ impl ReActAgent {
         }
 
         let response = observation.response;
-        state.counters.usage_total += response.usage;
+        if let Some(usage) = response.usage {
+            state.counters.usage_total += usage;
+        } else {
+            state.counters.usage_omitted = true;
+        }
         let finish_reason = response.finish_reason.clone();
         let Message::Assistant {
             content,
@@ -2004,6 +2018,7 @@ fn run_summary(
         counters.rounds,
         counters.tool_calls_total,
         counters.usage_total,
+        counters.usage_omitted,
         finish_reason,
         started_at,
         provider_model,
@@ -2014,6 +2029,7 @@ fn run_summary_from_parts(
     rounds: usize,
     tool_calls: usize,
     usage: Usage,
+    usage_omitted: bool,
     finish_reason: Option<FinishReason>,
     started_at: Instant,
     provider_model: Option<String>,
@@ -2022,6 +2038,7 @@ fn run_summary_from_parts(
         rounds,
         tool_calls,
         usage,
+        usage_omitted,
         finish_reason,
         latency: started_at.elapsed(),
         provider_model,
@@ -2241,9 +2258,12 @@ impl ReActAgent {
         let stream = async_stream::stream! {
             let mut rounds = 0usize;
             // Execution summary (carried with Done): rounds is the `rounds`
-            // above; tool counts and usage accumulate per round.
+            // above; tool counts and usage accumulate per round; rounds whose
+            // provider omitted usage are tracked so the sum is not misread
+            // as exact.
             let mut tool_calls_total = 0usize;
             let mut usage_total = Usage::default();
+            let mut usage_omitted = false;
             // Structured validator: built when this run has a hand-written
             // schema from the request or config; the retry budget lives in
             // the component.
@@ -2269,6 +2289,7 @@ impl ReActAgent {
                         rounds,
                         tool_calls_total,
                         usage_total,
+                        usage_omitted,
                         None,
                         started_at,
                         provider_model.clone(),
@@ -2288,10 +2309,14 @@ impl ReActAgent {
                 // immediately — this round hasn't started a conversation,
                 // so the memory is clean.
                 if let Err(e) = check_run_context(&context) {
+                    // This counted round got no provider usage: the sum is a
+                    // lower bound from here on.
+                    usage_omitted = true;
                     let summary = run_summary_from_parts(
                         rounds,
                         tool_calls_total,
                         usage_total,
+                        usage_omitted,
                         None,
                         started_at,
                         provider_model.clone(),
@@ -2306,10 +2331,14 @@ impl ReActAgent {
                 let messages = match self.memory.context().await {
                     Ok(messages) => messages,
                     Err(e) => {
+                        // This counted round got no provider usage: the sum
+                        // is a lower bound from here on.
+                        usage_omitted = true;
                         let summary = run_summary_from_parts(
                             rounds,
                             tool_calls_total,
                             usage_total,
+                            usage_omitted,
                             None,
                             started_at,
                             provider_model.clone(),
@@ -2350,10 +2379,14 @@ impl ReActAgent {
                         // (observability pinpoints the failed call).
                         #[cfg(feature = "tracing")]
                         llm_span.record("error", e.to_string());
+                        // This counted round got no provider usage: the sum
+                        // is a lower bound from here on.
+                        usage_omitted = true;
                         let summary = run_summary_from_parts(
                             rounds,
                             tool_calls_total,
                             usage_total,
+                            usage_omitted,
                             None,
                             started_at,
                             provider_model.clone(),
@@ -2363,10 +2396,14 @@ impl ReActAgent {
                         break;
                     }
                     Err(e) => {
+                        // This counted round got no provider usage: the sum
+                        // is a lower bound from here on.
+                        usage_omitted = true;
                         let summary = run_summary_from_parts(
                             rounds,
                             tool_calls_total,
                             usage_total,
+                            usage_omitted,
                             None,
                             started_at,
                             provider_model.clone(),
@@ -2391,6 +2428,10 @@ impl ReActAgent {
                 let mut reasoning = String::new();
                 let mut calls = Vec::new();
                 let mut round_finish_reason = None::<FinishReason>;
+                // True when this round's Done carried reported usage; a
+                // round that ends without it marks the run's usage sum as a
+                // lower bound (see the wrap-up after the loop below).
+                let mut round_usage_reported = false;
                 loop {
                     // next()'s Output is itself an Option, and
                     // run_until_cancelled wraps it in another (returns None
@@ -2405,10 +2446,14 @@ impl ReActAgent {
                     let Some(event) = (match next {
                         Ok(event) => event,
                         Err(e) => {
+                            // The round was aborted before its Done: its
+                            // usage is unknown, the sum is a lower bound.
+                            usage_omitted = true;
                             let summary = run_summary_from_parts(
                                 rounds,
                                 tool_calls_total,
                                 usage_total,
+                                usage_omitted,
                                 None,
                                 started_at,
                                 provider_model.clone(),
@@ -2428,10 +2473,15 @@ impl ReActAgent {
                             // bound (the Provider layer only limits single
                             // lines; this is the per-round backstop).
                             if text.len() + delta.len() > MAX_ROUND_TEXT {
+                                // The round was aborted before its Done:
+                                // its usage is unknown, the sum is a lower
+                                // bound.
+                                usage_omitted = true;
                                 let summary = run_summary_from_parts(
                                     rounds,
                                     tool_calls_total,
                                     usage_total,
+                                    usage_omitted,
                                     None,
                                     started_at,
                                     provider_model.clone(),
@@ -2450,10 +2500,15 @@ impl ReActAgent {
                             // Same limit as text: a custom Provider may
                             // send reasoning deltas without bound.
                             if reasoning.len() + chunk.len() > MAX_ROUND_TEXT {
+                                // The round was aborted before its Done:
+                                // its usage is unknown, the sum is a lower
+                                // bound.
+                                usage_omitted = true;
                                 let summary = run_summary_from_parts(
                                     rounds,
                                     tool_calls_total,
                                     usage_total,
+                                    usage_omitted,
                                     None,
                                     started_at,
                                     provider_model.clone(),
@@ -2477,8 +2532,8 @@ impl ReActAgent {
                         }
                         Ok(StreamEvent::Done { reason, usage }) => {
                             // Streaming usage may be absent (the endpoint
-                            // didn't return it); missing rounds count as
-                            // zero.
+                            // didn't return it); missing rounds are tracked
+                            // so the summary's sum is not misread as exact.
                             // usage goes through both channels:
                             // observability records it on the llm_request
                             // span at wrap-up, and the business-side
@@ -2490,6 +2545,9 @@ impl ReActAgent {
                                 llm_span.record("usage.completion_tokens", usage.completion_tokens);
                                 }
                                 usage_total += usage;
+                                round_usage_reported = true;
+                            } else {
+                                usage_omitted = true;
                             }
                             round_finish_reason = Some(reason);
                             // Done = this round is complete: move to
@@ -2507,10 +2565,14 @@ impl ReActAgent {
                             // pinpoints the failed call).
                             #[cfg(feature = "tracing")]
                             llm_span.record("error", e.to_string());
+                            // The round was aborted before its Done: its
+                            // usage is unknown, the sum is a lower bound.
+                            usage_omitted = true;
                             let summary = run_summary_from_parts(
                                 rounds,
                                 tool_calls_total,
                                 usage_total,
+                                usage_omitted,
                                 None,
                                 started_at,
                                 provider_model.clone(),
@@ -2522,6 +2584,11 @@ impl ReActAgent {
                         Ok(_) => {}
                     }
                 }
+
+                // Round ended without reported usage (stream ended without
+                // Done, or Done carried None): the accumulated sum is a
+                // lower bound from here on.
+                usage_omitted |= !round_usage_reported;
 
                 // Empty Assistant messages are not recorded (consistent
                 // with run).
@@ -2538,6 +2605,7 @@ impl ReActAgent {
                                 rounds,
                                 tool_calls_total,
                                 usage_total,
+                                usage_omitted,
                                 None,
                                 started_at,
                                 provider_model.clone(),
@@ -2572,6 +2640,7 @@ impl ReActAgent {
                                                 rounds,
                                                 tool_calls_total,
                                                 usage_total,
+                                                usage_omitted,
                                                 None,
                                                 started_at,
                                                 provider_model.clone(),
@@ -2587,6 +2656,7 @@ impl ReActAgent {
                                         rounds,
                                         tool_calls_total,
                                         usage_total,
+                                        usage_omitted,
                                         None,
                                         started_at,
                                         provider_model.clone(),
@@ -2604,6 +2674,7 @@ impl ReActAgent {
                         rounds,
                         tool_calls_total,
                         usage_total,
+                        usage_omitted,
                         round_finish_reason,
                         started_at,
                         provider_model.clone(),
@@ -2633,6 +2704,7 @@ impl ReActAgent {
                             rounds,
                             tool_calls_total,
                             usage_total,
+                            usage_omitted,
                             None,
                             started_at,
                             provider_model.clone(),
@@ -2662,6 +2734,7 @@ impl ReActAgent {
                             rounds,
                             tool_calls_total,
                             usage_total,
+                            usage_omitted,
                             None,
                             started_at,
                             provider_model.clone(),
@@ -2885,8 +2958,21 @@ mod tests {
         }
     }
 
-    fn assert_done_summary(chunk: &MessageChunk, rounds: usize, tool_calls: usize, usage: Usage) {
-        assert_done_summary_with_finish(chunk, rounds, tool_calls, usage, Some(FinishReason::Stop));
+    fn assert_done_summary(
+        chunk: &MessageChunk,
+        rounds: usize,
+        tool_calls: usize,
+        usage: Usage,
+        usage_omitted: bool,
+    ) {
+        assert_done_summary_with_finish(
+            chunk,
+            rounds,
+            tool_calls,
+            usage,
+            usage_omitted,
+            Some(FinishReason::Stop),
+        );
     }
 
     fn assert_done_summary_with_finish(
@@ -2894,12 +2980,14 @@ mod tests {
         rounds: usize,
         tool_calls: usize,
         usage: Usage,
+        usage_omitted: bool,
         finish_reason: Option<FinishReason>,
     ) {
         let summary = done_summary(chunk).expect("expected Done chunk");
         assert_eq!(summary.rounds, rounds);
         assert_eq!(summary.tool_calls, tool_calls);
         assert_eq!(summary.usage, usage);
+        assert_eq!(summary.usage_omitted, usage_omitted);
         assert_eq!(summary.finish_reason, finish_reason);
         assert_eq!(summary.provider_model, None);
     }
@@ -3563,7 +3651,7 @@ mod tests {
         ));
         // The stream continues: the model answers directly in the second
         // round and Done follows.
-        assert_done_summary(chunks.last().unwrap(), 2, 1, Usage::default());
+        assert_done_summary(chunks.last().unwrap(), 2, 1, Usage::default(), true);
     }
 
     /// Streaming: multiple tools in one round, chunks produced strictly in
@@ -3612,7 +3700,7 @@ mod tests {
                 MessageChunk::Delta("Done".into()),
             ]
         );
-        assert_done_summary(&chunks[5], 2, 2, Usage::default());
+        assert_done_summary(&chunks[5], 2, 2, Usage::default(), true);
     }
 
     /// Error semantics are equivalent across paths: with the same failure
@@ -3743,7 +3831,7 @@ mod tests {
         // Empty answer: not recorded + normal Done (rounds counts 1).
         assert_eq!(chunks.len(), 1);
         let chunk = chunks[0].as_ref().unwrap();
-        assert_done_summary_with_finish(chunk, 1, 0, Usage::default(), None);
+        assert_done_summary_with_finish(chunk, 1, 0, Usage::default(), true, None);
         // The memory only holds the user input; no empty Assistant was
         // recorded.
         assert_eq!(
@@ -3792,7 +3880,7 @@ mod tests {
                 MessageChunk::Delta("The answer is 42".into()),
             ]
         );
-        assert_done_summary(&events[4], 2, 1, Usage::default());
+        assert_done_summary(&events[4], 2, 1, Usage::default(), true);
     }
 
     /// Pure tool round: no text, no Delta dispatched; the tool call still
@@ -3830,7 +3918,7 @@ mod tests {
                 MessageChunk::Delta("42".into()),
             ]
         );
-        assert_done_summary(&events[3], 2, 1, Usage::default());
+        assert_done_summary(&events[3], 2, 1, Usage::default(), true);
     }
 
     /// The Done summary carries real token usage (injected via
@@ -3858,7 +3946,32 @@ mod tests {
 
         // Two conversation rounds (tool round + direct-answer round), one
         // tool execution; usage accumulates per round.
-        assert_done_summary(events.last().unwrap(), 2, 1, Usage::new(30, 7));
+        assert_done_summary(events.last().unwrap(), 2, 1, Usage::new(30, 7), false);
+    }
+
+    /// Mixed usage presence: only reported parts are summed, and the
+    /// summary marks the sum as a lower bound (usage_omitted).
+    #[tokio::test]
+    async fn summary_tracks_omitted_usage_rounds() {
+        let (calc, _calls) = FakeTool::new("calc", "42");
+        let mut registry = ToolRegistry::new();
+        registry.register(calc);
+        // Round 1 (tool round) reports nothing; round 2 (direct answer)
+        // reports usage: the sum is the reported part only, and the summary
+        // flags the omission.
+        let fake = SharedFake::new([
+            FakeReply::ToolCalls {
+                content: "".into(),
+                calls: vec![call("c1", "calc", "{}")],
+            },
+            FakeReply::text_with_usage("42", Usage::new(20, 5)),
+        ]);
+        let mut agent = agent_with_registry(fake.clone(), registry, AgentConfig::default());
+
+        let mut stream = agent.run_stream("Compute").await.unwrap();
+        let events: Vec<MessageChunk> = stream.by_ref().map(|e| e.unwrap()).collect().await;
+
+        assert_done_summary(events.last().unwrap(), 2, 1, Usage::new(20, 5), true);
     }
 
     /// run and run_stream with the same script share semantics: identical

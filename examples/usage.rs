@@ -139,12 +139,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         "rounds: {} (tool executions: {})",
                         summary.rounds, summary.tool_calls
                     );
-                    println!(
-                        "usage: prompt {} / completion {} / total {} tokens",
-                        summary.usage.prompt_tokens,
-                        summary.usage.completion_tokens,
-                        summary.usage.total_tokens,
-                    );
+                    if summary.usage_omitted {
+                        // At least one round's provider did not report usage:
+                        // the sums are a lower bound, not an exact count.
+                        println!(
+                            "usage (partial, some rounds did not report): \
+                             prompt {} / completion {} / total {} tokens",
+                            summary.usage.prompt_tokens,
+                            summary.usage.completion_tokens,
+                            summary.usage.total_tokens,
+                        );
+                    } else {
+                        println!(
+                            "usage: prompt {} / completion {} / total {} tokens",
+                            summary.usage.prompt_tokens,
+                            summary.usage.completion_tokens,
+                            summary.usage.total_tokens,
+                        );
+                    }
                     break;
                 }
                 MessageChunk::Cancelled => {

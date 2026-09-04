@@ -286,7 +286,8 @@ fn check_context(context: &ProviderRequestContext) -> Result<(), ProviderError> 
 
 /// Converts one script reply into a non-streaming response.
 ///
-/// Usage defaults to zero; `WithUsage` wrappers are unwrapped recursively and
+/// Usage is `None` unless injected via `WithUsage` (an endpoint that does not
+/// report usage); `WithUsage` wrappers are unwrapped recursively and
 /// overridden with the injected value (matching the streaming path).
 fn chat_response(reply: FakeReply) -> Result<ChatResponse, ProviderError> {
     match reply {
@@ -295,18 +296,18 @@ fn chat_response(reply: FakeReply) -> Result<ChatResponse, ProviderError> {
         FakeReply::Error(e) => Err(e),
         FakeReply::WithUsage { reply, usage } => {
             let mut response = chat_response(*reply)?;
-            response.usage = usage;
+            response.usage = Some(usage);
             Ok(response)
         }
         FakeReply::Text(content) => Ok(ChatResponse {
             message: Message::assistant(content),
             finish_reason: FinishReason::Stop,
-            usage: Usage::default(),
+            usage: None,
         }),
         FakeReply::TextWithReasoning { content, reasoning } => Ok(ChatResponse {
             message: Message::assistant_with_reasoning(content, reasoning),
             finish_reason: FinishReason::Stop,
-            usage: Usage::default(),
+            usage: None,
         }),
         FakeReply::ToolCalls { content, calls } => Ok(ChatResponse {
             message: Message::Assistant {
@@ -315,7 +316,7 @@ fn chat_response(reply: FakeReply) -> Result<ChatResponse, ProviderError> {
                 tool_calls: calls,
             },
             finish_reason: FinishReason::Stop,
-            usage: Usage::default(),
+            usage: None,
         }),
     }
 }
@@ -351,7 +352,7 @@ fn stream_events(
             Ok(StreamEvent::Delta(content)),
             Ok(StreamEvent::Done {
                 reason: FinishReason::Stop,
-                usage: Some(Usage::default()),
+                usage: None,
             }),
         ]),
         // Scripted order: the content Delta first, then the Reasoning
@@ -361,7 +362,7 @@ fn stream_events(
             Ok(StreamEvent::Reasoning(reasoning)),
             Ok(StreamEvent::Done {
                 reason: FinishReason::Stop,
-                usage: Some(Usage::default()),
+                usage: None,
             }),
         ]),
         FakeReply::ToolCalls { content, calls } => {
@@ -378,7 +379,7 @@ fn stream_events(
             }));
             events.push(Ok(StreamEvent::Done {
                 reason: FinishReason::Stop,
-                usage: Some(Usage::default()),
+                usage: None,
             }));
             Ok(events)
         }
@@ -509,7 +510,7 @@ mod tests {
 
         let r = fake.chat(ChatRequest::default()).await.unwrap();
         assert_eq!(r.message, Message::assistant("hi"));
-        assert_eq!(r.usage, usage);
+        assert_eq!(r.usage, Some(usage));
     }
 
     #[tokio::test]
@@ -594,7 +595,7 @@ mod tests {
             stream.next().await.unwrap().unwrap(),
             StreamEvent::Done {
                 reason: FinishReason::Stop,
-                usage: Some(Usage::default()),
+                usage: None,
             }
         );
         assert!(stream.next().await.is_none());
@@ -630,7 +631,7 @@ mod tests {
             stream.next().await.unwrap().unwrap(),
             StreamEvent::Done {
                 reason: FinishReason::Stop,
-                usage: Some(Usage::default()),
+                usage: None,
             }
         );
         assert!(stream.next().await.is_none());
@@ -694,8 +695,12 @@ mod tests {
 
         let r1 = fake.chat(ChatRequest::default()).await.unwrap();
         assert_eq!(r1.message, Message::assistant("first"));
+        // No WithUsage in the script: usage is None for both turns ("not
+        // reported" stays distinguishable from a reported zero).
+        assert_eq!(r1.usage, None);
         let r2 = fake.chat(ChatRequest::default()).await.unwrap();
         assert_eq!(r2.message, Message::assistant("second"));
+        assert_eq!(r2.usage, None);
     }
 
     #[tokio::test]

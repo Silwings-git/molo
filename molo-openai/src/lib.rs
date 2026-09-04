@@ -1120,9 +1120,9 @@ fn parse_response(body: &str) -> Result<ChatResponse, ProviderError> {
         .collect();
     // When the model produced nothing it is still an empty Assistant,
     // keeping the convention that each turn has exactly one reply.
-    // Usage is always present: compatible endpoints that omit usage in
-    // non-streaming responses count as zero (consumers need not handle
-    // Option).
+    // Usage presence is preserved: compatible endpoints that omit usage in
+    // non-streaming responses yield None, matching the streaming `Done`
+    // semantics ("not reported" stays distinguishable from a reported zero).
     Ok(ChatResponse {
         message: Message::Assistant {
             content,
@@ -1130,7 +1130,7 @@ fn parse_response(body: &str) -> Result<ChatResponse, ProviderError> {
             tool_calls,
         },
         finish_reason: map_finish_reason(&choice.finish_reason),
-        usage: parsed.usage.map(map_usage).unwrap_or_default(),
+        usage: parsed.usage.map(map_usage),
     })
 }
 
@@ -1460,8 +1460,9 @@ struct OpenAiUsage {
 #[derive(serde::Deserialize)]
 struct OpenAiChatResponse {
     choices: Vec<OpenAiChoice>,
-    /// Non-streaming usage; compatible endpoints that omit it count as zero
-    /// (non-streaming always has it; consumers need not handle `Option`).
+    /// Non-streaming usage; compatible endpoints that omit it deserialize to
+    /// None (matches the streaming `Done` usage semantics — "not returned"
+    /// stays distinguishable from a reported zero).
     #[serde(default)]
     usage: Option<OpenAiUsage>,
 }
@@ -2085,7 +2086,7 @@ mod tests {
         let response = parse_response(body).unwrap();
         assert_eq!(response.message, Message::assistant("hi!"));
         assert_eq!(response.finish_reason, FinishReason::Stop);
-        assert_eq!(response.usage, Usage::new(5, 3));
+        assert_eq!(response.usage, Some(Usage::new(5, 3)));
     }
 
     #[test]
@@ -2181,12 +2182,13 @@ mod tests {
     }
 
     #[test]
-    fn missing_usage_defaults_to_zero() {
-        // Compatible endpoints that omit usage count as zero — non-streaming
-        // always has usage, so consumers need not handle Option.
+    fn missing_usage_is_none() {
+        // Compatible endpoints that omit usage yield None — "not returned"
+        // stays distinguishable from a reported zero (matching the streaming
+        // Done semantics).
         let body = r#"{"choices":[{"message":{"role":"assistant","content":"hi"},"finish_reason":"stop"}]}"#;
         let response = parse_response(body).unwrap();
-        assert_eq!(response.usage, Usage::default());
+        assert_eq!(response.usage, None);
     }
 
     #[test]
@@ -2886,7 +2888,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.message, crate::message::Message::assistant("hi"));
-        assert_eq!(resp.usage, Usage::new(1, 2));
+        assert_eq!(resp.usage, Some(Usage::new(1, 2)));
         server.await.unwrap();
     }
 

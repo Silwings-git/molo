@@ -36,7 +36,7 @@ async fn fake_non_streaming_text_usage_and_finish_reason() {
 
     assert_eq!(response.message, Message::assistant("hi"));
     assert_eq!(response.finish_reason, FinishReason::Stop);
-    assert_eq!(response.usage, usage);
+    assert_eq!(response.usage, Some(usage));
     assert_eq!(fake.requests(), vec![text_request()]);
 }
 
@@ -343,7 +343,7 @@ mod openai_compatible {
             .unwrap();
 
         assert_eq!(response.finish_reason, FinishReason::Stop);
-        assert_eq!(response.usage, Usage::new(3, 4));
+        assert_eq!(response.usage, Some(Usage::new(3, 4)));
         assert_eq!(
             response.message,
             Message::assistant_with_reasoning(r#"{"ok":true}"#, "because")

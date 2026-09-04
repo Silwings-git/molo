@@ -361,11 +361,14 @@ pub struct ModelOptions {
 ///
 /// Field names match the OpenAI wire format; `total_tokens` follows the
 /// vendor's convention (not necessarily the sum of the other two). `Default`
-/// = all zeros (endpoints that omit usage count as zero).
+/// = all zeros.
 ///
-/// Usage serves two consumers: the Agent layer accumulates it per turn into
-/// the end-of-loop summary, while external observability (logs / metrics)
-/// reads it directly — consumers do not need to distinguish the source.
+/// Presence is carried by the enclosing type: [`ChatResponse::usage`] /
+/// [`StreamEvent::Done::usage`] are `Option<Usage>` — `None` means the
+/// endpoint did not report usage for this turn, `Some` means the reported
+/// values. The distinction matters for observability: "not reported" is not
+/// the same as "reportedly zero" (the Agent layer also tracks it in
+/// [`RunSummary::usage_omitted`](crate::run::RunSummary)).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Usage {
     /// Input tokens for this turn.
@@ -411,9 +414,10 @@ pub struct ChatResponse {
     /// Why the model ended its reply; vendor-specific reasons are surfaced via
     /// [`FinishReason::Other`].
     pub finish_reason: FinishReason,
-    /// Token usage for this turn; always present (endpoints that omit it
-    /// count as zero, see [`Usage`]).
-    pub usage: Usage,
+    /// Token usage for this turn; `None` when the endpoint did not return it
+    /// (compatible endpoints may omit usage; see [`Usage`] for the presence
+    /// semantics shared with [`StreamEvent::Done::usage`]).
+    pub usage: Option<Usage>,
 }
 
 /// Why the model ended its reply.

@@ -301,8 +301,17 @@ pub struct RunSummary {
     pub rounds: usize,
     /// Total number of tool executions.
     pub tool_calls: usize,
-    /// Sum of token usage across provider turns.
+    /// Sum of reported token usage across provider turns.
+    ///
+    /// Always the sum of the parts that were reported: turns whose provider
+    /// did not return usage contribute nothing. Only exact when
+    /// [`usage_omitted`](Self::usage_omitted) is `false`; otherwise it is a
+    /// lower bound.
     pub usage: Usage,
+    /// `true` = at least one provider turn did not report usage (the endpoint
+    /// omitted it), so [`usage`](Self::usage) is a lower bound rather than
+    /// the run's exact usage.
+    pub usage_omitted: bool,
     /// Final direct-answer provider finish reason, when available.
     pub finish_reason: Option<FinishReason>,
     /// Wall-clock run latency.

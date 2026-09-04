@@ -275,6 +275,7 @@ fn run_summary_payload(summary: &RunSummary) -> serde_json::Value {
         "usage.prompt_tokens": summary.usage.prompt_tokens,
         "usage.completion_tokens": summary.usage.completion_tokens,
         "usage.total_tokens": summary.usage.total_tokens,
+        "usage.omitted": summary.usage_omitted,
         "finish.reason": summary.finish_reason.as_ref().map(|reason| format!("{reason:?}")),
         "latency_ms": summary.latency.as_millis() as u64,
         "provider.model": summary.provider_model,

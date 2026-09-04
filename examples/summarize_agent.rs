@@ -151,13 +151,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     println!("  → {name}(#{id}) returned: {content}");
                 }
                 MessageChunk::Done(summary) => {
-                    println!(
-                        "\n  — run summary: rounds={} tool_calls={} usage={}/{} tokens",
-                        summary.rounds,
-                        summary.tool_calls,
-                        summary.usage.prompt_tokens,
-                        summary.usage.completion_tokens,
-                    );
+                    if summary.usage_omitted {
+                        println!(
+                            "\n  — run summary: rounds={} tool_calls={} \
+                             usage={}/{} tokens (partial, some rounds did not report)",
+                            summary.rounds,
+                            summary.tool_calls,
+                            summary.usage.prompt_tokens,
+                            summary.usage.completion_tokens,
+                        );
+                    } else {
+                        println!(
+                            "\n  — run summary: rounds={} tool_calls={} usage={}/{} tokens",
+                            summary.rounds,
+                            summary.tool_calls,
+                            summary.usage.prompt_tokens,
+                            summary.usage.completion_tokens,
+                        );
+                    }
                     break;
                 }
                 MessageChunk::Cancelled => {
