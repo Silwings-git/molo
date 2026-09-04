@@ -17,7 +17,7 @@ jobs:
       matrix:
         rust: ["1.88.0", stable] # MSRV + latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: "${{ matrix.rust }}"
@@ -37,7 +37,7 @@ jobs:
   audit: # dependency vulnerabilities / licenses
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
       - uses: cargo-bins/cargo-binstall@main
       - run: cargo binstall -y cargo-audit cargo-deny
@@ -47,7 +47,7 @@ jobs:
   package: # self-check the publish artifacts
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo package -p molo-core
@@ -72,7 +72,7 @@ jobs:
       contents: read
     environment: crates-io # CARGO_REGISTRY_TOKEN configured in Secrets
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
       - run: cargo publish -p molo-core
       - run: cargo publish -p molo-macros

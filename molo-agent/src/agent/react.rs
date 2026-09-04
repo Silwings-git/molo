@@ -5547,8 +5547,10 @@ mod tests {
 
         /// Collecting subscriber: gathers span creation, enter/exit, and field
         /// records into Vecs for the tests to assert hierarchy and fields.
-        /// tokio::test defaults to current_thread, so event order is
-        /// deterministic.
+        /// The tracing tests below force a current-thread runtime because the
+        /// collecting subscriber is installed with a thread-local dispatch
+        /// guard. A multi-thread runtime can resume the test future on a worker
+        /// that does not have that guard.
         #[derive(Debug, Default)]
         struct CollectSubscriber {
             spans: std::sync::Mutex<Vec<SpanInfo>>,
@@ -5694,7 +5696,7 @@ mod tests {
         /// levels, grouped by the round attribute); hierarchy invariants hold
         /// (no orphans, no double enters); llm_request records usage at wrap-up
         /// (dual channel); run.id is consistent across the tree.
-        #[tokio::test]
+        #[tokio::test(flavor = "current_thread")]
         async fn trace_span_tree_non_stream() {
             let sub = Arc::new(CollectSubscriber::default());
             let _guard = collect_guard(&sub);
@@ -5800,7 +5802,7 @@ mod tests {
         /// Streaming path: the same span structure; the run span enters on
         /// every poll (covering the whole consumption period); usage is
         /// recorded at wrap-up when the Done event arrives.
-        #[tokio::test]
+        #[tokio::test(flavor = "current_thread")]
         async fn trace_span_tree_stream() {
             let sub = Arc::new(CollectSubscriber::default());
             let _guard = collect_guard(&sub);
@@ -5862,7 +5864,7 @@ mod tests {
         /// Two runs: run.id differs (per-instance increment); the event stream's
         /// RunStarted carries the same id — the correlation key between trace
         /// and the event stream.
-        #[tokio::test]
+        #[tokio::test(flavor = "current_thread")]
         async fn trace_run_id_differs_between_runs() {
             let sub = Arc::new(CollectSubscriber::default());
             let _guard = collect_guard(&sub);
@@ -5904,7 +5906,7 @@ mod tests {
 
         /// Run failure: the agent.run span records an error at wrap-up
         /// (observability spots the failed run at a glance).
-        #[tokio::test]
+        #[tokio::test(flavor = "current_thread")]
         async fn trace_run_error_recorded() {
             let sub = Arc::new(CollectSubscriber::default());
             let _guard = collect_guard(&sub);
@@ -5949,7 +5951,7 @@ mod tests {
 
         /// Tool failure: the tool span records an error (the failure is fed
         /// back as text; the run ends normally, agent.run has no error).
-        #[tokio::test]
+        #[tokio::test(flavor = "current_thread")]
         async fn trace_tool_error_recorded() {
             struct FailingTool;
             #[async_trait::async_trait]
@@ -5993,7 +5995,7 @@ mod tests {
         /// Provider failure (non-streaming): the llm_request span records the
         /// error — observability can pinpoint which call of which round failed;
         /// the run span records too (the whole run failed).
-        #[tokio::test]
+        #[tokio::test(flavor = "current_thread")]
         async fn trace_llm_error_recorded() {
             let sub = Arc::new(CollectSubscriber::default());
             let _guard = collect_guard(&sub);
@@ -6025,7 +6027,7 @@ mod tests {
         /// Provider failure mid-stream (streaming): the consumption loop's Err
         /// event records the error on the llm_request span, and the run span
         /// records in sync; hierarchy invariants still hold.
-        #[tokio::test]
+        #[tokio::test(flavor = "current_thread")]
         async fn trace_stream_llm_error_recorded() {
             struct FailInStream;
             #[async_trait::async_trait]

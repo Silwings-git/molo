@@ -9,3 +9,6 @@
 
 # Nested internal docs repository; tracked and committed independently.
 /docs/internal/
+
+# Local CI run logs and artifacts
+/.ci-logs/
