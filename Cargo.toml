@@ -16,7 +16,7 @@ resolver = "2"
 
 [package]
 name = "molo"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2024"
 rust-version = "1.88"
 description = "An embeddable Rust agent runtime and harness framework for building safe, extensible tool-calling agents"
@@ -40,14 +40,14 @@ exclude = [
 
 [dependencies]
 # The path is stripped at publish time; the version is what crates.io resolves
-molo-core = { path = "molo-core", version = "0.3.0" }
-molo-agent = { path = "molo-agent", version = "0.3.0", default-features = false }
-molo-harness = { path = "molo-harness", version = "0.3.0", optional = true }
-molo-coding = { path = "molo-coding", version = "0.3.0", optional = true }
-molo-mcp = { path = "molo-mcp", version = "0.3.0", default-features = false, optional = true }
-molo-skills = { path = "molo-skills", version = "0.3.0", optional = true }
-molo-openai = { path = "molo-openai", version = "0.3.0", optional = true }
-molo-macros = { path = "molo-macros", version = "0.3.0", optional = true }
+molo-core = { path = "molo-core", version = "0.4.0" }
+molo-agent = { path = "molo-agent", version = "0.4.0", default-features = false }
+molo-harness = { path = "molo-harness", version = "0.4.0", optional = true }
+molo-coding = { path = "molo-coding", version = "0.4.0", optional = true }
+molo-mcp = { path = "molo-mcp", version = "0.4.0", default-features = false, optional = true }
+molo-skills = { path = "molo-skills", version = "0.4.0", optional = true }
+molo-openai = { path = "molo-openai", version = "0.4.0", optional = true }
+molo-macros = { path = "molo-macros", version = "0.4.0", optional = true }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 

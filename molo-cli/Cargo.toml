@@ -17,7 +17,7 @@ doc = false
 [dependencies]
 async-trait = "0.1"
 futures = "0.3"
-molo = { path = "..", version = "0.3.0", features = [
+molo = { path = "..", version = "0.4.0", features = [
     "openai",
     "harness",
     "coding",
