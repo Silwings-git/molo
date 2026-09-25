@@ -61,7 +61,7 @@ shape in one call.
 
 ```toml
 [dependencies]
-molo = "0.3"
+molo = "0.5"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 ```
 
@@ -69,14 +69,14 @@ The default feature set is intentionally small. Enable optional capabilities
 when you use them:
 
 ```toml
-molo = { version = "0.3", features = ["openai"] }      # OpenAiProvider
-molo = { version = "0.3", features = ["macros"] }      # #[molo::tool]
-molo = { version = "0.3", features = ["structured"] }  # TypedAgent / validation
-molo = { version = "0.3", features = ["harness"] }     # HarnessRuntime
-molo = { version = "0.3", features = ["coding"] }      # workspace/command/git SDK
-molo = { version = "0.3", features = ["mcp"] }         # MCP adapter
-molo = { version = "0.3", features = ["skills"] }      # Agent Skills
-molo = { version = "0.3", features = ["full"] }        # all optional features
+molo = { version = "0.5", features = ["openai"] }      # OpenAiProvider
+molo = { version = "0.5", features = ["macros"] }      # #[molo::tool]
+molo = { version = "0.5", features = ["structured"] }  # TypedAgent / validation
+molo = { version = "0.5", features = ["harness"] }     # HarnessRuntime
+molo = { version = "0.5", features = ["coding"] }      # workspace/command/git SDK
+molo = { version = "0.5", features = ["mcp"] }         # MCP adapter
+molo = { version = "0.5", features = ["skills"] }      # Agent Skills
+molo = { version = "0.5", features = ["full"] }        # all optional features
 ```
 
 ### Self-test without an API

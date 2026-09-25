@@ -52,21 +52,21 @@ facade 获得简单的 `molo::...` 导入路径，也可以直接依赖 focused 
 
 ```toml
 [dependencies]
-molo = "0.3"
+molo = "0.5"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 ```
 
 默认 feature set 保持精简。按需开启可选能力：
 
 ```toml
-molo = { version = "0.3", features = ["openai"] }      # OpenAiProvider
-molo = { version = "0.3", features = ["macros"] }      # #[molo::tool]
-molo = { version = "0.3", features = ["structured"] }  # TypedAgent / validation
-molo = { version = "0.3", features = ["harness"] }     # HarnessRuntime
-molo = { version = "0.3", features = ["coding"] }      # workspace/command/git SDK
-molo = { version = "0.3", features = ["mcp"] }         # MCP adapter
-molo = { version = "0.3", features = ["skills"] }      # Agent Skills
-molo = { version = "0.3", features = ["full"] }        # 全部可选能力
+molo = { version = "0.5", features = ["openai"] }      # OpenAiProvider
+molo = { version = "0.5", features = ["macros"] }      # #[molo::tool]
+molo = { version = "0.5", features = ["structured"] }  # TypedAgent / validation
+molo = { version = "0.5", features = ["harness"] }     # HarnessRuntime
+molo = { version = "0.5", features = ["coding"] }      # workspace/command/git SDK
+molo = { version = "0.5", features = ["mcp"] }         # MCP adapter
+molo = { version = "0.5", features = ["skills"] }      # Agent Skills
+molo = { version = "0.5", features = ["full"] }        # 全部可选能力
 ```
 
 ### 不需要 API 的自测
