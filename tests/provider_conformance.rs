@@ -320,7 +320,7 @@ mod openai_compatible {
 
     #[tokio::test]
     async fn openai_non_streaming_text_usage_finish_reason_and_structured_mapping() {
-        let body = r#"{"choices":[{"message":{"role":"assistant","content":"{\"ok\":true}","reasoning_content":"because","tool_calls":null},"finish_reason":"stop"}],"usage":{"prompt_tokens":3,"completion_tokens":4,"total_tokens":7}}"#;
+        let body = r#"{"choices":[{"message":{"role":"assistant","content":"{\"ok\":true}","reasoning_content":"because","tool_calls":null},"finish_reason":"stop"}],"usage":{"prompt_tokens":3,"completion_tokens":4,"total_tokens":7,"prompt_tokens_details":{"cached_tokens":2}}}"#;
         let (base_url, server) = serve_once(json_response(body)).await;
         let provider = OpenAiProvider::new(base_url, "sk-test-secret", "mock-model")
             .with_structured_output_mode(StructuredOutputMode::Native);
@@ -343,7 +343,9 @@ mod openai_compatible {
             .unwrap();
 
         assert_eq!(response.finish_reason, FinishReason::Stop);
-        assert_eq!(response.usage, Some(Usage::new(3, 4)));
+        // The prompt-cache breakdown reaches the caller as a reported value
+        // (not flattened into the totals).
+        assert_eq!(response.usage, Some(Usage::new(3, 4).with_cached_tokens(2)));
         assert_eq!(
             response.message,
             Message::assistant_with_reasoning(r#"{"ok":true}"#, "because")
@@ -487,7 +489,7 @@ mod openai_compatible {
     async fn openai_streaming_text_usage_and_malformed_stream_mapping() {
         let stream_body = concat!(
             "data: {\"choices\":[{\"delta\":{\"content\":\"hel\"},\"finish_reason\":null}]}\n\n",
-            "data: {\"choices\":[{\"delta\":{\"content\":\"lo\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":2,\"total_tokens\":3}}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"lo\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":2,\"total_tokens\":3,\"prompt_tokens_details\":{\"cached_tokens\":1}}}\n\n",
             "data: [DONE]\n\n",
         );
         let (base_url, _server) = serve_once(response(
@@ -508,7 +510,13 @@ mod openai_compatible {
             }
         }
         assert_eq!(text, "hello");
-        assert_eq!(done, Some((FinishReason::Stop, Some(Usage::new(1, 2)))));
+        assert_eq!(
+            done,
+            Some((
+                FinishReason::Stop,
+                Some(Usage::new(1, 2).with_cached_tokens(1))
+            ))
+        );
 
         let (base_url, _server) = serve_once(response(
             "200 OK",

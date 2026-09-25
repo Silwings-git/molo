@@ -5,7 +5,8 @@
 //! [`OpenAiProvider`](molo::provider::OpenAiProvider) and **prints this run's
 //! execution summary at the end of every turn**
 //! ([`RunSummary`](molo::RunSummary)): chat rounds, tool executions, and token
-//! usage (prompt / completion / total).
+//! usage (prompt / completion / total), plus the prompt-cache hit count when
+//! the endpoint reports one.
 //!
 //! The usage data path: non-streaming responses carry usage natively; streaming
 //! enables it via `stream_options.include_usage`, with the final chunk carrying
@@ -156,6 +157,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             summary.usage.completion_tokens,
                             summary.usage.total_tokens,
                         );
+                    }
+                    // Prompt cache: the subset of the prompt served from the
+                    // provider's cache. Only prompt-caching endpoints report
+                    // it, and a run can mix reporting and non-reporting
+                    // rounds — the count is exact only when cache_omitted is
+                    // false.
+                    match summary.usage.cached_tokens {
+                        Some(cached) if !summary.cache_omitted => println!(
+                            "prompt cache: {cached} tokens hit ({}% of the prompt)",
+                            u64::from(cached) * 100 / u64::from(summary.usage.prompt_tokens.max(1))
+                        ),
+                        Some(cached) => println!(
+                            "prompt cache: at least {cached} tokens hit \
+                             (some rounds did not report a breakdown)",
+                        ),
+                        None => println!("prompt cache: not reported by this endpoint"),
                     }
                     break;
                 }

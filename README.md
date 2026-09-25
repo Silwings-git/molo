@@ -141,6 +141,10 @@ let output = agent
 
 println!("{}", output.answer);
 println!("{} tokens", output.summary.usage.total_tokens);
+// Prompt-cache hits, when the endpoint reports them (`None` = not reported).
+if let Some(cached) = output.summary.usage.cached_tokens {
+    println!("{cached} tokens served from the prompt cache");
+}
 ```
 
 Typed output uses the same structured path via `run_typed_request`, returning

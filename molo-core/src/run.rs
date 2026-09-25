@@ -306,12 +306,20 @@ pub struct RunSummary {
     /// Always the sum of the parts that were reported: turns whose provider
     /// did not return usage contribute nothing. Only exact when
     /// [`usage_omitted`](Self::usage_omitted) is `false`; otherwise it is a
-    /// lower bound.
+    /// lower bound. The cached-token part has its own, finer-grained latch in
+    /// [`cache_omitted`](Self::cache_omitted).
     pub usage: Usage,
     /// `true` = at least one provider turn did not report usage (the endpoint
     /// omitted it), so [`usage`](Self::usage) is a lower bound rather than
     /// the run's exact usage.
     pub usage_omitted: bool,
+    /// `true` = at least one provider turn did not report the prompt-cache
+    /// breakdown, so `usage.cached_tokens` is a lower bound: it is the sum of
+    /// the turns that did report one (`None` when no turn did).
+    ///
+    /// Implied by [`usage_omitted`](Self::usage_omitted) — a turn that
+    /// reported no usage at all reported no cache breakdown either.
+    pub cache_omitted: bool,
     /// Final direct-answer provider finish reason, when available.
     pub finish_reason: Option<FinishReason>,
     /// Wall-clock run latency.

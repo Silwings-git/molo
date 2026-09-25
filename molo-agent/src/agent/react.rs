@@ -756,10 +756,13 @@ impl ReActAgent {
                     {
                         llm_span.record("usage.prompt_tokens", usage.prompt_tokens);
                         llm_span.record("usage.completion_tokens", usage.completion_tokens);
+                        if let Some(cached) = usage.cached_tokens {
+                            llm_span.record("usage.cached_tokens", cached);
+                        }
                     }
-                    counters.usage_total += usage;
+                    counters.usage.record(usage);
                 } else {
-                    counters.usage_omitted = true;
+                    counters.usage.omit();
                 }
                 let finish_reason = response.finish_reason.clone();
 
@@ -1318,11 +1321,42 @@ struct RunCounters {
     rounds: usize,
     /// Total number of tool executions.
     tool_calls_total: usize,
-    /// Sum of token usage across rounds (reported parts only).
-    usage_total: Usage,
-    /// `true` = at least one round's provider did not report usage, so
-    /// [`usage_total`](Self::usage_total) is a lower bound.
-    usage_omitted: bool,
+    /// Token usage across rounds (reported parts only).
+    usage: UsageTotals,
+}
+
+/// Accumulated token usage across rounds plus the latches that say whether
+/// the sums are exact; shared by the non-streaming path (held in
+/// [`RunCounters`]) and the streaming path (held in generator locals, same
+/// semantics).
+#[derive(Default, Clone, Copy)]
+struct UsageTotals {
+    /// Sum of the reported parts; turns that reported nothing contribute
+    /// nothing.
+    total: Usage,
+    /// `true` = at least one round did not report usage at all, so
+    /// [`total`](Self::total) is a lower bound.
+    omitted: bool,
+    /// `true` = at least one round reported usage without the prompt-cache
+    /// breakdown, so the cached part of [`total`](Self::total) is a lower
+    /// bound. A round that omitted usage entirely omitted the breakdown too
+    /// (OR'd in at summary build).
+    cache_omitted: bool,
+}
+
+impl UsageTotals {
+    /// Accumulates one round's reported usage; a missing prompt-cache
+    /// breakdown latches [`cache_omitted`](Self::cache_omitted).
+    fn record(&mut self, usage: Usage) {
+        self.total += usage;
+        self.cache_omitted |= usage.cached_tokens.is_none();
+    }
+
+    /// Marks a counted round that contributed no usage at all (provider
+    /// error, cancellation, or an endpoint that reported nothing).
+    fn omit(&mut self) {
+        self.omitted = true;
+    }
 }
 
 struct FinalAnswer {
@@ -1520,9 +1554,9 @@ impl ReActAgent {
 
         let response = observation.response;
         if let Some(usage) = response.usage {
-            state.counters.usage_total += usage;
+            state.counters.usage.record(usage);
         } else {
-            state.counters.usage_omitted = true;
+            state.counters.usage.omit();
         }
         let finish_reason = response.finish_reason.clone();
         let Message::Assistant {
@@ -1929,6 +1963,7 @@ fn span_llm(run_id: &str, round: usize) -> TraceSpan {
             round = round,
             usage.prompt_tokens = tracing::field::Empty,
             usage.completion_tokens = tracing::field::Empty,
+            usage.cached_tokens = tracing::field::Empty,
             error = tracing::field::Empty,
         )
     }
@@ -2017,8 +2052,7 @@ fn run_summary(
     run_summary_from_parts(
         counters.rounds,
         counters.tool_calls_total,
-        counters.usage_total,
-        counters.usage_omitted,
+        counters.usage,
         finish_reason,
         started_at,
         provider_model,
@@ -2028,8 +2062,7 @@ fn run_summary(
 fn run_summary_from_parts(
     rounds: usize,
     tool_calls: usize,
-    usage: Usage,
-    usage_omitted: bool,
+    usage: UsageTotals,
     finish_reason: Option<FinishReason>,
     started_at: Instant,
     provider_model: Option<String>,
@@ -2037,8 +2070,12 @@ fn run_summary_from_parts(
     RunSummary {
         rounds,
         tool_calls,
-        usage,
-        usage_omitted,
+        usage: usage.total,
+        usage_omitted: usage.omitted,
+        // A round that reported no usage reported no cache breakdown either,
+        // so the coarser latch implies the finer one (record only latches
+        // rounds that reported usage without a breakdown).
+        cache_omitted: usage.cache_omitted || usage.omitted,
         finish_reason,
         latency: started_at.elapsed(),
         provider_model,
@@ -2262,8 +2299,7 @@ impl ReActAgent {
             // provider omitted usage are tracked so the sum is not misread
             // as exact.
             let mut tool_calls_total = 0usize;
-            let mut usage_total = Usage::default();
-            let mut usage_omitted = false;
+            let mut usage_totals = UsageTotals::default();
             // Structured validator: built when this run has a hand-written
             // schema from the request or config; the retry budget lives in
             // the component.
@@ -2288,8 +2324,7 @@ impl ReActAgent {
                     let summary = run_summary_from_parts(
                         rounds,
                         tool_calls_total,
-                        usage_total,
-                        usage_omitted,
+                        usage_totals,
                         None,
                         started_at,
                         provider_model.clone(),
@@ -2311,12 +2346,11 @@ impl ReActAgent {
                 if let Err(e) = check_run_context(&context) {
                     // This counted round got no provider usage: the sum is a
                     // lower bound from here on.
-                    usage_omitted = true;
+                    usage_totals.omit();
                     let summary = run_summary_from_parts(
                         rounds,
                         tool_calls_total,
-                        usage_total,
-                        usage_omitted,
+                        usage_totals,
                         None,
                         started_at,
                         provider_model.clone(),
@@ -2333,12 +2367,11 @@ impl ReActAgent {
                     Err(e) => {
                         // This counted round got no provider usage: the sum
                         // is a lower bound from here on.
-                        usage_omitted = true;
+                        usage_totals.omit();
                         let summary = run_summary_from_parts(
                             rounds,
                             tool_calls_total,
-                            usage_total,
-                            usage_omitted,
+                            usage_totals,
                             None,
                             started_at,
                             provider_model.clone(),
@@ -2381,12 +2414,11 @@ impl ReActAgent {
                         llm_span.record("error", e.to_string());
                         // This counted round got no provider usage: the sum
                         // is a lower bound from here on.
-                        usage_omitted = true;
+                        usage_totals.omit();
                         let summary = run_summary_from_parts(
                             rounds,
                             tool_calls_total,
-                            usage_total,
-                            usage_omitted,
+                            usage_totals,
                             None,
                             started_at,
                             provider_model.clone(),
@@ -2398,12 +2430,11 @@ impl ReActAgent {
                     Err(e) => {
                         // This counted round got no provider usage: the sum
                         // is a lower bound from here on.
-                        usage_omitted = true;
+                        usage_totals.omit();
                         let summary = run_summary_from_parts(
                             rounds,
                             tool_calls_total,
-                            usage_total,
-                            usage_omitted,
+                            usage_totals,
                             None,
                             started_at,
                             provider_model.clone(),
@@ -2448,12 +2479,11 @@ impl ReActAgent {
                         Err(e) => {
                             // The round was aborted before its Done: its
                             // usage is unknown, the sum is a lower bound.
-                            usage_omitted = true;
+                            usage_totals.omit();
                             let summary = run_summary_from_parts(
                                 rounds,
                                 tool_calls_total,
-                                usage_total,
-                                usage_omitted,
+                                usage_totals,
                                 None,
                                 started_at,
                                 provider_model.clone(),
@@ -2476,12 +2506,11 @@ impl ReActAgent {
                                 // The round was aborted before its Done:
                                 // its usage is unknown, the sum is a lower
                                 // bound.
-                                usage_omitted = true;
+                                usage_totals.omit();
                                 let summary = run_summary_from_parts(
                                     rounds,
                                     tool_calls_total,
-                                    usage_total,
-                                    usage_omitted,
+                                    usage_totals,
                                     None,
                                     started_at,
                                     provider_model.clone(),
@@ -2503,12 +2532,11 @@ impl ReActAgent {
                                 // The round was aborted before its Done:
                                 // its usage is unknown, the sum is a lower
                                 // bound.
-                                usage_omitted = true;
+                                usage_totals.omit();
                                 let summary = run_summary_from_parts(
                                     rounds,
                                     tool_calls_total,
-                                    usage_total,
-                                    usage_omitted,
+                                    usage_totals,
                                     None,
                                     started_at,
                                     provider_model.clone(),
@@ -2543,11 +2571,14 @@ impl ReActAgent {
                                 {
                                 llm_span.record("usage.prompt_tokens", usage.prompt_tokens);
                                 llm_span.record("usage.completion_tokens", usage.completion_tokens);
+                                if let Some(cached) = usage.cached_tokens {
+                                llm_span.record("usage.cached_tokens", cached);
                                 }
-                                usage_total += usage;
+                                }
+                                usage_totals.record(usage);
                                 round_usage_reported = true;
                             } else {
-                                usage_omitted = true;
+                                usage_totals.omit();
                             }
                             round_finish_reason = Some(reason);
                             // Done = this round is complete: move to
@@ -2567,12 +2598,11 @@ impl ReActAgent {
                             llm_span.record("error", e.to_string());
                             // The round was aborted before its Done: its
                             // usage is unknown, the sum is a lower bound.
-                            usage_omitted = true;
+                            usage_totals.omit();
                             let summary = run_summary_from_parts(
                                 rounds,
                                 tool_calls_total,
-                                usage_total,
-                                usage_omitted,
+                                usage_totals,
                                 None,
                                 started_at,
                                 provider_model.clone(),
@@ -2588,7 +2618,9 @@ impl ReActAgent {
                 // Round ended without reported usage (stream ended without
                 // Done, or Done carried None): the accumulated sum is a
                 // lower bound from here on.
-                usage_omitted |= !round_usage_reported;
+                if !round_usage_reported {
+                    usage_totals.omit();
+                }
 
                 // Empty Assistant messages are not recorded (consistent
                 // with run).
@@ -2604,8 +2636,7 @@ impl ReActAgent {
                             let summary = run_summary_from_parts(
                                 rounds,
                                 tool_calls_total,
-                                usage_total,
-                                usage_omitted,
+                                usage_totals,
                                 None,
                                 started_at,
                                 provider_model.clone(),
@@ -2639,8 +2670,7 @@ impl ReActAgent {
                                             let summary = run_summary_from_parts(
                                                 rounds,
                                                 tool_calls_total,
-                                                usage_total,
-                                                usage_omitted,
+                                                usage_totals,
                                                 None,
                                                 started_at,
                                                 provider_model.clone(),
@@ -2655,8 +2685,7 @@ impl ReActAgent {
                                     let summary = run_summary_from_parts(
                                         rounds,
                                         tool_calls_total,
-                                        usage_total,
-                                        usage_omitted,
+                                        usage_totals,
                                         None,
                                         started_at,
                                         provider_model.clone(),
@@ -2673,8 +2702,7 @@ impl ReActAgent {
                     let summary = run_summary_from_parts(
                         rounds,
                         tool_calls_total,
-                        usage_total,
-                        usage_omitted,
+                        usage_totals,
                         round_finish_reason,
                         started_at,
                         provider_model.clone(),
@@ -2703,8 +2731,7 @@ impl ReActAgent {
                         let summary = run_summary_from_parts(
                             rounds,
                             tool_calls_total,
-                            usage_total,
-                            usage_omitted,
+                            usage_totals,
                             None,
                             started_at,
                             provider_model.clone(),
@@ -2733,8 +2760,7 @@ impl ReActAgent {
                         let summary = run_summary_from_parts(
                             rounds,
                             tool_calls_total,
-                            usage_total,
-                            usage_omitted,
+                            usage_totals,
                             None,
                             started_at,
                             provider_model.clone(),
@@ -3068,6 +3094,44 @@ mod tests {
         assert_eq!(output.summary.usage, Usage::new(5, 2));
         assert_eq!(output.summary.finish_reason, Some(FinishReason::Stop));
         assert_eq!(output.summary.provider_model, None);
+    }
+
+    /// A reported prompt-cache breakdown lands in the summary as an exact
+    /// value (`cache_omitted` stays false).
+    #[tokio::test]
+    async fn run_request_carries_reported_cache_breakdown() {
+        let fake = SharedFake::new([FakeReply::text_with_usage(
+            "Hello",
+            Usage::new(5, 2).with_cached_tokens(4),
+        )]);
+        let mut agent = agent(fake.clone(), "");
+        let output = agent
+            .run_request_with_context(RunRequest::text("hi"), RunContext::new("r1"))
+            .await
+            .unwrap();
+
+        assert_eq!(output.summary.usage.cached_tokens, Some(4));
+        assert!(!output.summary.usage_omitted);
+        assert!(!output.summary.cache_omitted);
+    }
+
+    /// A round that reports usage without the prompt-cache breakdown latches
+    /// `cache_omitted` (the cached part of the sum is a lower bound) even
+    /// though the usage totals themselves are exact.
+    #[tokio::test]
+    async fn run_request_tracks_omitted_cache_breakdown() {
+        let fake = SharedFake::new([FakeReply::text_with_usage("Hello", Usage::new(5, 2))]);
+        let mut agent = agent(fake.clone(), "");
+        let output = agent
+            .run_request_with_context(RunRequest::text("hi"), RunContext::new("r1"))
+            .await
+            .unwrap();
+
+        // The totals are exact (usage was reported), the cached part is not:
+        // `None` — no round reported one — with the latch set.
+        assert_eq!(output.summary.usage.cached_tokens, None);
+        assert!(!output.summary.usage_omitted);
+        assert!(output.summary.cache_omitted);
     }
 
     #[tokio::test]
@@ -3972,6 +4036,62 @@ mod tests {
         let events: Vec<MessageChunk> = stream.by_ref().map(|e| e.unwrap()).collect().await;
 
         assert_done_summary(events.last().unwrap(), 2, 1, Usage::new(20, 5), true);
+    }
+
+    /// The streaming summary sums the reported prompt-cache counts across
+    /// rounds (only the reported parts) and latches `cache_omitted` when a
+    /// round reported usage without the breakdown.
+    #[tokio::test]
+    async fn stream_done_summary_accumulates_cache_counts() {
+        let (calc, _calls) = FakeTool::new("calc", "42");
+        let mut registry = ToolRegistry::new();
+        registry.register(calc);
+        // Round 1 (tool round) reports a cache breakdown, round 2 (direct
+        // answer) reports usage without one: the cached sum keeps the
+        // reported part and the omission is latched.
+        let fake = SharedFake::new([
+            FakeReply::WithUsage {
+                reply: Box::new(FakeReply::ToolCalls {
+                    content: "".into(),
+                    calls: vec![call("c1", "calc", "{}")],
+                }),
+                usage: Usage::new(10, 2).with_cached_tokens(4),
+            },
+            FakeReply::text_with_usage("42", Usage::new(20, 5)),
+        ]);
+        let mut agent = agent_with_registry(fake.clone(), registry, AgentConfig::default());
+
+        let mut stream = agent.run_stream("Compute").await.unwrap();
+        let events: Vec<MessageChunk> = stream.by_ref().map(|e| e.unwrap()).collect().await;
+
+        let summary = done_summary(events.last().unwrap()).expect("expected Done chunk");
+        assert_eq!(summary.usage, Usage::new(30, 7).with_cached_tokens(4));
+        assert!(!summary.usage_omitted);
+        assert!(summary.cache_omitted);
+
+        // Every round reports a breakdown: the cached sum is exact.
+        let (calc, _calls) = FakeTool::new("calc", "42");
+        let mut registry = ToolRegistry::new();
+        registry.register(calc);
+        let fake = SharedFake::new([
+            FakeReply::WithUsage {
+                reply: Box::new(FakeReply::ToolCalls {
+                    content: "".into(),
+                    calls: vec![call("c1", "calc", "{}")],
+                }),
+                usage: Usage::new(10, 2).with_cached_tokens(4),
+            },
+            FakeReply::text_with_usage("42", Usage::new(20, 5).with_cached_tokens(6)),
+        ]);
+        let mut agent = agent_with_registry(fake.clone(), registry, AgentConfig::default());
+
+        let mut stream = agent.run_stream("Compute").await.unwrap();
+        let events: Vec<MessageChunk> = stream.by_ref().map(|e| e.unwrap()).collect().await;
+
+        let summary = done_summary(events.last().unwrap()).expect("expected Done chunk");
+        assert_eq!(summary.usage, Usage::new(30, 7).with_cached_tokens(10));
+        assert!(!summary.usage_omitted);
+        assert!(!summary.cache_omitted);
     }
 
     /// run and run_stream with the same script share semantics: identical

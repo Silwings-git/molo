@@ -130,6 +130,10 @@ let output = agent
 
 println!("{}", output.answer);
 println!("{} tokens", output.summary.usage.total_tokens);
+// 命中 prompt cache 的 token 数（端点上报告时才有值，None = 未报告）。
+if let Some(cached) = output.summary.usage.cached_tokens {
+    println!("{cached} tokens served from the prompt cache");
+}
 ```
 
 Typed output 走同样的结构化路径：`run_typed_request` 同时返回反序列化后的值和原始

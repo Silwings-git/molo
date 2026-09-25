@@ -1004,11 +1004,22 @@ impl ToolCallAggregator {
 }
 
 /// Maps the vendor's wire usage to [`Usage`](crate::provider::Usage).
+///
+/// The cache count prefers the nested `prompt_tokens_details.cached_tokens`
+/// (the OpenAI / DeepSeek shape) and falls back to the flat
+/// `prompt_cache_hit_tokens` (endpoints sending only DeepSeek's older flat
+/// form); when neither is present the breakdown is reported as absent rather
+/// than as zero.
 fn map_usage(wire: OpenAiUsage) -> Usage {
+    let cached_tokens = wire
+        .prompt_tokens_details
+        .and_then(|details| details.cached_tokens)
+        .or(wire.prompt_cache_hit_tokens);
     Usage {
         prompt_tokens: wire.prompt_tokens,
         completion_tokens: wire.completion_tokens,
         total_tokens: wire.total_tokens,
+        cached_tokens,
     }
 }
 
@@ -1453,6 +1464,25 @@ struct OpenAiUsage {
     prompt_tokens: u32,
     completion_tokens: u32,
     total_tokens: u32,
+    /// Prompt breakdown; absent on endpoints that do not report one (kept
+    /// optional so "not reported" stays distinguishable from a reported
+    /// zero, matching the enclosing usage semantics).
+    #[serde(default)]
+    prompt_tokens_details: Option<OpenAiPromptTokensDetails>,
+    /// DeepSeek's flat cache-hit count; compatible endpoints that predate the
+    /// nested breakdown only send this form.
+    #[serde(default)]
+    prompt_cache_hit_tokens: Option<u32>,
+}
+
+/// The wire prompt breakdown (OpenAI `usage.prompt_tokens_details`; DeepSeek
+/// documents its `cached_tokens` as the same value as
+/// `prompt_cache_hit_tokens`).
+#[derive(serde::Deserialize)]
+struct OpenAiPromptTokensDetails {
+    /// Prompt tokens served from the prompt cache.
+    #[serde(default)]
+    cached_tokens: Option<u32>,
 }
 
 /// The wire response format for OpenAI-compatible APIs (only the needed
@@ -2087,6 +2117,67 @@ mod tests {
         assert_eq!(response.message, Message::assistant("hi!"));
         assert_eq!(response.finish_reason, FinishReason::Stop);
         assert_eq!(response.usage, Some(Usage::new(5, 3)));
+    }
+
+    #[test]
+    fn parses_prompt_cache_breakdown() {
+        // OpenAI / DeepSeek shape: usage.prompt_tokens_details.cached_tokens.
+        let body = r#"{"choices":[{"message":{"role":"assistant","content":"hi!"},"finish_reason":"stop"}],"usage":{"prompt_tokens":5,"completion_tokens":3,"total_tokens":8,"prompt_tokens_details":{"cached_tokens":4}}}"#;
+        let response = parse_response(body).unwrap();
+        assert_eq!(response.usage, Some(Usage::new(5, 3).with_cached_tokens(4)));
+    }
+
+    #[test]
+    fn parses_deepseek_flat_cache_hit_tokens() {
+        // Endpoints that only send DeepSeek's flat pair: the hit count is
+        // taken from the fallback field.
+        let body = r#"{"choices":[{"message":{"role":"assistant","content":"hi!"},"finish_reason":"stop"}],"usage":{"prompt_tokens":5,"completion_tokens":3,"total_tokens":8,"prompt_cache_hit_tokens":4,"prompt_cache_miss_tokens":1}}"#;
+        let response = parse_response(body).unwrap();
+        assert_eq!(response.usage, Some(Usage::new(5, 3).with_cached_tokens(4)));
+    }
+
+    #[test]
+    fn reported_cache_breakdown_takes_precedence_over_flat_fallback() {
+        // DeepSeek sends both; they agree, but the nested breakdown is the
+        // documented one and wins by construction.
+        let body = r#"{"choices":[{"message":{"role":"assistant","content":"hi!"},"finish_reason":"stop"}],"usage":{"prompt_tokens":5,"completion_tokens":3,"total_tokens":8,"prompt_tokens_details":{"cached_tokens":4},"prompt_cache_hit_tokens":9}}"#;
+        let response = parse_response(body).unwrap();
+        assert_eq!(response.usage, Some(Usage::new(5, 3).with_cached_tokens(4)));
+    }
+
+    #[test]
+    fn missing_cache_breakdown_stays_unreported() {
+        // No cache fields at all: "not reported" (None), not a reported zero.
+        let body = r#"{"choices":[{"message":{"role":"assistant","content":"hi!"},"finish_reason":"stop"}],"usage":{"prompt_tokens":5,"completion_tokens":3,"total_tokens":8}}"#;
+        let response = parse_response(body).unwrap();
+        assert_eq!(response.usage.unwrap().cached_tokens, None);
+
+        // Reported zero is preserved as such.
+        let body = r#"{"choices":[{"message":{"role":"assistant","content":"hi!"},"finish_reason":"stop"}],"usage":{"prompt_tokens":5,"completion_tokens":3,"total_tokens":8,"prompt_tokens_details":{"cached_tokens":0}}}"#;
+        let response = parse_response(body).unwrap();
+        assert_eq!(response.usage.unwrap().cached_tokens, Some(0));
+    }
+
+    #[test]
+    fn stream_parses_cache_breakdown_in_usage_tail_chunk() {
+        // The streamed usage-only trailing chunk uses the same wire shape:
+        // the cache count reaches the Done event.
+        let mut aggregator = ToolCallAggregator::default();
+        let done_line = r#"data: {"choices":[{"delta":{"content":"ok"},"finish_reason":"stop"}]}"#;
+        let usage_line = r#"data: {"choices":[],"usage":{"prompt_tokens":5,"completion_tokens":3,"total_tokens":8,"prompt_tokens_details":{"cached_tokens":4}}}"#;
+
+        assert_eq!(
+            parse_events(done_line, &mut aggregator),
+            vec![StreamEvent::Delta("ok".to_string())]
+        );
+        assert!(parse_events(usage_line, &mut aggregator).is_empty());
+        assert_eq!(
+            aggregator.flush_done(),
+            vec![Ok(StreamEvent::Done {
+                reason: FinishReason::Stop,
+                usage: Some(Usage::new(5, 3).with_cached_tokens(4)),
+            })]
+        );
     }
 
     #[test]

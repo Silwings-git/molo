@@ -361,7 +361,7 @@ pub struct ModelOptions {
 ///
 /// Field names match the OpenAI wire format; `total_tokens` follows the
 /// vendor's convention (not necessarily the sum of the other two). `Default`
-/// = all zeros.
+/// = all zeros, with nothing reported.
 ///
 /// Presence is carried by the enclosing type: [`ChatResponse::usage`] /
 /// [`StreamEvent::Done::usage`] are `Option<Usage>` — `None` means the
@@ -369,6 +369,10 @@ pub struct ModelOptions {
 /// values. The distinction matters for observability: "not reported" is not
 /// the same as "reportedly zero" (the Agent layer also tracks it in
 /// [`RunSummary::usage_omitted`](crate::run::RunSummary)).
+///
+/// [`cached_tokens`](Self::cached_tokens) carries the same distinction inside
+/// a reported usage: the prompt-cache breakdown is optional per turn even
+/// when the totals are present.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Usage {
     /// Input tokens for this turn.
@@ -377,26 +381,56 @@ pub struct Usage {
     pub completion_tokens: u32,
     /// Total for this turn (vendor convention).
     pub total_tokens: u32,
+    /// Prompt tokens served from the provider's prompt cache.
+    ///
+    /// A subset of [`prompt_tokens`](Self::prompt_tokens), not an addition to
+    /// it (vendors bill cached input at a lower rate).
+    ///
+    /// `None` = the endpoint did not report a cache breakdown for this turn;
+    /// `Some(0)` = it reported that nothing hit the cache. Endpoints differ
+    /// here — prompt-caching ones report the breakdown (OpenAI / DeepSeek as
+    /// `prompt_tokens_details.cached_tokens`), others omit it — so a reported
+    /// zero must not be inferred from an omission. When turns are summed,
+    /// only the reported parts contribute and
+    /// [`RunSummary::cache_omitted`](crate::run::RunSummary) marks whether
+    /// the sum is a lower bound.
+    pub cached_tokens: Option<u32>,
 }
 
 impl Usage {
     /// Constructs from input / output counts; the total is summed
-    /// automatically.
+    /// automatically and no cache breakdown is reported
+    /// ([`with_cached_tokens`](Self::with_cached_tokens) sets one).
     pub fn new(prompt_tokens: u32, completion_tokens: u32) -> Self {
         Self {
             prompt_tokens,
             completion_tokens,
             total_tokens: prompt_tokens + completion_tokens,
+            cached_tokens: None,
         }
+    }
+
+    /// Sets the prompt tokens served from the provider's cache, marking the
+    /// breakdown as reported (`Some` in [`cached_tokens`](Self::cached_tokens)).
+    pub fn with_cached_tokens(mut self, cached_tokens: u32) -> Self {
+        self.cached_tokens = Some(cached_tokens);
+        self
     }
 }
 
 /// Usage accumulates per turn (the Agent layer sums tokens across turns).
+///
+/// `cached_tokens` sums the parts that were reported: a turn that omitted the
+/// breakdown contributes nothing rather than zero.
 impl std::ops::AddAssign for Usage {
     fn add_assign(&mut self, rhs: Self) {
         self.prompt_tokens += rhs.prompt_tokens;
         self.completion_tokens += rhs.completion_tokens;
         self.total_tokens += rhs.total_tokens;
+        self.cached_tokens = match (self.cached_tokens, rhs.cached_tokens) {
+            (Some(lhs), Some(rhs)) => Some(lhs + rhs),
+            (lhs, rhs) => lhs.or(rhs),
+        };
     }
 }
 
@@ -602,4 +636,36 @@ pub enum TimeoutStage {
     /// Generic transport timeout (reqwest cannot distinguish the stage, e.g.
     /// during connect or read).
     Transport,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Usage;
+
+    #[test]
+    fn usage_add_assign_sums_reported_cache_counts() {
+        let mut total = Usage::new(10, 2).with_cached_tokens(4);
+        total += Usage::new(20, 5).with_cached_tokens(6);
+        assert_eq!(total, Usage::new(30, 7).with_cached_tokens(10));
+    }
+
+    /// A turn that did not report the breakdown contributes nothing (not
+    /// zero); a turn that reported one still contributes, so the sum stays
+    /// usable as the lower bound it is (the Agent layer marks it via
+    /// `RunSummary::cache_omitted`).
+    #[test]
+    fn usage_add_assign_ignores_turns_without_a_cache_breakdown() {
+        let mut total = Usage::new(10, 2).with_cached_tokens(4);
+        total += Usage::new(20, 5);
+        assert_eq!(total, Usage::new(30, 7).with_cached_tokens(4));
+
+        let mut none_reported = Usage::new(10, 2);
+        none_reported += Usage::new(20, 5);
+        assert_eq!(none_reported.cached_tokens, None);
+
+        // Reported zero is not the same as not reported.
+        let mut reported_zero = Usage::default();
+        reported_zero += Usage::new(10, 2).with_cached_tokens(0);
+        assert_eq!(reported_zero.cached_tokens, Some(0));
+    }
 }
