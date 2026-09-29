@@ -233,6 +233,88 @@ impl OpenAiProvider {
             }
         }
     }
+
+    /// Builds the wire request for one turn; `stream` selects the streaming
+    /// shape (`stream` + `stream_options`, which must be sent for the endpoint
+    /// to report usage).
+    ///
+    /// Precedence follows [`ModelOptions`]' "explicit settings win" rule: an
+    /// `extra` key naming a managed parameter suppresses the typed field, so
+    /// the key reaches the endpoint exactly once with the caller's value
+    /// (serializing both would emit a duplicate JSON key).
+    fn wire_request(&self, request: &ChatRequest, stream: bool) -> OpenAiChatRequest {
+        let options = &request.options;
+        let extra = wire_extra(options);
+        let temperature = if extra.contains_key("temperature") {
+            None
+        } else {
+            options.temperature
+        };
+        let max_tokens = if extra.contains_key("max_tokens") {
+            None
+        } else {
+            options.max_tokens
+        };
+        let response_format = if extra.contains_key("response_format") {
+            None
+        } else {
+            self.wire_response_format(options.structured.as_ref())
+        };
+
+        OpenAiChatRequest {
+            model: self.model.clone(),
+            messages: request
+                .messages
+                .iter()
+                .map(OpenAiMessage::from_message)
+                .collect(),
+            tools: request
+                .tools
+                .iter()
+                .map(OpenAiToolDef::from_schema)
+                .collect(),
+            stream: stream.then_some(true),
+            stream_options: stream.then_some(StreamOptions {
+                include_usage: true,
+            }),
+            temperature,
+            max_tokens,
+            response_format,
+            extra,
+        }
+    }
+
+    /// Builds the HTTP request for one turn: caller headers first, then the
+    /// framework's own auth.
+    ///
+    /// Header ownership (see [`ModelOptions::headers`]):
+    /// - `reqwest`'s `.headers()` replaces by name and `.json()` only fills
+    ///   `Content-Type` in when it is absent, so a caller-supplied
+    ///   `Content-Type` survives and no header is ever sent twice;
+    /// - `Authorization` is added **only when the caller did not supply one**:
+    ///   an explicit header is a deliberate override of `api_key`, and
+    ///   skipping `bearer_auth` keeps the request down to a single
+    ///   `Authorization` header (appending would leave two, with the
+    ///   endpoint's choice between them undefined).
+    ///
+    /// # Errors
+    ///
+    /// An unusable entry in [`ModelOptions::headers`] fails here, before
+    /// anything is sent, as [`ProviderError::Protocol`].
+    fn build_request(
+        &self,
+        wire: &OpenAiChatRequest,
+        options: &ModelOptions,
+    ) -> Result<reqwest::RequestBuilder, ProviderError> {
+        let url = format!("{}/chat/completions", self.base_url);
+        let headers = wire_headers(options)?;
+        let caller_authorization = headers.contains_key(reqwest::header::AUTHORIZATION);
+        let mut req = self.client.post(url).headers(headers).json(wire);
+        if !self.api_key.is_empty() && !caller_authorization {
+            req = req.bearer_auth(&self.api_key);
+        }
+        Ok(req)
+    }
 }
 
 /// Builds the HTTP client: the connect timeout is configured at the Client
@@ -264,36 +346,14 @@ impl Provider for OpenAiProvider {
     }
 
     async fn chat(&self, request: ChatRequest) -> Result<ChatResponse, ProviderError> {
-        let wire = OpenAiChatRequest {
-            model: self.model.clone(),
-            messages: request
-                .messages
-                .iter()
-                .map(OpenAiMessage::from_message)
-                .collect(),
-            tools: request
-                .tools
-                .iter()
-                .map(OpenAiToolDef::from_schema)
-                .collect(),
-            stream: None,
-            stream_options: None,
-            temperature: request.options.temperature,
-            max_tokens: request.options.max_tokens,
-            response_format: self.wire_response_format(request.options.structured.as_ref()),
-            extra: wire_extra(&request.options),
-        };
-
-        let url = format!("{}/chat/completions", self.base_url);
-        let mut req = self.client.post(url).json(&wire);
-        if !self.api_key.is_empty() {
-            req = req.bearer_auth(&self.api_key);
-        }
+        let wire = self.wire_request(&request, false);
         // Non-streaming total timeout (per-request; default 600s). Timeout
         // errors are classified as the Request stage (reqwest cannot
         // distinguish them from connect timeouts; diagnose as a
         // "non-streaming request").
-        req = req.timeout(self.request_timeout);
+        let req = self
+            .build_request(&wire, &request.options)?
+            .timeout(self.request_timeout);
 
         let resp = req.send().await.map_err(|e| {
             if e.is_timeout() {
@@ -324,35 +384,8 @@ impl Provider for OpenAiProvider {
         &self,
         request: ChatRequest,
     ) -> Result<BoxStream<'static, Result<StreamEvent, ProviderError>>, ProviderError> {
-        let wire = OpenAiChatRequest {
-            model: self.model.clone(),
-            messages: request
-                .messages
-                .iter()
-                .map(OpenAiMessage::from_message)
-                .collect(),
-            tools: request
-                .tools
-                .iter()
-                .map(OpenAiToolDef::from_schema)
-                .collect(),
-            stream: Some(true),
-            // Streaming usage: explicitly enable include_usage, otherwise the
-            // endpoint's streamed response carries no usage.
-            stream_options: Some(StreamOptions {
-                include_usage: true,
-            }),
-            temperature: request.options.temperature,
-            max_tokens: request.options.max_tokens,
-            response_format: self.wire_response_format(request.options.structured.as_ref()),
-            extra: wire_extra(&request.options),
-        };
-
-        let url = format!("{}/chat/completions", self.base_url);
-        let mut req = self.client.post(url).json(&wire);
-        if !self.api_key.is_empty() {
-            req = req.bearer_auth(&self.api_key);
-        }
+        let wire = self.wire_request(&request, true);
+        let req = self.build_request(&wire, &request.options)?;
         // Streaming has no total timeout: reqwest's timeout spans from
         // sending the request to finishing the response body, which would kill
         // long SSE streams. Connect timeout is at the Client level, and event
@@ -1258,9 +1291,13 @@ impl OpenAiResponseFormat {
 
 /// Extracts vendor extension parameters from [`ModelOptions`].
 ///
-/// Filters out framework-managed fields (model / messages / tools / stream /
-/// stream_options / temperature / max_tokens); on name collision the
-/// framework field wins.
+/// Only the request **envelope** is filtered out (model / messages / tools /
+/// stream / stream_options): those keys describe the request the framework is
+/// driving (and, for `model`, the identity it reports in run summaries), so a
+/// caller value would replace it rather than tune it. Everything else passes
+/// through verbatim — including keys naming a managed parameter
+/// (`temperature` / `max_tokens` / `response_format`), where the explicit wire
+/// value wins over the typed field (see `wire_request`).
 fn wire_extra(options: &ModelOptions) -> BTreeMap<String, serde_json::Value> {
     options
         .extra
@@ -1268,17 +1305,58 @@ fn wire_extra(options: &ModelOptions) -> BTreeMap<String, serde_json::Value> {
         .filter(|(key, _)| {
             !matches!(
                 key.as_str(),
-                "model"
-                    | "messages"
-                    | "tools"
-                    | "stream"
-                    | "stream_options"
-                    | "temperature"
-                    | "max_tokens"
+                "model" | "messages" | "tools" | "stream" | "stream_options"
             )
         })
         .map(|(key, value)| (key.clone(), value.clone()))
         .collect()
+}
+
+/// Headers the framework owns because they describe the request it actually
+/// sends: a caller value would contradict the body or the connection instead
+/// of customizing the endpoint call (a stale `Content-Length` corrupts the
+/// framing of the JSON body). Entries with these names are dropped from
+/// [`ModelOptions::headers`].
+///
+/// `Content-Type` is deliberately *not* here — a vendor media type or charset
+/// is a legitimate per-endpoint requirement, and the body stays the same JSON
+/// either way.
+const FRAMEWORK_HEADERS: [&str; 5] = [
+    "content-length",
+    "transfer-encoding",
+    "connection",
+    "host",
+    "upgrade",
+];
+
+/// Converts [`ModelOptions::headers`] into an HTTP header map.
+///
+/// Invalid names and values are **reported, never dropped**: a header that
+/// silently never arrives looks like an endpoint problem, while a failed
+/// request names the culprit. Rejecting values carrying control characters
+/// (CR / LF) is also what makes header injection through a value impossible.
+fn wire_headers(options: &ModelOptions) -> Result<reqwest::header::HeaderMap, ProviderError> {
+    let mut headers = reqwest::header::HeaderMap::new();
+    for (name, value) in &options.headers {
+        if FRAMEWORK_HEADERS
+            .iter()
+            .any(|owned| name.eq_ignore_ascii_case(owned))
+        {
+            continue;
+        }
+        let header_name =
+            reqwest::header::HeaderName::from_bytes(name.as_bytes()).map_err(|_| {
+                ProviderError::Protocol {
+                    message: format!("invalid request header name: {name:?}"),
+                }
+            })?;
+        let header_value =
+            reqwest::header::HeaderValue::from_str(value).map_err(|_| ProviderError::Protocol {
+                message: format!("invalid value for request header {name:?}"),
+            })?;
+        headers.insert(header_name, header_value);
+    }
+    Ok(headers)
 }
 
 /// Usage switch for streaming requests (the OpenAI `stream_options`
@@ -2040,29 +2118,32 @@ mod tests {
         );
     }
 
+    fn test_provider() -> OpenAiProvider {
+        OpenAiProvider::new("https://api.example.com", "sk-test", "m")
+    }
+
+    fn wire_json(options: ModelOptions) -> String {
+        let request = ChatRequest {
+            messages: vec![Message::user("hi")],
+            tools: vec![],
+            options,
+        };
+        serde_json::to_string(&test_provider().wire_request(&request, false)).unwrap()
+    }
+
     #[test]
     fn passes_through_extra_options() {
         // Vendor-specific parameters pass through extra verbatim, no
         // framework update needed.
-        let mut extra = BTreeMap::new();
-        extra.insert("top_p".into(), serde_json::json!(0.9));
-        extra.insert(
+        let mut options = ModelOptions::default();
+        options.extra.insert("top_p".into(), serde_json::json!(0.9));
+        options.extra.insert(
             "response_format".into(),
             serde_json::json!({"type": "json_object"}),
         );
-        let request = OpenAiChatRequest {
-            model: "m".into(),
-            messages: vec![OpenAiMessage::from_message(&Message::user("hi"))],
-            tools: vec![],
-            stream: None,
-            stream_options: None,
-            temperature: None,
-            max_tokens: None,
-            response_format: None,
-            extra,
-        };
+
         assert_eq!(
-            serde_json::to_value(&request).unwrap(),
+            serde_json::from_str::<serde_json::Value>(&wire_json(options)).unwrap(),
             json!({
                 "model": "m",
                 "messages": [{"role": "user", "content": "hi"}],
@@ -2072,40 +2153,72 @@ mod tests {
         );
     }
 
+    /// An explicitly written wire parameter wins over the typed field, and is
+    /// sent **once**: the typed field is suppressed rather than merged, since
+    /// serializing both would write the JSON key twice.
     #[test]
-    fn extra_keys_colliding_with_managed_fields_are_filtered() {
-        // Extra keys colliding with framework-managed fields are filtered
-        // out in favor of the typed fields.
-        let mut extra = BTreeMap::new();
-        extra.insert("temperature".into(), serde_json::json!(1.0));
-        extra.insert("top_p".into(), serde_json::json!(0.9));
-        let options = ModelOptions {
+    fn explicit_extra_overrides_managed_parameters() {
+        let mut options = ModelOptions {
             temperature: Some(0.5),
-            max_tokens: None,
-            extra,
-            structured: None,
+            max_tokens: Some(64),
+            structured: Some(json!({"type": "object"})),
+            ..Default::default()
         };
-        let request = OpenAiChatRequest {
-            model: "m".into(),
-            messages: vec![OpenAiMessage::from_message(&Message::user("hi"))],
-            tools: vec![],
-            stream: None,
-            stream_options: None,
-            temperature: options.temperature,
-            max_tokens: options.max_tokens,
-            response_format: options
-                .structured
-                .as_ref()
-                .map(OpenAiResponseFormat::from_schema),
-            extra: wire_extra(&options),
-        };
+        options
+            .extra
+            .insert("temperature".into(), serde_json::json!(1.0));
+        options
+            .extra
+            .insert("max_tokens".into(), serde_json::json!(256));
+        options
+            .extra
+            .insert("response_format".into(), json!({"type": "json_object"}));
+
+        let wire = wire_json(options);
         assert_eq!(
-            serde_json::to_value(&request).unwrap(),
+            serde_json::from_str::<serde_json::Value>(&wire).unwrap(),
             json!({
                 "model": "m",
                 "messages": [{"role": "user", "content": "hi"}],
-                "temperature": 0.5,
-                "top_p": 0.9
+                "temperature": 1.0,
+                "max_tokens": 256,
+                "response_format": {"type": "json_object"}
+            })
+        );
+        for key in ["temperature", "max_tokens", "response_format"] {
+            assert_eq!(
+                wire.matches(&format!("\"{key}\"")).count(),
+                1,
+                "{key} must appear exactly once: {wire}"
+            );
+        }
+    }
+
+    /// The request envelope is not a parameter: extra entries naming envelope
+    /// fields are ignored, because they would replace the conversation the
+    /// framework is driving instead of tuning it.
+    #[test]
+    fn extra_entries_naming_envelope_fields_are_ignored() {
+        let mut options = ModelOptions::default();
+        options
+            .extra
+            .insert("model".into(), serde_json::json!("other-model"));
+        options
+            .extra
+            .insert("messages".into(), serde_json::json!([]));
+        options
+            .extra
+            .insert("stream".into(), serde_json::json!(true));
+        options.extra.insert("tools".into(), serde_json::json!([]));
+        options
+            .extra
+            .insert("stream_options".into(), serde_json::json!({}));
+
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&wire_json(options)).unwrap(),
+            json!({
+                "model": "m",
+                "messages": [{"role": "user", "content": "hi"}]
             })
         );
     }
@@ -2903,16 +3016,18 @@ mod tests {
         assert!(matches!(events[0], Err(ProviderError::Decode { .. })));
     }
 
-    /// HTTP integration: a minimal local TcpListener server verifies the wire
-    /// request (method / path / auth header / body) and response parsing.
-    #[tokio::test]
-    async fn chat_over_real_http_wire() {
+    /// Serves exactly one HTTP request on a local port and writes `response`
+    /// back; the handle resolves to the raw request text (headers + body) once
+    /// it has fully arrived — tests assert the wire shape from the outside
+    /// instead of trusting the provider's own view of it.
+    async fn one_shot_server(
+        response: String,
+    ) -> (std::net::SocketAddr, tokio::task::JoinHandle<String>) {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         use tokio::net::TcpListener;
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-
         let server = tokio::spawn(async move {
             let (mut socket, _) = listener.accept().await.unwrap();
             let mut bytes = Vec::new();
@@ -2934,8 +3049,7 @@ mod tests {
                 let content_length = request
                     .lines()
                     .find_map(|line| {
-                        let lower = line.to_ascii_lowercase();
-                        lower
+                        line.to_ascii_lowercase()
                             .strip_prefix("content-length:")
                             .and_then(|value| value.trim().parse::<usize>().ok())
                     })
@@ -2944,30 +3058,40 @@ mod tests {
                     break;
                 }
             }
-            let req = String::from_utf8_lossy(&bytes).to_string();
-            // Assert the wire shape item by item.
-            assert!(
-                req.starts_with("POST /chat/completions HTTP/1.1"),
-                "method/path: {req}"
-            );
-            assert!(
-                req.to_lowercase().contains("authorization: bearer sk-test"),
-                "auth header: {req}"
-            );
-            assert!(
-                req.contains(r#""model":"deepseek-chat""#),
-                "body model: {req}"
-            );
-            // With stream None, serialization omits it (non-streaming).
-            // Replay a minimal OpenAI response.
-            let body = r#"{"choices":[{"message":{"role":"assistant","content":"hi","reasoning_content":null,"tool_calls":null},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":2,"total_tokens":3}}"#;
-            let resp = format!(
-                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{}",
-                body.len(),
-                body
-            );
-            socket.write_all(resp.as_bytes()).await.unwrap();
+            socket.write_all(response.as_bytes()).await.unwrap();
+            String::from_utf8_lossy(&bytes).to_string()
         });
+        (addr, server)
+    }
+
+    /// A one-turn SSE response: one content delta, the finish marker and the
+    /// `[DONE]` terminator.
+    fn sse_response(content: &str) -> String {
+        let body = format!(
+            "data: {{\"choices\":[{{\"delta\":{{\"content\":\"{content}\"}}}}]}}\n\n\
+             data: {{\"choices\":[{{\"delta\":{{}},\"finish_reason\":\"stop\"}}]}}\n\n\
+             data: [DONE]\n\n"
+        );
+        format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\n\r\n{}",
+            body.len(),
+            body
+        )
+    }
+
+    /// HTTP integration: a minimal local TcpListener server verifies the wire
+    /// request (method / path / auth header / body) and response parsing.
+    #[tokio::test]
+    async fn chat_over_real_http_wire() {
+        // With stream None, serialization omits it (non-streaming). Replay a
+        // minimal OpenAI response.
+        let body = r#"{"choices":[{"message":{"role":"assistant","content":"hi","reasoning_content":null,"tool_calls":null},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":2,"total_tokens":3}}"#;
+        let response = format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        let (addr, server) = one_shot_server(response).await;
 
         let provider = OpenAiProvider::new(format!("http://{addr}"), "sk-test", "deepseek-chat");
         let resp = provider
@@ -2980,7 +3104,153 @@ mod tests {
             .unwrap();
         assert_eq!(resp.message, crate::message::Message::assistant("hi"));
         assert_eq!(resp.usage, Some(Usage::new(1, 2)));
-        server.await.unwrap();
+
+        // Assert the wire shape item by item.
+        let req = server.await.unwrap();
+        assert!(
+            req.starts_with("POST /chat/completions HTTP/1.1"),
+            "method/path: {req}"
+        );
+        assert!(
+            req.to_lowercase().contains("authorization: bearer sk-test"),
+            "auth header: {req}"
+        );
+        assert!(
+            req.contains(r#""model":"deepseek-chat""#),
+            "body model: {req}"
+        );
+    }
+
+    /// Headers from [`ModelOptions::headers`] reach the wire — on the
+    /// streaming path too: vendor headers alongside the framework's auth, an
+    /// explicit `Authorization` replacing it (the api key must not be appended
+    /// as a second one), and framework-owned framing headers ignored.
+    #[tokio::test]
+    async fn custom_headers_reach_the_wire() {
+        let (addr, server) = one_shot_server(sse_response("hi")).await;
+
+        let provider = OpenAiProvider::new(format!("http://{addr}"), "sk-test", "deepseek-chat");
+        let mut options = ModelOptions::default();
+        options
+            .headers
+            .insert("x-trace-id".into(), "abc-123".into());
+        options.headers.insert("api-key".into(), "secret".into());
+        options
+            .headers
+            .insert("Authorization".into(), "Token custom".into());
+        options
+            .headers
+            .insert("Content-Length".into(), "9999".into());
+
+        let mut stream = provider
+            .stream_chat(ChatRequest {
+                messages: vec![crate::message::Message::user("hi")],
+                tools: vec![],
+                options,
+            })
+            .await
+            .unwrap();
+        let mut text = String::new();
+        while let Some(event) = stream.next().await {
+            match event.unwrap() {
+                StreamEvent::Delta(delta) => text.push_str(&delta),
+                StreamEvent::Done { .. } => break,
+                other => panic!("unexpected stream event: {other:?}"),
+            }
+        }
+        assert_eq!(text, "hi");
+
+        let req = server.await.unwrap();
+        let lower = req.to_lowercase();
+        assert!(
+            lower.contains("x-trace-id: abc-123"),
+            "vendor header: {req}"
+        );
+        assert!(
+            lower.contains("api-key: secret"),
+            "vendor auth header: {req}"
+        );
+        // The explicit Authorization wins over the api key, and it is the only
+        // one on the request.
+        assert!(
+            lower.contains("authorization: token custom"),
+            "caller auth: {req}"
+        );
+        assert!(
+            !lower.contains("bearer sk-test"),
+            "api key must not be appended: {req}"
+        );
+        assert_eq!(
+            lower.matches("authorization:").count(),
+            1,
+            "exactly one Authorization: {req}"
+        );
+        // The framework-owned Content-Length in the options is ignored: the
+        // header on the wire describes the body actually sent.
+        let content_length = lower
+            .lines()
+            .find_map(|line| line.strip_prefix("content-length:"))
+            .and_then(|value| value.trim().parse::<usize>().ok())
+            .unwrap();
+        let body = req.split("\r\n\r\n").nth(1).unwrap_or_default();
+        assert_eq!(content_length, body.len(), "framing intact: {req}");
+        assert!(body.contains(r#""stream":true"#), "streaming body: {req}");
+    }
+
+    /// An unusable header fails the request as a protocol error **before**
+    /// anything is sent: the provider points at a closed port, so a request
+    /// that got as far as connecting would be classified as Network instead.
+    #[tokio::test]
+    async fn invalid_header_fails_before_sending() {
+        let provider = OpenAiProvider::new("http://127.0.0.1:1", "sk-test", "m");
+        for (name, value) in [
+            ("bad header", "value"),
+            ("x-injected", "value\r\nx-evil: 1"),
+        ] {
+            let mut options = ModelOptions::default();
+            options.headers.insert(name.into(), value.into());
+            let err = provider
+                .chat(ChatRequest {
+                    messages: vec![crate::message::Message::user("hi")],
+                    tools: vec![],
+                    options,
+                })
+                .await
+                .unwrap_err();
+
+            assert!(
+                matches!(&err, ProviderError::Protocol { message } if message.contains(name)),
+                "expected a protocol error naming {name:?}, got: {err:?}"
+            );
+        }
+    }
+
+    /// Framework-owned framing headers are dropped from the options, while a
+    /// caller `Content-Type` is kept (the JSON body is unaffected).
+    #[test]
+    fn wire_headers_filter_framing_and_keep_content_type() {
+        let mut options = ModelOptions::default();
+        for name in [
+            "content-length",
+            "Transfer-Encoding",
+            "connection",
+            "Host",
+            "upgrade",
+        ] {
+            options.headers.insert(name.into(), "x".into());
+        }
+        options.headers.insert(
+            "Content-Type".into(),
+            "application/json; charset=utf-8".into(),
+        );
+
+        let headers = wire_headers(&options).unwrap();
+
+        assert_eq!(headers.len(), 1);
+        assert_eq!(
+            headers.get(reqwest::header::CONTENT_TYPE).unwrap(),
+            "application/json; charset=utf-8"
+        );
     }
 
     /// Non-streaming request total timeout: the server accepts the connection

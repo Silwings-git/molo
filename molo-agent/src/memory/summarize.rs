@@ -118,6 +118,13 @@ pub struct SummarizeStrategy {
     /// Token cap for the summary output (also the budget reservation for kept
     /// rounds).
     summary_max_tokens: u32,
+    /// Request-scoped model options for the summarizer call (headers,
+    /// temperature, extra parameters). The strategy builds its own request, so
+    /// it does not see the agent's [`ModelOptions`]; anything the endpoint
+    /// needs on *every* call (an auth header for a gateway, a tenant id) has
+    /// to be set here as well, or the summarizer call fails and degrades to
+    /// window dropping.
+    options: ModelOptions,
 }
 
 impl fmt::Debug for SummarizeStrategy {
@@ -128,6 +135,7 @@ impl fmt::Debug for SummarizeStrategy {
             .field("provider", &"Box<dyn Provider>")
             .field("prompt_len", &self.prompt.len())
             .field("summary_max_tokens", &self.summary_max_tokens)
+            .field("options", &self.options)
             .finish()
     }
 }
@@ -140,6 +148,7 @@ impl SummarizeStrategy {
             provider: Box::new(provider),
             prompt: DEFAULT_SUMMARY_PROMPT.into(),
             summary_max_tokens: 1024,
+            options: ModelOptions::default(),
         }
     }
 
@@ -155,8 +164,41 @@ impl SummarizeStrategy {
     /// The value doubles as the budget reservation for kept rounds: the kept
     /// rounds' token total stays within "budget − summary cap", leaving room
     /// for the summary output.
+    ///
+    /// Kept authoritative over [`with_options`](Self::with_options)'s
+    /// `max_tokens`: the cap is coupled with the budget reservation, so a
+    /// different cap would make the reservation wrong.
     pub fn with_summary_max_tokens(mut self, max_tokens: u32) -> Self {
         self.summary_max_tokens = max_tokens;
+        self
+    }
+
+    /// Sets the model options carried by the summarizer call: request headers
+    /// ([`ModelOptions::headers`]), sampling parameters, and vendor extension
+    /// parameters.
+    ///
+    /// The strategy sends its own request (system prompt + textified history),
+    /// so it does not inherit the agent's [`ModelOptions`]. Endpoints that
+    /// require something on every call — a gateway route or auth header, a
+    /// tenant id — must have it set here too; otherwise the summarizer call is
+    /// the one that fails.
+    ///
+    /// ```rust
+    /// # extern crate molo_agent as molo;
+    /// use molo::memory::SummarizeStrategy;
+    /// use molo::provider::{FakeProvider, FakeReply, ModelOptions};
+    ///
+    /// let mut options = ModelOptions::default();
+    /// options.headers.insert("x-tenant".into(), "acme".into());
+    ///
+    /// let strategy = SummarizeStrategy::new(FakeProvider::new([FakeReply::Text(
+    ///     "Earlier rounds in brief".into(),
+    /// )]))
+    /// .with_options(options);
+    /// # let _ = strategy;
+    /// ```
+    pub fn with_options(mut self, options: ModelOptions) -> Self {
+        self.options = options;
         self
     }
 
@@ -192,8 +234,11 @@ impl SummarizeStrategy {
             ],
             tools: Vec::new(),
             options: ModelOptions {
+                // The cap is the budget reservation, so it governs the request
+                // regardless of what `with_options` was given (see
+                // `with_summary_max_tokens`).
                 max_tokens: Some(self.summary_max_tokens),
-                ..Default::default()
+                ..self.options.clone()
             },
         };
         let summary = match self.provider.chat(request).await {
@@ -351,7 +396,7 @@ mod tests {
     use super::*;
     use crate::memory::{CharTokenCounter, Memory, WindowMemory};
     use crate::message::ToolCall;
-    use crate::provider::{FakeProvider, FakeReply, ProviderError};
+    use crate::provider::{FakeProvider, FakeReply, ModelOptions, ProviderError};
     use std::sync::Arc;
 
     /// Builds a conversation (round `start` through round `n`; about 11 tokens
@@ -431,6 +476,38 @@ mod tests {
         assert_eq!(context.len(), 5);
         assert_eq!(context[1], Message::user("Question from round 3"));
         assert_eq!(context[3], Message::user("Question from round 4"));
+    }
+
+    /// Options set on the strategy are carried by the summarizer call — the
+    /// strategy builds its own request, so this is how a gateway-required
+    /// header reaches the summarizer. The summary cap stays authoritative for
+    /// `max_tokens`: it doubles as the budget reservation.
+    #[tokio::test]
+    async fn strategy_options_are_carried_by_the_summarizer_call() {
+        let fake = Arc::new(FakeProvider::new([FakeReply::Text("Highlights".into())]));
+        let mut options = ModelOptions {
+            temperature: Some(0.2),
+            max_tokens: Some(9_999),
+            ..Default::default()
+        };
+        options.headers.insert("x-tenant".into(), "acme".into());
+        let mut memory = WindowMemory::new(30).with_strategy(Arc::new(
+            SummarizeStrategy::new(fake.clone())
+                .with_summary_max_tokens(4)
+                .with_options(options),
+        ));
+        record_rounds(&mut memory, 1, 4).await;
+        memory.context().await.unwrap();
+
+        let requests = fake.requests();
+        assert_eq!(requests.len(), 1);
+        let options = &requests[0].options;
+        assert_eq!(
+            options.headers.get("x-tenant").map(String::as_str),
+            Some("acme")
+        );
+        assert_eq!(options.temperature, Some(0.2));
+        assert_eq!(options.max_tokens, Some(4));
     }
 
     /// Incremental compaction: on the second over-budget event, the previous

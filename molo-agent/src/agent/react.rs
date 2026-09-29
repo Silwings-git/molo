@@ -4319,18 +4319,19 @@ mod tests {
     }
 
     /// AgentConfig.options passes through: every round's ChatRequest
-    /// carries the configured model parameters.
+    /// carries the configured model parameters, request headers included.
     #[tokio::test]
     async fn config_options_forwarded_to_chat_request() {
         let fake = SharedFake::new([FakeReply::Text("hi".into())]);
+        let mut options = ModelOptions {
+            temperature: Some(0.2),
+            max_tokens: Some(128),
+            ..Default::default()
+        };
+        options.headers.insert("x-tenant".into(), "acme".into());
         let mut agent = agent(fake.clone(), "").with_config(AgentConfig {
             max_tool_rounds: 10,
-            options: ModelOptions {
-                temperature: Some(0.2),
-                max_tokens: Some(128),
-                extra: Default::default(),
-                structured: None,
-            },
+            options,
             ..Default::default()
         });
         agent.run("hi").await.unwrap();
@@ -4338,6 +4339,10 @@ mod tests {
         let req = &fake.requests()[0];
         assert_eq!(req.options.temperature, Some(0.2));
         assert_eq!(req.options.max_tokens, Some(128));
+        assert_eq!(
+            req.options.headers.get("x-tenant").map(String::as_str),
+            Some("acme")
+        );
     }
 
     #[tokio::test]

@@ -317,9 +317,10 @@ pub struct ChatRequest {
 ///
 /// Common parameters are provided as typed fields (temperature / max tokens,
 /// where `None` means vendor default); **vendor-specific or framework-unknown
-/// parameters go into [`extra`](ModelOptions::extra)** and are passed through
-/// to the vendor verbatim under their wire field names — so users can use new
-/// parameters without waiting for a framework update:
+/// parameters go into [`extra`](ModelOptions::extra)** and request headers go
+/// into [`headers`](ModelOptions::headers) — both are passed through to the
+/// vendor verbatim, so users can reach new parameters and endpoint
+/// requirements without waiting for a framework update:
 ///
 /// ```rust
 /// # extern crate molo_core as molo;
@@ -327,11 +328,24 @@ pub struct ChatRequest {
 ///
 /// let mut options = ModelOptions::default();
 /// options.extra.insert("top_p".into(), serde_json::json!(0.9));
+/// options.headers.insert("x-trace-id".into(), "abc-123".into());
 /// ```
 ///
-/// Extra keys that collide with framework-managed fields are ignored in favor
-/// of the typed fields.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+/// # Explicit settings win
+///
+/// When an `extra` key names a parameter the framework also manages
+/// (`temperature` / `max_tokens` / `response_format`), the `extra` value is
+/// the one sent: an explicitly written wire field is a deliberate override,
+/// and the typed field is dropped for that request instead of being merged
+/// (merging would emit the JSON key twice).
+///
+/// The request envelope is not a parameter: `extra` entries named `messages` /
+/// `tools` (the conversation the framework is driving), `stream` /
+/// `stream_options` (the delivery shape) and `model` (bound at provider
+/// construction and reported in run summaries — a per-request override would
+/// make those summaries name a model that did not answer) are ignored, since
+/// they would replace the request rather than tune it.
+#[derive(Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct ModelOptions {
     /// Sampling temperature; `None` means vendor default.
     pub temperature: Option<f32>,
@@ -340,6 +354,47 @@ pub struct ModelOptions {
     /// Vendor extension parameters: keys are wire request field names,
     /// serialized into the request body verbatim.
     pub extra: BTreeMap<String, serde_json::Value>,
+    /// Extra HTTP request headers, sent by HTTP providers alongside the
+    /// headers the framework sets itself.
+    ///
+    /// For endpoints that require more than the request body: gateways and
+    /// proxies commonly route or trace by header (a tenant / project id, a
+    /// gateway token, an `x-trace-id`), and some vendors authenticate with a
+    /// header name of their own (`api-key`, `x-api-key`).
+    ///
+    /// ```rust
+    /// # extern crate molo_core as molo;
+    /// use molo::ModelOptions;
+    ///
+    /// let mut options = ModelOptions::default();
+    /// options.headers.insert("api-key".into(), "secret".into());
+    /// options.headers.insert("x-trace-id".into(), "abc-123".into());
+    /// ```
+    ///
+    /// # Semantics
+    ///
+    /// - **Names / values are taken as given** (HTTP matches names
+    ///   case-insensitively); an entry that is not a valid HTTP header is
+    ///   reported by the provider as [`ProviderError::Protocol`] rather than
+    ///   dropped silently, since a header that quietly never arrives is worse
+    ///   than a failed request.
+    /// - **An explicit `Authorization` wins over the provider's api key**: the
+    ///   endpoint sees the caller's value and the provider does not add a
+    ///   bearer token of its own (two `Authorization` headers would be
+    ///   ambiguous — see the adapter's request construction). `Content-Type`
+    ///   is likewise the caller's when set.
+    /// - **Transport-framing headers stay framework-owned**:
+    ///   `Content-Length` / `Transfer-Encoding` / `Connection` / `Host` /
+    ///   `Upgrade` describe the request the framework actually sends, so
+    ///   entries with those names are ignored (a stale `Content-Length`
+    ///   corrupts the framing of the body).
+    /// - **Values are masked in `Debug` output** (names stay visible), so a
+    ///   credential carried in a header does not leak through `{:?}` logging;
+    ///   the map itself still prints plainly for deliberate inspection.
+    ///
+    /// Providers that do not speak HTTP ignore this field.
+    #[serde(default)]
+    pub headers: BTreeMap<String, String>,
     /// Structured output: the final answer must be JSON conforming to this
     /// **JSON Schema document** (the serialized `RootSchema` produced by
     /// schemars, or a hand-written schema).
@@ -355,6 +410,28 @@ pub struct ModelOptions {
     ///
     /// `None` = free-form text reply.
     pub structured: Option<serde_json::Value>,
+}
+
+impl fmt::Debug for ModelOptions {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Hand-written Debug that masks header values: headers routinely carry
+        // credentials (see `headers`), and Debug output ends up in logs and
+        // panic messages — the same reason `OpenAiProvider` masks its api_key.
+        // Names stay visible: which headers a request carries is the part that
+        // matters when diagnosing it.
+        let headers: BTreeMap<&str, &str> = self
+            .headers
+            .keys()
+            .map(|name| (name.as_str(), "***"))
+            .collect();
+        f.debug_struct("ModelOptions")
+            .field("temperature", &self.temperature)
+            .field("max_tokens", &self.max_tokens)
+            .field("extra", &self.extra)
+            .field("headers", &headers)
+            .field("structured", &self.structured)
+            .finish()
+    }
 }
 
 /// Token usage for one conversation.
@@ -556,6 +633,11 @@ pub enum ProviderError {
     },
     /// Provider response was syntactically decoded but violated either the
     /// vendor contract or molo's provider contract.
+    ///
+    /// Also raised **before sending** when a caller-supplied request part
+    /// cannot be put on the wire at all — an invalid
+    /// [`ModelOptions::headers`] entry (a name or value that is not a valid
+    /// HTTP header) fails the request here instead of being dropped silently.
     #[error("provider protocol error: {message}")]
     Protocol {
         /// Error description text.
@@ -640,7 +722,7 @@ pub enum TimeoutStage {
 
 #[cfg(test)]
 mod tests {
-    use super::Usage;
+    use super::{ModelOptions, Usage};
 
     #[test]
     fn usage_add_assign_sums_reported_cache_counts() {
@@ -667,5 +749,31 @@ mod tests {
         let mut reported_zero = Usage::default();
         reported_zero += Usage::new(10, 2).with_cached_tokens(0);
         assert_eq!(reported_zero.cached_tokens, Some(0));
+    }
+
+    /// Headers routinely carry credentials: `Debug` shows which headers a
+    /// request carries (the diagnostic part) while masking the values, so a
+    /// `{:?}` in a log line cannot leak the token.
+    #[test]
+    fn model_options_debug_masks_header_values() {
+        let mut options = ModelOptions::default();
+        options.headers.insert("x-api-key".into(), "secret".into());
+
+        let debug = format!("{options:?}");
+        assert!(debug.contains("x-api-key"), "names stay visible: {debug}");
+        assert!(!debug.contains("secret"), "values are masked: {debug}");
+    }
+
+    /// Options written before `headers` existed still deserialize: the field
+    /// defaults to empty instead of being required.
+    #[test]
+    fn model_options_deserialize_without_headers() {
+        let options: ModelOptions = serde_json::from_str(
+            r#"{"temperature":0.5,"max_tokens":null,"extra":{},"structured":null}"#,
+        )
+        .unwrap();
+
+        assert_eq!(options.temperature, Some(0.5));
+        assert!(options.headers.is_empty());
     }
 }
